@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/types",
+    "crates/event-bus",
+    "crates/journal",
+    "crates/config",
+    "crates/observability",
+    "crates/app",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# serialization
+rkyv = { version = "0.8", features = ["validation"] }
+bincode = "1.3"
+serde = { version = "1", features = ["derive"] }
+
+# async
+tokio = { version = "1", features = ["full"] }
+
+# channels
+crossbeam-channel = "0.5"
+
+# storage
+rocksdb = "0.22"
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+
+# config
+toml = "0.8"
+
+# testing
+proptest = "1.4"
+
+# error
+thiserror = "2"
+anyhow = "1"
+
+# EVM types
+alloy-primitives = "0.8"

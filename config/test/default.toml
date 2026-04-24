@@ -1,0 +1,5 @@
+[bus]
+capacity = 1024
+
+[logging]
+level = "warn"

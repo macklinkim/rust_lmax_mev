@@ -1,0 +1,12 @@
+[bus]
+capacity = 65536
+
+[journal]
+fsync_interval_ms = 100
+
+[metrics]
+port = 9090
+
+[logging]
+level = "info"
+format = "json"
