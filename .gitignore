@@ -1,0 +1,7 @@
+/target
+.superpowers/
+*.swp
+*.swo
+.env
+.env.*
+!.env.example
