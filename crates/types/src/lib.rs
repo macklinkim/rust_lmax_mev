@@ -49,3 +49,17 @@ pub struct SmokeTestPayload {
     pub nonce: u64,
     pub data: [u8; 32],
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum TypesError {
+    #[error("invalid envelope: field={field}, reason={reason}")]
+    InvalidEnvelope {
+        field: &'static str,
+        reason: &'static str,
+    },
+    #[error("unsupported event_version: found={found}, max_supported={max_supported}")]
+    UnsupportedEventVersion {
+        found: u16,
+        max_supported: u16,
+    },
+}
