@@ -1,7 +1,7 @@
 # Task 11: `crates/types` — Phase 1 Type Primitives Design
 
 **작성일:** 2026-04-27
-**문서 상태:** Approved (구현 계획 작성 단계로 이행 가능)
+**문서 상태:** v0.2 Approved (reviewer 2회 통과, 사용자 최종 검토 대기)
 **대상 작업:** Phase 1 / Task 11 / `crates/types` 크레이트 신설
 **선행 입력:**
 - `docs/specs/event-model.md` (frozen)
@@ -89,6 +89,9 @@ impl<T> EventEnvelope<T> {
         timestamp_ns: u64,
     ) -> Result<Self, TypesError>;
 
+    // Post-decode invariant 재검증 (deserialize 경계용)
+    pub fn validate(&self) -> Result<(), TypesError>;
+
     // Copy 필드: by value
     pub fn sequence(&self) -> u64;
     pub fn timestamp_ns(&self) -> u64;
@@ -106,6 +109,8 @@ impl<T> EventEnvelope<T> {
 ```
 
 setter는 제공하지 않음. envelope는 `seal()` 이후 불변.
+
+**`seal()`은 단일 _validated_ 생성 경로**다. `serde::Deserialize` 및 `rkyv::Deserialize`는 `seal()`을 우회하여 필드를 직접 재구성하므로, decode 경계에서는 별도의 `validate()` 호출로 invariant를 다시 강제해야 한다 (§5.3 참조).
 
 ---
 
@@ -280,7 +285,54 @@ impl<T> EventEnvelope<T> {
 - `block_number != 0` — genesis 블록도 합법.
 - `correlation_id != 0` — 0이 "no parent / root span" sentinel일 수 있음.
 
-### 5.3 `event_version = 0` 정책 명시
+### 5.3 `validate()` — deserialize 경계 invariant 재검증
+
+`seal()`은 envelope **생성** 경로의 invariant를 강제하지만 **deserialize** 경로는 우회한다. `serde::Deserialize`와 `rkyv::Deserialize`는 envelope의 필드를 직접 재구성하므로, 손상되거나 악의적으로 조작된 journal frame / wire frame이 `timestamp_ns = 0`, `event_version = 0`, `chain_context.chain_id = 0` 같은 invariant 위반 값을 가진 envelope를 만들 수 있다. `seal()`이 거부했을 값들이 deserialize를 통해 시스템에 유입될 수 있는 것이다.
+
+이 구멍을 막기 위해 `EventEnvelope`는 두 번째 검증 entry로 `validate()`를 노출한다.
+
+```rust
+impl<T> EventEnvelope<T> {
+    /// Re-validates Phase 1 invariants without reconstructing the envelope.
+    ///
+    /// Use this at deserialization boundaries (journal decode, replay, wire
+    /// decode) to confirm a decoded envelope still satisfies the invariants
+    /// that `seal()` enforced at construction time.
+    ///
+    /// `serde::Deserialize` and `rkyv::Deserialize` reconstruct fields
+    /// directly, **bypassing `seal()`**. Without `validate()`, a corrupted or
+    /// malicious frame could produce an envelope with `timestamp_ns = 0`,
+    /// `event_version = 0`, or `chain_context.chain_id = 0`.
+    ///
+    /// Checks the same three invariants as `seal()`:
+    /// - `timestamp_ns != 0`
+    /// - `event_version != 0`
+    /// - `chain_context.chain_id != 0`
+    ///
+    /// Journal, replay, and decoder consumers MUST call `validate()` after
+    /// any deserialization, before passing the envelope to downstream
+    /// pipeline stages.
+    pub fn validate(&self) -> Result<(), TypesError> { /* ... */ }
+}
+```
+
+**구현 권장 사항 (강제 아님):** `seal()`과 `validate()`가 동일한 3개 검사를 중복 작성하지 않도록 내부 helper(예: `fn check_invariants(timestamp_ns, event_version, chain_id) -> Result<(), TypesError>`)로 추출. 단, helper는 crate-private (`pub` 아님). 본 spec은 helper 시그니처를 강제하지 않으며, 두 메서드가 같은 3개 invariant를 검사하는 것만이 계약이다.
+
+**호출 책임 분배:**
+
+| 경로 | 검증 메서드 |
+|---|---|
+| `EventBus::publish` 내부에서 envelope 생성 | `seal()` 호출 |
+| Journal frame decode (Task 13) | decode 후 `validate()` 호출 의무 |
+| Replay loader (Phase 2) | decode 후 `validate()` 호출 의무 |
+| Wire/RPC decode (Phase 2+) | decode 후 `validate()` 호출 의무 |
+
+**왜 두 메서드를 모두 두는가:**
+- `seal()`만 두고 `validate()`를 빼면, deserialize 후 검증을 강제할 표준 entry가 없다.
+- `validate()`만 두고 `seal()`을 빼면, 생성 시 `Result`를 통한 명시적 실패 경로가 사라진다 (생성자가 모든 입력을 받아들인 후 별도 호출에서 검증되어야 함 — caller-side 의무 부담↑).
+- 두 메서드를 같은 invariant 셋으로 둘 다 노출하는 것이 가장 적은 우회 표면을 만든다.
+
+### 5.4 `event_version = 0` 정책 명시
 
 `event_version = 0`이 reserved/uninitialized라는 결정은 frozen spec(`docs/specs/event-model.md`)에 직접 박힌 문장이 아니다. Phase 1 정책으로 다음 두 곳에 명시한다:
 
@@ -289,7 +341,7 @@ impl<T> EventEnvelope<T> {
 
 Phase 2 이후 이 정책이 변경되면 이 두 docstring과 `TypesError::InvalidEnvelope` 반환 케이스를 동시에 갱신.
 
-### 5.4 `into_payload()` — metadata-discard helper
+### 5.5 `into_payload()` — metadata-discard helper
 
 ```rust
 impl<T> EventEnvelope<T> {
@@ -317,7 +369,7 @@ impl<T> EventEnvelope<T> {
 }
 ```
 
-### 5.5 `UnsupportedEventVersion`의 raise 지점 (types 외부)
+### 5.6 `UnsupportedEventVersion`의 raise 지점 (types 외부)
 
 types는 envelope의 version 필드를 표현하고 최소 invariant(`!= 0`)만 확인할 뿐 **버전 범위 강제는 하지 않는다**. `MAX_SUPPORTED_EVENT_VERSION` 같은 상수와 그에 따른 `UnsupportedEventVersion` 반환 책임은 다음 소비자가 자기 도메인에서 소유한다:
 
@@ -327,7 +379,7 @@ types는 envelope의 version 필드를 표현하고 최소 invariant(`!= 0`)만 
 
 types는 이 variant의 표현 자리만 미리 제공.
 
-### 5.6 크레이트 레벨 docstring
+### 5.7 크레이트 레벨 docstring
 
 `lib.rs` 최상단에 다음 내용을 둔다:
 
@@ -347,11 +399,19 @@ types는 이 variant의 표현 자리만 미리 제공.
 //! tests and replay/decode infrastructure. ADR-005 and the event-model spec
 //! govern the canonical ownership contract.
 //!
+//! ## Validation at the deserialize boundary
+//!
+//! `seal()` is the single _validated_ construction path. `serde::Deserialize`
+//! and `rkyv::Deserialize` reconstruct envelope fields directly, **bypassing
+//! `seal()`**. Journal, replay, and decoder consumers MUST call
+//! `EventEnvelope::validate()` immediately after any deserialization to
+//! re-enforce the same invariants `seal()` would have rejected at construction.
+//!
 //! ## Phase 1 version policy
 //!
 //! `event_version = 0` is treated as reserved/uninitialized in Phase 1 and is
-//! rejected by `seal()`. This is a Phase 1 policy decision, not a constraint
-//! from the frozen event-model spec.
+//! rejected by both `seal()` and `validate()`. This is a Phase 1 policy
+//! decision, not a constraint from the frozen event-model spec.
 ```
 
 ---
@@ -419,18 +479,23 @@ bincode = { workspace = true }
 
 ### 6.5 워크스페이스 `Cargo.toml`의 rkyv feature 보정 (Task 11 작업 범위)
 
-현재 워크스페이스 `Cargo.toml`은 `rkyv = { version = "0.8", features = ["validation"] }`로 선언되어 있다. **`validation`은 rkyv 0.8에 존재하지 않는 feature 이름이다.** rkyv 0.8 docs(<https://docs.rs/crate/rkyv/latest/features>)에 따르면 default features는 `std` + `alloc`이며, safe `from_bytes` 사용에는 `bytecheck` feature가 필요하다.
+현재 워크스페이스 `Cargo.toml`은 `rkyv = { version = "0.8", features = ["validation"] }`로 선언되어 있다. **`validation`은 rkyv 0.8에 존재하지 않는 feature 이름이다.**
+
+rkyv 0.8 docs(<https://docs.rs/crate/rkyv/latest/features>) 기준 정확한 feature 구성:
+- **default features:** `bytecheck` + `std`
+- `std`가 활성화되면 `alloc`이 자동 enable됨
+- safe `rkyv::from_bytes::<T, E>(...)` 호출에는 `bytecheck`가 필요 (default에 이미 포함)
 
 Task 11 구현자는 `cargo check -p rust-lmax-mev-types` 또는 워크스페이스 빌드에서 feature 오류가 나면 **bincode-only downgrade가 아니라 rkyv 설정 정정** 경로를 따라야 한다:
 
-1. 워크스페이스 `Cargo.toml`의 `rkyv = { version = "0.8", features = ["validation"] }`을 다음 target feature 집합으로 수정한다:
+1. 워크스페이스 `Cargo.toml`의 `rkyv = { version = "0.8", features = ["validation"] }`을 다음 target으로 수정한다:
    ```toml
-   rkyv = { version = "0.8", features = ["bytecheck", "alloc"] }
+   rkyv = { version = "0.8", features = ["bytecheck"] }
    ```
-   - `bytecheck`: `rkyv::from_bytes` safe 호출에 필요한 검증 레이어.
-   - `alloc`: rkyv 0.8 default-on이지만 명시 부착 — 명시적 의존성 표현.
-   - `std`는 default-on이라 따로 명시하지 않음.
-2. 위 feature 집합이 docs.rs/rkyv/0.8 (`https://docs.rs/crate/rkyv/latest/features`)와 일치하는지 구현 시점에 1회 cross-check. 만약 0.8.x 마이너 버전 동안 feature 이름이 변경되었다면 docs를 신뢰하고 spec을 후속 update.
+   - `bytecheck`는 rkyv 0.8 default에 이미 포함되어 있지만 **의도를 명시**하기 위해 features에 부착한다.
+   - `std` / `alloc`은 default에 포함되므로 별도 명시 불필요.
+   - `default-features = false`는 사용하지 않는다 — std 기반 환경 그대로 유지.
+2. 위 feature 구성이 docs.rs/rkyv/0.8 (<https://docs.rs/crate/rkyv/latest/features>)와 일치하는지 구현 시점에 1회 cross-check. 만약 0.8.x 마이너 버전 동안 feature 이름이 변경되었다면 docs를 신뢰하고 spec을 후속 update.
 3. `cargo check -p rust-lmax-mev-types`로 빌드 통과 확인.
 4. 변경된 rkyv 0.8 feature 이름과 그 근거를 커밋 메시지에 기록.
 
@@ -474,13 +539,23 @@ mod tests {
 
 ### 7.2 테스트 1 — `seal_enforces_phase_1_invariants`
 
-**목적:** 5.2의 invariant 3개에 대한 reject + happy path 검증.
+**목적:** §5.2의 invariant 3개에 대한 `seal()` reject + happy path 검증, 그리고 §5.3의 `validate()`가 동일 invariant 셋을 같은 방식으로 강제하는지 cross-check.
 
-한 함수 안에서 4개 케이스(timestamp_ns=0 / event_version=0 / chain_id=0 reject + valid 입력 happy path)를 순차 assertion으로 검증. happy path는 모든 getter 반환값이 입력 그대로인지 확인.
+한 함수 안에서 다음을 순차 assertion으로 검증:
+
+1. `seal()` reject: `timestamp_ns=0`, `event_version=0`, `chain_id=0` 각각 → `InvalidEnvelope { field, .. }`.
+2. `seal()` happy path: 정상 입력으로 envelope 생성 → 모든 getter 반환값이 입력 그대로.
+3. **`validate()` happy path**: 위에서 생성된 정상 envelope에 대해 `env.validate()` → `Ok(())`.
+
+`validate()`의 reject 케이스(즉 `timestamp_ns=0` 같은 손상 envelope에 대한 거부)는 별도 테스트하지 않는다. 이유:
+- `seal()`과 `validate()`가 동일한 helper로 같은 3개 invariant를 검사함이 §5.3 계약.
+- `seal()` 거부 테스트가 invariant 검사 로직을 이미 cover.
+- 손상된 envelope는 deserialize-only 경로에서만 발생 가능한데, 이를 인위적으로 만들려면 binary frame을 직접 조작해야 함 — Task 13 (journal corruption test) 영역.
+- Phase 1 testing scope를 부풀리지 않음.
 
 ### 7.3 테스트 2 — `serde_bincode_round_trip_preserves_envelope`
 
-**목적:** serde derive가 envelope 전체에 대해 직렬화 → 역직렬화 round-trip을 보존하는지 검증. PHASE_1_DETAIL_REVISION 3.2의 "semantic equality" 요구사항을 가장 작은 surface에서 확인.
+**목적:** serde derive가 envelope 전체에 대해 직렬화 → 역직렬화 round-trip을 보존하는지 검증. PHASE_1_DETAIL_REVISION 3.2의 "semantic equality" 요구사항을 가장 작은 surface에서 확인. 추가로, decode 후 `validate()` 호출이 happy path를 통과하는지도 확인 (§5.3의 호출 책임을 테스트로 시연).
 
 ```rust
 #[test]
@@ -490,6 +565,8 @@ fn serde_bincode_round_trip_preserves_envelope() {
     let decoded: EventEnvelope<SmokeTestPayload> =
         bincode::deserialize(&bytes).expect("bincode deserialize");
     assert_eq!(original, decoded);
+    // decode 경계의 표준 호출 패턴 시연
+    decoded.validate().expect("decoded envelope must pass validate()");
 }
 ```
 
@@ -516,7 +593,7 @@ fn rkyv_archive_round_trip_preserves_envelope() {
 }
 ```
 
-API 시그니처 출처: <https://docs.rs/rkyv/latest/rkyv/fn.to_bytes.html>, <https://docs.rs/rkyv/latest/rkyv/fn.from_bytes.html>. safe `from_bytes`에는 `bytecheck` + `alloc` feature가 필요(6.5의 워크스페이스 보정으로 해결).
+API 시그니처 출처: <https://docs.rs/rkyv/latest/rkyv/fn.to_bytes.html>, <https://docs.rs/rkyv/latest/rkyv/fn.from_bytes.html>. safe `from_bytes`에는 `bytecheck` feature가 필요하며, `alloc`은 default feature `std`에 의해 자동 활성화된다 (6.5의 워크스페이스 보정으로 해결).
 
 ### 7.5 fallback 정책
 
@@ -526,7 +603,7 @@ API 시그니처 출처: <https://docs.rs/rkyv/latest/rkyv/fn.to_bytes.html>, <h
 |---|---|
 | rkyv 0.8 derive 매크로 컴파일 실패 (Phase 1 타입에 alloy 형이 없으므로 발생 가능성 낮음) | Q2: `[u8; N]` primitive로 fallback 시도 → 그래도 실패하면 ADR-004/event-model spec update 대상으로 surface (silent bincode-only 금지) |
 | rkyv feature 누락 / 잘못된 feature 이름으로 인한 빌드 실패 | 6.5: 워크스페이스 `Cargo.toml`의 rkyv features를 docs.rs에서 확인한 정확한 이름으로 수정 |
-| safe `from_bytes` 호출에 추가 feature 필요 | 워크스페이스 `Cargo.toml`에 `bytecheck` 등 명시적으로 추가 |
+| safe `from_bytes` 호출에 추가 feature 필요 | 워크스페이스 `Cargo.toml`의 `features = ["bytecheck"]` 외에 추가 feature가 docs에서 요구되면 명시적으로 부착 |
 | `rkyv::rancor::Error` 외 다른 helper가 필요 | dev-dep에서 rkyv feature를 보강 또는 대체 helper 사용 |
 
 각 보정은 silent downgrade가 아니라 명시적 설정 변경. 커밋 메시지에 이유 기록.
@@ -559,16 +636,17 @@ Task 11이 완료되었다고 선언하기 위한 검증 가능 항목:
 
 1. `crates/types/src/lib.rs`에 §4의 7개 타입 + `BlockHash` alias가 정의되어 있다.
 2. `crates/types/Cargo.toml`이 §6.2와 정확히 일치한다.
-3. `EventEnvelope`의 필드는 모두 private이며 §3.4의 getter 7개 + `seal()` + `into_payload()` 8개 메서드만 노출한다.
+3. `EventEnvelope`의 필드는 모두 private이며 §3.4의 메서드만 노출한다 — getter 7개 + `seal()` + `validate()` + `into_payload()` 총 10개.
 4. `EventEnvelope::seal()`이 §5.2의 invariant 3개를 강제하고 위반 시 `TypesError::InvalidEnvelope`을 반환한다.
-5. §7의 테스트 3개가 모두 통과한다 (`cargo test -p rust-lmax-mev-types`).
-6. `cargo build -p rust-lmax-mev-types`가 경고 없이 통과한다.
-7. `cargo clippy -p rust-lmax-mev-types -- -D warnings`가 통과한다.
-8. `cargo fmt --check`가 통과한다.
-9. crate-level docstring(§5.6)과 `seal()` / `into_payload()` docstring(§5.1, §5.4)이 부착되어 있다.
-10. (필요 시) §6.5에 따른 워크스페이스 `Cargo.toml`의 rkyv feature 정정이 같은 커밋 또는 직전 커밋으로 반영되어 있다.
+5. `EventEnvelope::validate()`가 `seal()`과 **동일한** 3개 invariant를 검사하며, 위반 시 같은 `field`/`reason` 페어를 가진 `TypesError::InvalidEnvelope`을 반환한다 (deserialize 경계 보호).
+6. §7의 테스트 3개가 모두 통과한다 (`cargo test -p rust-lmax-mev-types`). serde/rkyv round-trip 테스트는 decoded envelope에 대해 `validate()` 호출이 `Ok` 임을 같이 검증한다.
+7. `cargo build -p rust-lmax-mev-types`가 경고 없이 통과한다.
+8. `cargo clippy -p rust-lmax-mev-types -- -D warnings`가 통과한다.
+9. `cargo fmt --check`가 통과한다.
+10. crate-level docstring(§5.7)과 `seal()` / `validate()` / `into_payload()` docstring(§5.1, §5.3, §5.5)이 부착되어 있다. crate-level docstring은 deserialize 경계의 `validate()` 호출 의무를 명시한다.
+11. (필요 시) §6.5에 따른 워크스페이스 `Cargo.toml`의 rkyv feature 정정이 같은 커밋 또는 직전 커밋으로 반영되어 있다.
 
-다음 단계 (Task 12 `crates/event-bus`)가 본 크레이트의 `EventEnvelope`/`EventSource`/`ChainContext`/`PublishMeta`/`TypesError`를 import하여 컴파일 가능해야 한다.
+다음 단계 (Task 12 `crates/event-bus`)가 본 크레이트의 `EventEnvelope`/`EventSource`/`ChainContext`/`PublishMeta`/`TypesError`를 import하여 컴파일 가능해야 한다. Task 13 (`crates/journal`) 이후의 deserialize 소비자는 decode 후 `EventEnvelope::validate()`를 호출하는 표준 패턴을 따른다.
 
 ---
 
@@ -580,3 +658,23 @@ Task 11이 완료되었다고 선언하기 위한 검증 가능 항목:
 - `PHASE_1_DETAIL_REVISION.md` — §3.2 Replay Contract 의미 분리, §3.4 sequence assignment 위치, `JournalPosition { sequence, byte_offset }` 도입.
 - `CLAUDE.md` — rkyv 0.8 호환성 주의, Task 11 위치.
 - `Cargo.toml` (workspace 루트) — 워크스페이스 deps 사전 정의 및 §6.5 rkyv feature 정정 대상.
+- §11 Open Issues — Task 11 비차단 후속 보정 항목 (ADR-004 bincode API 표기 불일치).
+
+---
+
+## 11. Open Issues (Task 11 비차단, 후속 작업에서 처리)
+
+### 11.1 ADR-004의 bincode API 표기 불일치
+
+`docs/adr/ADR-004-rpc-evm-stack-selection.md` line 48의 Consequences는 다음과 같이 적혀 있다:
+
+> Snapshot types must derive `bincode::Encode` and `bincode::Decode`.
+
+그러나 워크스페이스 `Cargo.toml`은 `bincode = "1.3"`로 고정되어 있고, **bincode 1.x는 자체 `Encode`/`Decode` derive가 없으며 serde 어댑터(`bincode::serialize` / `bincode::deserialize`)를 통해 동작한다**. `Encode`/`Decode` derive는 bincode 2.x에서 도입된 별도 API다.
+
+본 spec(§7.3 serde round-trip 테스트)은 `bincode = 1.3`의 serde 어댑터 형태(`bincode::serialize` / `bincode::deserialize`)를 사용하므로 Task 11 작업 자체는 영향받지 않는다. 다만 ADR-004 Consequences 문장이 현재 워크스페이스 의존성과 일치하지 않으므로 다음 중 하나로 후속 보정해야 한다:
+
+1. ADR-004 Consequences를 "Snapshot types must implement `serde::Serialize` and `serde::Deserialize`, encoded via `bincode` (1.x serde adapter)"로 수정.
+2. 또는 워크스페이스 `Cargo.toml`을 `bincode = "2.x"`로 업그레이드하고 ADR-004 문구는 그대로 유지하되 Migration 노트를 추가.
+
+**처리 시점:** Task 13 (`crates/journal`) 시작 전 — journal/snapshot이 실제 bincode를 호출하는 첫 consumer이므로 그 작업 진입 직전에 ADR을 정합 상태로 정리하는 것이 안전하다. Task 11에서는 본 issue를 등록만 하고 spec 자체에는 수정을 가하지 않는다.
