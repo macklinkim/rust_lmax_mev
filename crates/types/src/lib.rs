@@ -138,9 +138,30 @@ impl<T> EventEnvelope<T> {
         })
     }
 
-    /// Re-validates Phase 1 invariants. **STUB — Task 7 replaces this.**
+    /// Re-validates Phase 1 invariants without reconstructing the envelope.
+    ///
+    /// Use this at deserialization boundaries (journal decode, replay,
+    /// wire decode) to confirm a decoded envelope still satisfies the
+    /// invariants `seal()` enforced at construction time. `serde::Deserialize`
+    /// and `rkyv::Deserialize` reconstruct fields directly, **bypassing
+    /// `seal()`** — without this method, a corrupted frame could produce
+    /// an envelope with `timestamp_ns = 0`, `event_version = 0`, or
+    /// `chain_context.chain_id = 0`.
+    ///
+    /// Checks the same three invariants as `seal()`:
+    /// - `timestamp_ns != 0`
+    /// - `event_version != 0`
+    /// - `chain_context.chain_id != 0`
+    ///
+    /// Journal, replay, and decoder consumers MUST call `validate()`
+    /// after any deserialization, before passing the envelope to
+    /// downstream pipeline stages.
     pub fn validate(&self) -> Result<(), TypesError> {
-        Ok(())
+        check_envelope_invariants(
+            self.timestamp_ns,
+            self.event_version,
+            self.chain_context.chain_id,
+        )
     }
 
     pub fn sequence(&self) -> u64 {
@@ -263,5 +284,67 @@ mod tests {
         // 5. happy envelope must also pass validate() (cross-check that
         //    seal() and validate() accept the same valid inputs)
         env.validate().expect("happy envelope must pass validate()");
+    }
+
+    #[test]
+    fn validate_rejects_decoded_envelope_violations() {
+        let valid_chain = ChainContext {
+            chain_id: 1,
+            block_number: 18_000_000,
+            block_hash: [0xAB; 32],
+        };
+        let valid_payload = SmokeTestPayload {
+            nonce: 7,
+            data: [0xCD; 32],
+        };
+
+        // Case 1: timestamp_ns = 0 (simulates corrupted decoded frame).
+        // Direct struct literal is permitted in test module per spec section 5.3.
+        let bad_ts = EventEnvelope::<SmokeTestPayload> {
+            sequence: 100,
+            timestamp_ns: 0,
+            source: EventSource::Ingress,
+            chain_context: valid_chain.clone(),
+            event_version: 1,
+            correlation_id: 42,
+            payload: valid_payload.clone(),
+        };
+        assert!(matches!(
+            bad_ts.validate(),
+            Err(TypesError::InvalidEnvelope { field: "timestamp_ns", .. })
+        ));
+
+        // Case 2: event_version = 0
+        let bad_ver = EventEnvelope::<SmokeTestPayload> {
+            sequence: 100,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            source: EventSource::Ingress,
+            chain_context: valid_chain.clone(),
+            event_version: 0,
+            correlation_id: 42,
+            payload: valid_payload.clone(),
+        };
+        assert!(matches!(
+            bad_ver.validate(),
+            Err(TypesError::InvalidEnvelope { field: "event_version", .. })
+        ));
+
+        // Case 3: chain_context.chain_id = 0
+        let bad_chain = EventEnvelope::<SmokeTestPayload> {
+            sequence: 100,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            source: EventSource::Ingress,
+            chain_context: ChainContext {
+                chain_id: 0,
+                ..valid_chain.clone()
+            },
+            event_version: 1,
+            correlation_id: 42,
+            payload: valid_payload,
+        };
+        assert!(matches!(
+            bad_chain.validate(),
+            Err(TypesError::InvalidEnvelope { field: "chain_context.chain_id", .. })
+        ));
     }
 }
