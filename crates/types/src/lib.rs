@@ -347,4 +347,17 @@ mod tests {
             Err(TypesError::InvalidEnvelope { field: "chain_context.chain_id", .. })
         ));
     }
+
+    #[test]
+    fn serde_bincode_round_trip_preserves_envelope() {
+        let original = valid_envelope();
+        let bytes = bincode::serialize(&original).expect("bincode serialize");
+        let decoded: EventEnvelope<SmokeTestPayload> =
+            bincode::deserialize(&bytes).expect("bincode deserialize");
+        assert_eq!(original, decoded);
+        // Demonstrates the standard decode-boundary call pattern: every
+        // deserialize path must call validate() before passing the envelope
+        // downstream.
+        decoded.validate().expect("decoded envelope must pass validate()");
+    }
 }
