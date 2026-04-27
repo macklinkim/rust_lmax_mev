@@ -360,4 +360,18 @@ mod tests {
         // downstream.
         decoded.validate().expect("decoded envelope must pass validate()");
     }
+
+    #[test]
+    fn rkyv_archive_round_trip_preserves_envelope() {
+        let original = valid_envelope();
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original)
+            .expect("rkyv serialize");
+        let decoded: EventEnvelope<SmokeTestPayload> =
+            rkyv::from_bytes::<EventEnvelope<SmokeTestPayload>, rkyv::rancor::Error>(&bytes)
+                .expect("rkyv deserialize");
+
+        assert_eq!(original, decoded);
+        decoded.validate().expect("decoded envelope must pass validate()");
+    }
 }
