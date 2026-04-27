@@ -1,5 +1,31 @@
-// Crate-level docstring is added in Task 10. EventEnvelope and TypesError
-// are added in later tasks.
+//! # rust-lmax-mev-types
+//!
+//! Phase 1 type primitives for the LMAX-style MEV engine.
+//!
+//! ## Sequence and timestamp ownership
+//!
+//! `EventEnvelope::sequence` and `EventEnvelope::timestamp_ns` are
+//! **bus-assigned** invariants. Production code populates them exclusively
+//! through the `EventBus::publish(payload, meta)` API; the bus calls
+//! `EventEnvelope::seal()` internally with the values it owns.
+//!
+//! Direct calls to `seal()` outside the bus implementation are reserved for
+//! tests and replay/decode infrastructure. ADR-005 and the event-model spec
+//! govern the canonical ownership contract.
+//!
+//! ## Validation at the deserialize boundary
+//!
+//! `seal()` is the single _validated_ construction path. `serde::Deserialize`
+//! and `rkyv::Deserialize` reconstruct envelope fields directly, **bypassing
+//! `seal()`**. Journal, replay, and decoder consumers MUST call
+//! `EventEnvelope::validate()` immediately after any deserialization to
+//! re-enforce the same invariants `seal()` would have rejected at construction.
+//!
+//! ## Phase 1 version policy
+//!
+//! `event_version = 0` is treated as reserved/uninitialized in Phase 1 and is
+//! rejected by both `seal()` and `validate()`. This is a Phase 1 policy
+//! decision, not a constraint from the frozen event-model spec.
 
 pub type BlockHash = [u8; 32];
 
@@ -192,6 +218,24 @@ impl<T> EventEnvelope<T> {
         &self.payload
     }
 
+    /// Consumes the envelope and returns only the payload, **intentionally
+    /// discarding all metadata** (sequence, timestamp_ns, source,
+    /// chain_context, event_version, correlation_id).
+    ///
+    /// # When to use
+    ///
+    /// Terminal consumers that have already logged or otherwise persisted the
+    /// envelope metadata upstream and only need the typed payload for further
+    /// processing.
+    ///
+    /// # When NOT to use
+    ///
+    /// **Never** call this at bus, journal, or replay boundaries. Metadata
+    /// preservation is a hard correctness requirement at those layers — losing
+    /// `sequence` or `correlation_id` breaks ordering and trace linkage.
+    ///
+    /// If you need both the payload and a metadata field, prefer the getters
+    /// (`.payload()`, `.sequence()`, etc.) over consuming the envelope.
     pub fn into_payload(self) -> T {
         self.payload
     }
