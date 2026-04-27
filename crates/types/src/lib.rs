@@ -63,3 +63,77 @@ pub enum TypesError {
         max_supported: u16,
     },
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct EventEnvelope<T> {
+    sequence: u64,
+    timestamp_ns: u64,
+    source: EventSource,
+    chain_context: ChainContext,
+    event_version: u16,
+    correlation_id: u64,
+    payload: T,
+}
+
+impl<T> EventEnvelope<T> {
+    /// Seals an envelope with bus-assigned `sequence` and `timestamp_ns`.
+    ///
+    /// **STUB — Task 6 replaces this with the real invariant-checking
+    /// implementation. Do not consume in production code while this stub
+    /// is in place.**
+    pub fn seal(
+        meta: PublishMeta,
+        payload: T,
+        sequence: u64,
+        timestamp_ns: u64,
+    ) -> Result<Self, TypesError> {
+        Ok(Self {
+            sequence,
+            timestamp_ns,
+            source: meta.source,
+            chain_context: meta.chain_context,
+            event_version: meta.event_version,
+            correlation_id: meta.correlation_id,
+            payload,
+        })
+    }
+
+    /// Re-validates Phase 1 invariants. **STUB — Task 7 replaces this.**
+    pub fn validate(&self) -> Result<(), TypesError> {
+        Ok(())
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn timestamp_ns(&self) -> u64 {
+        self.timestamp_ns
+    }
+
+    pub fn source(&self) -> EventSource {
+        self.source
+    }
+
+    pub fn event_version(&self) -> u16 {
+        self.event_version
+    }
+
+    pub fn correlation_id(&self) -> u64 {
+        self.correlation_id
+    }
+
+    pub fn chain_context(&self) -> &ChainContext {
+        &self.chain_context
+    }
+
+    pub fn payload(&self) -> &T {
+        &self.payload
+    }
+
+    pub fn into_payload(self) -> T {
+        self.payload
+    }
+}
