@@ -55,11 +55,11 @@ This is the precondition for any subsequent task's `cargo` invocation to succeed
 
 - [ ] **Step 1.1: Read current workspace manifest**
 
-```bash
-cat Cargo.toml
+```powershell
+Get-Content Cargo.toml
 ```
 
-Confirm lines 3–10 list six members and line 18 contains `rkyv = { version = "0.8", features = ["validation"] }`.
+Confirm lines 3–10 list six members and line 18 contains `rkyv = { version = "0.8", features = ["validation"] }`. (`cat` works as a PowerShell alias too, but `Get-Content` is the canonical cmdlet name.)
 
 - [ ] **Step 1.2: Trim `members` to only `crates/types`**
 
@@ -104,30 +104,32 @@ Rationale (spec §6.5): rkyv 0.8 has no `validation` feature. Default features a
 
 - [ ] **Step 1.4: Verify the workspace metadata loads**
 
-```bash
-cargo metadata --format-version 1 --no-deps > /dev/null
+```powershell
+cargo metadata --format-version 1 --no-deps | Out-Null
 ```
 
-Expected: exits 0 with no output. (Errors here mean the workspace is still misconfigured — re-check Steps 1.2/1.3.)
+Expected: exits 0 with no output. (Errors here mean the workspace is still misconfigured — re-check Steps 1.2/1.3.) On PowerShell, `| Out-Null` is the idiomatic equivalent of bash's `> /dev/null`.
 
 - [ ] **Step 1.5: Commit**
 
-```bash
+```powershell
 git add Cargo.toml
-git commit -m "chore: scope workspace to crates/types and fix rkyv feature
+git commit -m @'
+chore: scope workspace to crates/types and fix rkyv feature
 
 Trim workspace members to crates/types only for Task 11 isolation;
 remaining Phase 1 crates re-add their member entries in Task 12-16
 as those crates are created. Empty stub crates are forbidden per
 PHASE_1_DETAIL_REVISION.
 
-Replace rkyv features = [\"validation\"] (non-existent in 0.8) with
-features = [\"bytecheck\"] per spec docs/superpowers/specs/2026-04-27-task-11-types-crate-design.md
+Replace rkyv features = ["validation"] (non-existent in 0.8) with
+features = ["bytecheck"] per spec docs/superpowers/specs/2026-04-27-task-11-types-crate-design.md
 section 6.5. bytecheck is in rkyv 0.8 default features; this lists
 it explicitly to document intent and to keep the safe from_bytes
 high-level API available.
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+'@
 ```
 
 ---
@@ -142,9 +144,11 @@ Goal: a buildable empty crate. No types yet — just the manifest and an empty `
 
 - [ ] **Step 2.1: Create the directory tree**
 
-```bash
-mkdir -p crates/types/src
+```powershell
+New-Item -ItemType Directory -Path crates/types/src -Force | Out-Null
 ```
+
+PowerShell's `New-Item -ItemType Directory` creates intermediate directories as needed. `-Force` makes the command idempotent (no error if the path already exists). `| Out-Null` suppresses the directory-info object that would otherwise print.
 
 - [ ] **Step 2.2: Write `crates/types/Cargo.toml`**
 
@@ -178,7 +182,7 @@ Single line for now:
 
 - [ ] **Step 2.4: Verify the crate builds**
 
-```bash
+```powershell
 cargo check -p rust-lmax-mev-types
 ```
 
@@ -186,15 +190,17 @@ Expected: compiles with no errors and no warnings (an empty lib has no warnings 
 
 - [ ] **Step 2.5: Commit**
 
-```bash
+```powershell
 git add crates/types/Cargo.toml crates/types/src/lib.rs
-git commit -m "feat(types): scaffold rust-lmax-mev-types crate
+git commit -m @'
+feat(types): scaffold rust-lmax-mev-types crate
 
 Empty buildable crate with rkyv, serde, thiserror runtime deps and
 bincode dev-dep per spec section 6.2. Subsequent tasks fill the
 type definitions and tests inline in lib.rs.
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+'@
 ```
 
 ---
@@ -264,7 +270,7 @@ pub struct SmokeTestPayload {
 
 - [ ] **Step 3.2: Verify the crate builds**
 
-```bash
+```powershell
 cargo check -p rust-lmax-mev-types
 ```
 
@@ -276,16 +282,18 @@ If `rkyv::Archive` derive errors on `EventSource`/`ChainContext`/`SmokeTestPaylo
 
 - [ ] **Step 3.3: Commit**
 
-```bash
+```powershell
 git add crates/types/src/lib.rs
-git commit -m "feat(types): add carrier type primitives
+git commit -m @'
+feat(types): add carrier type primitives
 
 Adds BlockHash alias plus EventSource enum, ChainContext,
 PublishMeta, JournalPosition, and SmokeTestPayload structs per
 spec sections 4.2-4.6 and 4.8. All are pub-field transparent
 carriers with derive matrix per spec section 6.1.
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+'@
 ```
 
 ---
@@ -319,7 +327,7 @@ pub enum TypesError {
 
 - [ ] **Step 4.2: Verify the crate builds**
 
-```bash
+```powershell
 cargo check -p rust-lmax-mev-types
 ```
 
@@ -327,9 +335,10 @@ Expected: compiles with no errors. `UnsupportedEventVersion` may appear in outpu
 
 - [ ] **Step 4.3: Commit**
 
-```bash
+```powershell
 git add crates/types/src/lib.rs
-git commit -m "feat(types): add TypesError with two variants
+git commit -m @'
+feat(types): add TypesError with two variants
 
 InvalidEnvelope is raised by seal()/validate() at the construction
 and deserialize boundaries. UnsupportedEventVersion has no Phase 1
@@ -337,7 +346,8 @@ emit site - it is reserved for journal/replay decoders in Task 13
 and Phase 2. Both variants use static string field/reason payloads
 to avoid heap allocation in the hot error path.
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+'@
 ```
 
 ---
@@ -433,7 +443,7 @@ The docstring on `into_payload` is intentionally minimal here; the **full** docs
 
 - [ ] **Step 5.2: Verify the crate builds**
 
-```bash
+```powershell
 cargo check -p rust-lmax-mev-types
 ```
 
@@ -443,9 +453,10 @@ If you see a derive error on `EventEnvelope<T>`'s `rkyv::Archive` derive related
 
 - [ ] **Step 5.3: Commit**
 
-```bash
+```powershell
 git add crates/types/src/lib.rs
-git commit -m "feat(types): add EventEnvelope<T> with stub seal/validate/getters
+git commit -m @'
+feat(types): add EventEnvelope<T> with stub seal/validate/getters
 
 EventEnvelope is the only encapsulated type in the crate - all 7
 fields are private, exposed only through seal() (construction),
@@ -456,7 +467,8 @@ TDD tasks (Task 6, 7) can write tests against the API. seal() and
 validate() currently lack the invariant checks - those land in
 Task 6 and Task 7 via test-driven flows.
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+'@
 ```
 
 ---
@@ -568,7 +580,7 @@ mod tests {
 
 - [ ] **Step 6.2: Run Test 1, expect FAIL**
 
-```bash
+```powershell
 cargo test -p rust-lmax-mev-types seal_enforces_phase_1_invariants
 ```
 
@@ -650,7 +662,7 @@ The 4-space indentation (inside `impl<T> EventEnvelope<T> { ... }`) must be pres
 
 - [ ] **Step 6.4: Run Test 1, expect PASS**
 
-```bash
+```powershell
 cargo test -p rust-lmax-mev-types seal_enforces_phase_1_invariants
 ```
 
@@ -658,9 +670,10 @@ Expected: PASS. (Note: `validate()` cross-check passes only because the stub `va
 
 - [ ] **Step 6.5: Commit**
 
-```bash
+```powershell
 git add crates/types/src/lib.rs
-git commit -m "feat(types): seal() validates Phase 1 invariants (TDD)
+git commit -m @'
+feat(types): seal() validates Phase 1 invariants (TDD)
 
 Implements the three seal() invariant checks (timestamp_ns,
 event_version, chain_id all non-zero) per spec section 5.2 by way
@@ -671,7 +684,8 @@ cases plus the happy path with full getter readback.
 Test 1 also calls env.validate() on the happy envelope as a
 cross-check; the validate() reject paths land in Task 7.
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+'@
 ```
 
 ---
@@ -751,7 +765,7 @@ fn validate_rejects_decoded_envelope_violations() {
 
 - [ ] **Step 7.2: Run Test 2, expect FAIL**
 
-```bash
+```powershell
 cargo test -p rust-lmax-mev-types validate_rejects_decoded_envelope_violations
 ```
 
@@ -791,7 +805,7 @@ pub fn validate(&self) -> Result<(), TypesError> {
 
 - [ ] **Step 7.4: Run both tests, expect PASS**
 
-```bash
+```powershell
 cargo test -p rust-lmax-mev-types
 ```
 
@@ -799,9 +813,10 @@ Expected: both `seal_enforces_phase_1_invariants` and `validate_rejects_decoded_
 
 - [ ] **Step 7.5: Commit**
 
-```bash
+```powershell
 git add crates/types/src/lib.rs
-git commit -m "feat(types): validate() re-checks invariants on decoded envelopes (TDD)
+git commit -m @'
+feat(types): validate() re-checks invariants on decoded envelopes (TDD)
 
 Implements EventEnvelope::validate() by delegating to the
 check_envelope_invariants helper introduced in Task 6, so seal()
@@ -814,7 +829,8 @@ in the test module (permitted by same-module visibility, see
 spec section 5.3 'test-only direct struct literal') and asserts
 each violation is rejected with the expected field tag.
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+'@
 ```
 
 ---
@@ -845,7 +861,7 @@ fn serde_bincode_round_trip_preserves_envelope() {
 
 - [ ] **Step 8.2: Run Test 3, expect PASS**
 
-```bash
+```powershell
 cargo test -p rust-lmax-mev-types serde_bincode_round_trip_preserves_envelope
 ```
 
@@ -855,9 +871,10 @@ Expected: PASS. If FAIL, the most likely causes are:
 
 - [ ] **Step 8.3: Commit**
 
-```bash
+```powershell
 git add crates/types/src/lib.rs
-git commit -m "test(types): bincode round-trip preserves envelope semantic equality
+git commit -m @'
+test(types): bincode round-trip preserves envelope semantic equality
 
 Adds Test 3 serde_bincode_round_trip_preserves_envelope. Verifies
 that serde derives + bincode 1.x serde adapter produce a decoded
@@ -868,7 +885,8 @@ decode-boundary call pattern from spec section 5.3).
 Implements the cold-path serializer side of ADR-004's serialization
 policy at the smallest verification surface.
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+'@
 ```
 
 ---
@@ -900,7 +918,7 @@ fn rkyv_archive_round_trip_preserves_envelope() {
 
 - [ ] **Step 9.2: Run Test 4, expect PASS**
 
-```bash
+```powershell
 cargo test -p rust-lmax-mev-types rkyv_archive_round_trip_preserves_envelope
 ```
 
@@ -918,7 +936,7 @@ Expected: PASS.
 
 - [ ] **Step 9.4: Run all tests once Test 4 passes**
 
-```bash
+```powershell
 cargo test -p rust-lmax-mev-types
 ```
 
@@ -926,9 +944,10 @@ Expected: 4 tests pass.
 
 - [ ] **Step 9.5: Commit**
 
-```bash
+```powershell
 git add crates/types/src/lib.rs
-git commit -m "test(types): rkyv archive round-trip preserves envelope semantic equality
+git commit -m @'
+test(types): rkyv archive round-trip preserves envelope semantic equality
 
 Adds Test 4 rkyv_archive_round_trip_preserves_envelope. Exercises
 rkyv 0.8 to_bytes/from_bytes high-level API with rkyv::rancor::Error
@@ -938,7 +957,8 @@ original and passes validate().
 Closes ADR-004's hot-path serialization consequence at the smallest
 verification surface for Phase 1 types.
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+'@
 ```
 
 ---
@@ -1013,7 +1033,7 @@ pub fn into_payload(self) -> T {
 
 - [ ] **Step 10.3: Verify docs render**
 
-```bash
+```powershell
 cargo doc -p rust-lmax-mev-types --no-deps
 ```
 
@@ -1021,19 +1041,21 @@ Expected: builds with no errors. (No need to open the HTML — successful build 
 
 - [ ] **Step 10.4: Commit**
 
-```bash
+```powershell
 git add crates/types/src/lib.rs
-git commit -m "docs(types): add crate-level docstring and into_payload full doc
+git commit -m @'
+docs(types): add crate-level docstring and into_payload full doc
 
 Crate-level docstring covers sequence/timestamp ownership, the
 deserialize-boundary validate() obligation, and the Phase 1
 event_version=0 reserved policy per spec section 5.7.
 
 into_payload docstring per spec section 5.5 with the explicit
-'When NOT to use' warning that deters use at bus/journal/replay
+"When NOT to use" warning that deters use at bus/journal/replay
 boundaries.
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+'@
 ```
 
 ---
@@ -1047,13 +1069,13 @@ Goal: verify all spec §9 Definition of Done items are satisfied. This task may 
 
 - [ ] **Step 11.1: `cargo fmt`**
 
-```bash
+```powershell
 cargo fmt --check
 ```
 
 If FAIL:
 
-```bash
+```powershell
 cargo fmt
 ```
 
@@ -1061,7 +1083,7 @@ then re-run `cargo fmt --check` to confirm clean.
 
 - [ ] **Step 11.2: `cargo clippy` with `-D warnings`**
 
-```bash
+```powershell
 cargo clippy -p rust-lmax-mev-types -- -D warnings
 ```
 
@@ -1075,7 +1097,7 @@ If any other clippy warnings surface that are clearly stylistic (e.g. needless `
 
 - [ ] **Step 11.3: Full test pass**
 
-```bash
+```powershell
 cargo test -p rust-lmax-mev-types
 ```
 
@@ -1087,7 +1109,7 @@ Expected: 4 tests pass:
 
 - [ ] **Step 11.4: Build with no warnings**
 
-```bash
+```powershell
 cargo build -p rust-lmax-mev-types
 ```
 
@@ -1113,11 +1135,13 @@ Open `docs/superpowers/specs/2026-04-27-task-11-types-crate-design.md` and verif
 
 If Steps 11.1–11.4 produced any auto-formatting or clippy fixes:
 
-```bash
+```powershell
 git add crates/types/src/lib.rs
-git commit -m "chore(types): final fmt/clippy cleanup
+git commit -m @'
+chore(types): final fmt/clippy cleanup
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+'@
 ```
 
 If everything was already clean, no commit is needed.
