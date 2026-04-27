@@ -1,0 +1,15 @@
+[package]
+name = "rust-lmax-mev-types"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Phase 1 type primitives for the LMAX-style MEV engine"
+
+[dependencies]
+rkyv = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+bincode = { workspace = true }
