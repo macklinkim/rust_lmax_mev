@@ -8,6 +8,12 @@
 
 **Tech Stack:** Rust 1.80, edition 2021. Workspace deps used: `rkyv = "0.8"` (features `["bytecheck"]`), `serde = "1"` (`features = ["derive"]`), `thiserror = "2"`. Dev-dep: `bincode = "1.3"` (serde adapter for cold-path round-trip test).
 
+**Execution shell:** Windows 11 + PowerShell. Commands below are PowerShell-native. Notes:
+- Many GNU CLI shims (`cat.exe`, `mkdir.exe`, `tee.exe`, `grep.exe`, `rg.exe`, ...) exist via Scoop, but PowerShell aliases (`cat`/`mkdir`/`tee`) shadow them. When GNU semantics are needed, append `.exe`.
+- `scoop.ps1` may be blocked by execution policy — use `scoop.cmd list` or `cmd /c scoop list` for inspection if needed.
+- Multi-line strings to native executables (e.g., `git commit -m`) use **multiple `-m` arguments** rather than here-strings. Each `-m` argument becomes a separate paragraph in the resulting commit message. This avoids edge-case parsing issues with `@'...'@` here-strings inside non-trivial shell contexts.
+- Line-continuation is the backtick (`` ` ``) at end of line.
+
 ---
 
 ## Pre-flight Reading
@@ -114,22 +120,11 @@ Expected: exits 0 with no output. (Errors here mean the workspace is still misco
 
 ```powershell
 git add Cargo.toml
-git commit -m @'
-chore: scope workspace to crates/types and fix rkyv feature
-
-Trim workspace members to crates/types only for Task 11 isolation;
-remaining Phase 1 crates re-add their member entries in Task 12-16
-as those crates are created. Empty stub crates are forbidden per
-PHASE_1_DETAIL_REVISION.
-
-Replace rkyv features = ["validation"] (non-existent in 0.8) with
-features = ["bytecheck"] per spec docs/superpowers/specs/2026-04-27-task-11-types-crate-design.md
-section 6.5. bytecheck is in rkyv 0.8 default features; this lists
-it explicitly to document intent and to keep the safe from_bytes
-high-level API available.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-'@
+git commit `
+    -m 'chore: scope workspace to crates/types and fix rkyv feature' `
+    -m 'Trim workspace members to crates/types only for Task 11 isolation; remaining Phase 1 crates re-add their member entries in Task 12-16 as those crates are created. Empty stub crates are forbidden per PHASE_1_DETAIL_REVISION.' `
+    -m 'Replace rkyv features = ["validation"] (non-existent in 0.8) with features = ["bytecheck"] per spec docs/superpowers/specs/2026-04-27-task-11-types-crate-design.md section 6.5. bytecheck is in rkyv 0.8 default features; this lists it explicitly to document intent and to keep the safe from_bytes high-level API available.' `
+    -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'
 ```
 
 ---
@@ -192,15 +187,10 @@ Expected: compiles with no errors and no warnings (an empty lib has no warnings 
 
 ```powershell
 git add crates/types/Cargo.toml crates/types/src/lib.rs
-git commit -m @'
-feat(types): scaffold rust-lmax-mev-types crate
-
-Empty buildable crate with rkyv, serde, thiserror runtime deps and
-bincode dev-dep per spec section 6.2. Subsequent tasks fill the
-type definitions and tests inline in lib.rs.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-'@
+git commit `
+    -m 'feat(types): scaffold rust-lmax-mev-types crate' `
+    -m 'Empty buildable crate with rkyv, serde, thiserror runtime deps and bincode dev-dep per spec section 6.2. Subsequent tasks fill the type definitions and tests inline in lib.rs.' `
+    -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'
 ```
 
 ---
@@ -284,16 +274,10 @@ If `rkyv::Archive` derive errors on `EventSource`/`ChainContext`/`SmokeTestPaylo
 
 ```powershell
 git add crates/types/src/lib.rs
-git commit -m @'
-feat(types): add carrier type primitives
-
-Adds BlockHash alias plus EventSource enum, ChainContext,
-PublishMeta, JournalPosition, and SmokeTestPayload structs per
-spec sections 4.2-4.6 and 4.8. All are pub-field transparent
-carriers with derive matrix per spec section 6.1.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-'@
+git commit `
+    -m 'feat(types): add carrier type primitives' `
+    -m 'Adds BlockHash alias plus EventSource enum, ChainContext, PublishMeta, JournalPosition, and SmokeTestPayload structs per spec sections 4.2-4.6 and 4.8. All are pub-field transparent carriers with derive matrix per spec section 6.1.' `
+    -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'
 ```
 
 ---
@@ -337,17 +321,10 @@ Expected: compiles with no errors. `UnsupportedEventVersion` may appear in outpu
 
 ```powershell
 git add crates/types/src/lib.rs
-git commit -m @'
-feat(types): add TypesError with two variants
-
-InvalidEnvelope is raised by seal()/validate() at the construction
-and deserialize boundaries. UnsupportedEventVersion has no Phase 1
-emit site - it is reserved for journal/replay decoders in Task 13
-and Phase 2. Both variants use static string field/reason payloads
-to avoid heap allocation in the hot error path.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-'@
+git commit `
+    -m 'feat(types): add TypesError with two variants' `
+    -m 'InvalidEnvelope is raised by seal()/validate() at the construction and deserialize boundaries. UnsupportedEventVersion has no Phase 1 emit site - it is reserved for journal/replay decoders in Task 13 and Phase 2. Both variants use static string field/reason payloads to avoid heap allocation in the hot error path.' `
+    -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'
 ```
 
 ---
@@ -455,20 +432,11 @@ If you see a derive error on `EventEnvelope<T>`'s `rkyv::Archive` derive related
 
 ```powershell
 git add crates/types/src/lib.rs
-git commit -m @'
-feat(types): add EventEnvelope<T> with stub seal/validate/getters
-
-EventEnvelope is the only encapsulated type in the crate - all 7
-fields are private, exposed only through seal() (construction),
-validate() (post-decode check), getters, and into_payload (consume).
-
-This commit adds the struct and stub method bodies so subsequent
-TDD tasks (Task 6, 7) can write tests against the API. seal() and
-validate() currently lack the invariant checks - those land in
-Task 6 and Task 7 via test-driven flows.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-'@
+git commit `
+    -m 'feat(types): add EventEnvelope<T> with stub seal/validate/getters' `
+    -m 'EventEnvelope is the only encapsulated type in the crate - all 7 fields are private, exposed only through seal() (construction), validate() (post-decode check), getters, and into_payload (consume).' `
+    -m 'This commit adds the struct and stub method bodies so subsequent TDD tasks (Task 6, 7) can write tests against the API. seal() and validate() currently lack the invariant checks - those land in Task 6 and Task 7 via test-driven flows.' `
+    -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'
 ```
 
 ---
@@ -672,20 +640,11 @@ Expected: PASS. (Note: `validate()` cross-check passes only because the stub `va
 
 ```powershell
 git add crates/types/src/lib.rs
-git commit -m @'
-feat(types): seal() validates Phase 1 invariants (TDD)
-
-Implements the three seal() invariant checks (timestamp_ns,
-event_version, chain_id all non-zero) per spec section 5.2 by way
-of a crate-private check_envelope_invariants helper. Adds Test 1
-seal_enforces_phase_1_invariants that exercises all three reject
-cases plus the happy path with full getter readback.
-
-Test 1 also calls env.validate() on the happy envelope as a
-cross-check; the validate() reject paths land in Task 7.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-'@
+git commit `
+    -m 'feat(types): seal() validates Phase 1 invariants (TDD)' `
+    -m 'Implements the three seal() invariant checks (timestamp_ns, event_version, chain_id all non-zero) per spec section 5.2 by way of a crate-private check_envelope_invariants helper. Adds Test 1 seal_enforces_phase_1_invariants that exercises all three reject cases plus the happy path with full getter readback.' `
+    -m 'Test 1 also calls env.validate() on the happy envelope as a cross-check; the validate() reject paths land in Task 7.' `
+    -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'
 ```
 
 ---
@@ -815,22 +774,11 @@ Expected: both `seal_enforces_phase_1_invariants` and `validate_rejects_decoded_
 
 ```powershell
 git add crates/types/src/lib.rs
-git commit -m @'
-feat(types): validate() re-checks invariants on decoded envelopes (TDD)
-
-Implements EventEnvelope::validate() by delegating to the
-check_envelope_invariants helper introduced in Task 6, so seal()
-and validate() share one source of truth for the three Phase 1
-invariants per spec section 5.3.
-
-Adds Test 2 validate_rejects_decoded_envelope_violations that
-constructs invariant-violating envelopes via direct struct literal
-in the test module (permitted by same-module visibility, see
-spec section 5.3 'test-only direct struct literal') and asserts
-each violation is rejected with the expected field tag.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-'@
+git commit `
+    -m 'feat(types): validate() re-checks invariants on decoded envelopes (TDD)' `
+    -m 'Implements EventEnvelope::validate() by delegating to the check_envelope_invariants helper introduced in Task 6, so seal() and validate() share one source of truth for the three Phase 1 invariants per spec section 5.3.' `
+    -m "Adds Test 2 validate_rejects_decoded_envelope_violations that constructs invariant-violating envelopes via direct struct literal in the test module (permitted by same-module visibility, see spec section 5.3 'test-only direct struct literal') and asserts each violation is rejected with the expected field tag." `
+    -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'
 ```
 
 ---
@@ -873,20 +821,11 @@ Expected: PASS. If FAIL, the most likely causes are:
 
 ```powershell
 git add crates/types/src/lib.rs
-git commit -m @'
-test(types): bincode round-trip preserves envelope semantic equality
-
-Adds Test 3 serde_bincode_round_trip_preserves_envelope. Verifies
-that serde derives + bincode 1.x serde adapter produce a decoded
-envelope that compares equal to the original via PartialEq, and
-that validate() accepts the decoded envelope (demonstrating the
-decode-boundary call pattern from spec section 5.3).
-
-Implements the cold-path serializer side of ADR-004's serialization
-policy at the smallest verification surface.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-'@
+git commit `
+    -m 'test(types): bincode round-trip preserves envelope semantic equality' `
+    -m 'Adds Test 3 serde_bincode_round_trip_preserves_envelope. Verifies that serde derives + bincode 1.x serde adapter produce a decoded envelope that compares equal to the original via PartialEq, and that validate() accepts the decoded envelope (demonstrating the decode-boundary call pattern from spec section 5.3).' `
+    -m "Implements the cold-path serializer side of ADR-004's serialization policy at the smallest verification surface." `
+    -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'
 ```
 
 ---
@@ -946,19 +885,11 @@ Expected: 4 tests pass.
 
 ```powershell
 git add crates/types/src/lib.rs
-git commit -m @'
-test(types): rkyv archive round-trip preserves envelope semantic equality
-
-Adds Test 4 rkyv_archive_round_trip_preserves_envelope. Exercises
-rkyv 0.8 to_bytes/from_bytes high-level API with rkyv::rancor::Error
-unified error path. Verifies decoded envelope is PartialEq with the
-original and passes validate().
-
-Closes ADR-004's hot-path serialization consequence at the smallest
-verification surface for Phase 1 types.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-'@
+git commit `
+    -m 'test(types): rkyv archive round-trip preserves envelope semantic equality' `
+    -m 'Adds Test 4 rkyv_archive_round_trip_preserves_envelope. Exercises rkyv 0.8 to_bytes/from_bytes high-level API with rkyv::rancor::Error unified error path. Verifies decoded envelope is PartialEq with the original and passes validate().' `
+    -m "Closes ADR-004's hot-path serialization consequence at the smallest verification surface for Phase 1 types." `
+    -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'
 ```
 
 ---
@@ -1043,19 +974,11 @@ Expected: builds with no errors. (No need to open the HTML — successful build 
 
 ```powershell
 git add crates/types/src/lib.rs
-git commit -m @'
-docs(types): add crate-level docstring and into_payload full doc
-
-Crate-level docstring covers sequence/timestamp ownership, the
-deserialize-boundary validate() obligation, and the Phase 1
-event_version=0 reserved policy per spec section 5.7.
-
-into_payload docstring per spec section 5.5 with the explicit
-"When NOT to use" warning that deters use at bus/journal/replay
-boundaries.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-'@
+git commit `
+    -m 'docs(types): add crate-level docstring and into_payload full doc' `
+    -m 'Crate-level docstring covers sequence/timestamp ownership, the deserialize-boundary validate() obligation, and the Phase 1 event_version=0 reserved policy per spec section 5.7.' `
+    -m 'into_payload docstring per spec section 5.5 with the explicit "When NOT to use" warning that deters use at bus/journal/replay boundaries.' `
+    -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'
 ```
 
 ---
@@ -1137,11 +1060,9 @@ If Steps 11.1–11.4 produced any auto-formatting or clippy fixes:
 
 ```powershell
 git add crates/types/src/lib.rs
-git commit -m @'
-chore(types): final fmt/clippy cleanup
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-'@
+git commit `
+    -m 'chore(types): final fmt/clippy cleanup' `
+    -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'
 ```
 
 If everything was already clean, no commit is needed.
