@@ -1,7 +1,7 @@
 # Task 11: `crates/types` — Phase 1 Type Primitives Design
 
 **작성일:** 2026-04-27
-**문서 상태:** v0.2 Approved (reviewer 2회 통과, 사용자 최종 검토 대기)
+**문서 상태:** v0.3 Approved (reviewer 3회 통과, 사용자 최종 검토 대기)
 **대상 작업:** Phase 1 / Task 11 / `crates/types` 크레이트 신설
 **선행 입력:**
 - `docs/specs/event-model.md` (frozen)
@@ -332,6 +332,12 @@ impl<T> EventEnvelope<T> {
 - `validate()`만 두고 `seal()`을 빼면, 생성 시 `Result`를 통한 명시적 실패 경로가 사라진다 (생성자가 모든 입력을 받아들인 후 별도 호출에서 검증되어야 함 — caller-side 의무 부담↑).
 - 두 메서드를 같은 invariant 셋으로 둘 다 노출하는 것이 가장 적은 우회 표면을 만든다.
 
+**테스트에서의 직접 struct literal 허용:**
+
+`validate()` reject 케이스는 corrupted/deserialized frame 시뮬레이션이 필요하다. `serde::Deserialize` / `rkyv::Deserialize`가 만들어낼 수 있는 invariant-violating envelope를 produce하는 가장 직접적인 방법은 unit test 모듈 내부에서 struct literal로 envelope를 직접 구성하는 것이다 — `mod tests` 가 `super::*`를 통해 같은 모듈의 private 필드에 접근 가능하기 때문에 이는 컴파일러가 허용하는 합법적 경로다.
+
+이 우회는 **test-only 한정**이며, 공개 생성 계약(`seal()`이 유일한 _validated_ 생성 경로라는 본 spec의 §3.4 원칙)을 약화시키지 않는다. 테스트 모듈 외부의 어떤 consumer도 envelope의 private 필드를 struct literal로 채울 수 없다 — 이는 same-module 가시성 규칙이 보장한다. 본 spec은 §7.3 테스트(`validate_rejects_decoded_envelope_violations`)가 이 패턴을 사용함을 명시적으로 허용한다.
+
 ### 5.4 `event_version = 0` 정책 명시
 
 `event_version = 0`이 reserved/uninitialized라는 결정은 frozen spec(`docs/specs/event-model.md`)에 직접 박힌 문장이 아니다. Phase 1 정책으로 다음 두 곳에 명시한다:
@@ -460,7 +466,7 @@ bincode = { workspace = true }
 - `thiserror` — Error derive
 
 **dev dep 1개:**
-- `bincode` — serde 어댑터 기반 cold-path serializer. 6.5의 serde round-trip 테스트 전용. 런타임 의존 아님.
+- `bincode` — serde 어댑터 기반 cold-path serializer. §7.4의 serde round-trip 테스트 전용. 런타임 의존 아님.
 
 ### 6.3 제외한 워크스페이스 deps와 그 이유
 
@@ -503,7 +509,7 @@ Task 11 구현자는 `cargo check -p rust-lmax-mev-types` 또는 워크스페이
 
 ---
 
-## 7. 테스트 계획 (3개 인라인 `#[cfg(test)]`)
+## 7. 테스트 계획 (4개 인라인 `#[cfg(test)]`)
 
 ### 7.1 공통 fixture
 
@@ -539,21 +545,83 @@ mod tests {
 
 ### 7.2 테스트 1 — `seal_enforces_phase_1_invariants`
 
-**목적:** §5.2의 invariant 3개에 대한 `seal()` reject + happy path 검증, 그리고 §5.3의 `validate()`가 동일 invariant 셋을 같은 방식으로 강제하는지 cross-check.
+**목적:** §5.2의 invariant 3개에 대한 `seal()` reject + happy path 검증.
 
 한 함수 안에서 다음을 순차 assertion으로 검증:
 
-1. `seal()` reject: `timestamp_ns=0`, `event_version=0`, `chain_id=0` 각각 → `InvalidEnvelope { field, .. }`.
+1. `seal()` reject: `timestamp_ns=0`, `event_version=0`, `chain_id=0` 각각 → `InvalidEnvelope { field, reason }` (정확한 `field`/`reason` 페어 매칭).
 2. `seal()` happy path: 정상 입력으로 envelope 생성 → 모든 getter 반환값이 입력 그대로.
-3. **`validate()` happy path**: 위에서 생성된 정상 envelope에 대해 `env.validate()` → `Ok(())`.
+3. happy envelope에 대해 `env.validate()` → `Ok(())` (validate()와 seal()이 동일한 happy 입력을 동일하게 받아들이는지 cross-check).
 
-`validate()`의 reject 케이스(즉 `timestamp_ns=0` 같은 손상 envelope에 대한 거부)는 별도 테스트하지 않는다. 이유:
-- `seal()`과 `validate()`가 동일한 helper로 같은 3개 invariant를 검사함이 §5.3 계약.
-- `seal()` 거부 테스트가 invariant 검사 로직을 이미 cover.
-- 손상된 envelope는 deserialize-only 경로에서만 발생 가능한데, 이를 인위적으로 만들려면 binary frame을 직접 조작해야 함 — Task 13 (journal corruption test) 영역.
-- Phase 1 testing scope를 부풀리지 않음.
+### 7.3 테스트 2 — `validate_rejects_decoded_envelope_violations`
 
-### 7.3 테스트 2 — `serde_bincode_round_trip_preserves_envelope`
+**목적:** §5.3의 `validate()`가 deserialize 우회로 들어온 invariant-violating envelope를 정확히 거부하는지 검증. unit test 모듈이 `super::*`로 private 필드에 접근 가능한 점을 이용해, struct literal로 invalid envelope를 직접 구성한다 — 이는 corrupted/deserialized frame이 만들어낼 수 있는 envelope shape를 정확히 시뮬레이션한다 (§5.3 test-only 우회 허용 참조).
+
+```rust
+#[test]
+fn validate_rejects_decoded_envelope_violations() {
+    let valid_chain = ChainContext {
+        chain_id: 1,
+        block_number: 18_000_000,
+        block_hash: [0xAB; 32],
+    };
+    let valid_payload = SmokeTestPayload { nonce: 7, data: [0xCD; 32] };
+
+    // Case 1: timestamp_ns = 0 (corrupted frame)
+    let bad_ts = EventEnvelope::<SmokeTestPayload> {
+        sequence: 100,
+        timestamp_ns: 0,
+        source: EventSource::Ingress,
+        chain_context: valid_chain.clone(),
+        event_version: 1,
+        correlation_id: 42,
+        payload: valid_payload.clone(),
+    };
+    assert!(matches!(
+        bad_ts.validate(),
+        Err(TypesError::InvalidEnvelope { field: "timestamp_ns", .. })
+    ));
+
+    // Case 2: event_version = 0
+    let bad_ver = EventEnvelope::<SmokeTestPayload> {
+        sequence: 100,
+        timestamp_ns: 1_700_000_000_000_000_000,
+        source: EventSource::Ingress,
+        chain_context: valid_chain.clone(),
+        event_version: 0,
+        correlation_id: 42,
+        payload: valid_payload.clone(),
+    };
+    assert!(matches!(
+        bad_ver.validate(),
+        Err(TypesError::InvalidEnvelope { field: "event_version", .. })
+    ));
+
+    // Case 3: chain_context.chain_id = 0
+    let bad_chain = EventEnvelope::<SmokeTestPayload> {
+        sequence: 100,
+        timestamp_ns: 1_700_000_000_000_000_000,
+        source: EventSource::Ingress,
+        chain_context: ChainContext { chain_id: 0, ..valid_chain.clone() },
+        event_version: 1,
+        correlation_id: 42,
+        payload: valid_payload,
+    };
+    assert!(matches!(
+        bad_chain.validate(),
+        Err(TypesError::InvalidEnvelope { field: "chain_context.chain_id", .. })
+    ));
+}
+```
+
+**테스트 의의:**
+- §5.3의 우회 차단 계약을 실제 코드로 못박는다. validate() implementation에 회귀가 발생하면 이 테스트가 즉시 잡는다.
+- struct literal 직접 생성은 테스트 모듈 한정 패턴이며, lib.rs 외부의 어떤 consumer도 흉내낼 수 없다 — same-module 가시성으로 보장.
+- 이 테스트가 cover하는 영역은 binary frame 조작 기반 corruption test와 별개. binary 손상 시나리오는 여전히 Task 13 (journal)에서 별도로 검증.
+
+### 7.4 테스트 3 — `serde_bincode_round_trip_preserves_envelope`
+
+
 
 **목적:** serde derive가 envelope 전체에 대해 직렬화 → 역직렬화 round-trip을 보존하는지 검증. PHASE_1_DETAIL_REVISION 3.2의 "semantic equality" 요구사항을 가장 작은 surface에서 확인. 추가로, decode 후 `validate()` 호출이 happy path를 통과하는지도 확인 (§5.3의 호출 책임을 테스트로 시연).
 
@@ -572,7 +640,7 @@ fn serde_bincode_round_trip_preserves_envelope() {
 
 `PartialEq + Eq` derive로 한 줄 비교로 충분. ADR-004의 cold-path serializer를 실제로 통과시키는 의미적 round-trip이다.
 
-### 7.4 테스트 3 — `rkyv_archive_round_trip_preserves_envelope`
+### 7.5 테스트 4 — `rkyv_archive_round_trip_preserves_envelope`
 
 **목적:** rkyv archive → deserialize round-trip이 envelope 전체에 대해 동작하는지 검증. ADR-004 "all event bus message types must derive `rkyv::Archive`/`Serialize`/`Deserialize`" consequence를 컴파일 시점과 런타임 시점 양쪽에서 입증.
 
@@ -590,12 +658,14 @@ fn rkyv_archive_round_trip_preserves_envelope() {
             .expect("rkyv deserialize");
 
     assert_eq!(original, decoded);
+    // decode 경계의 표준 호출 패턴 시연
+    decoded.validate().expect("decoded envelope must pass validate()");
 }
 ```
 
 API 시그니처 출처: <https://docs.rs/rkyv/latest/rkyv/fn.to_bytes.html>, <https://docs.rs/rkyv/latest/rkyv/fn.from_bytes.html>. safe `from_bytes`에는 `bytecheck` feature가 필요하며, `alloc`은 default feature `std`에 의해 자동 활성화된다 (6.5의 워크스페이스 보정으로 해결).
 
-### 7.5 fallback 정책
+### 7.6 fallback 정책
 
 위 테스트 작성 중 다음 상황이 발생할 수 있다:
 
@@ -639,7 +709,10 @@ Task 11이 완료되었다고 선언하기 위한 검증 가능 항목:
 3. `EventEnvelope`의 필드는 모두 private이며 §3.4의 메서드만 노출한다 — getter 7개 + `seal()` + `validate()` + `into_payload()` 총 10개.
 4. `EventEnvelope::seal()`이 §5.2의 invariant 3개를 강제하고 위반 시 `TypesError::InvalidEnvelope`을 반환한다.
 5. `EventEnvelope::validate()`가 `seal()`과 **동일한** 3개 invariant를 검사하며, 위반 시 같은 `field`/`reason` 페어를 가진 `TypesError::InvalidEnvelope`을 반환한다 (deserialize 경계 보호).
-6. §7의 테스트 3개가 모두 통과한다 (`cargo test -p rust-lmax-mev-types`). serde/rkyv round-trip 테스트는 decoded envelope에 대해 `validate()` 호출이 `Ok` 임을 같이 검증한다.
+6. §7의 테스트 4개가 모두 통과한다 (`cargo test -p rust-lmax-mev-types`). 구체적으로:
+   - 테스트 1: `seal()` reject + happy path + happy envelope의 `validate()` Ok cross-check.
+   - 테스트 2: `validate()` reject — unit test 모듈 내부에서 struct literal로 invariant-violating envelope를 직접 구성해 3개 케이스 모두 거부됨을 검증.
+   - 테스트 3 (serde) / 테스트 4 (rkyv): round-trip 후 `decoded.validate()`가 `Ok`임을 같이 검증.
 7. `cargo build -p rust-lmax-mev-types`가 경고 없이 통과한다.
 8. `cargo clippy -p rust-lmax-mev-types -- -D warnings`가 통과한다.
 9. `cargo fmt --check`가 통과한다.
@@ -672,7 +745,7 @@ Task 11이 완료되었다고 선언하기 위한 검증 가능 항목:
 
 그러나 워크스페이스 `Cargo.toml`은 `bincode = "1.3"`로 고정되어 있고, **bincode 1.x는 자체 `Encode`/`Decode` derive가 없으며 serde 어댑터(`bincode::serialize` / `bincode::deserialize`)를 통해 동작한다**. `Encode`/`Decode` derive는 bincode 2.x에서 도입된 별도 API다.
 
-본 spec(§7.3 serde round-trip 테스트)은 `bincode = 1.3`의 serde 어댑터 형태(`bincode::serialize` / `bincode::deserialize`)를 사용하므로 Task 11 작업 자체는 영향받지 않는다. 다만 ADR-004 Consequences 문장이 현재 워크스페이스 의존성과 일치하지 않으므로 다음 중 하나로 후속 보정해야 한다:
+본 spec(§7.4 serde round-trip 테스트)은 `bincode = 1.3`의 serde 어댑터 형태(`bincode::serialize` / `bincode::deserialize`)를 사용하므로 Task 11 작업 자체는 영향받지 않는다. 다만 ADR-004 Consequences 문장이 현재 워크스페이스 의존성과 일치하지 않으므로 다음 중 하나로 후속 보정해야 한다:
 
 1. ADR-004 Consequences를 "Snapshot types must implement `serde::Serialize` and `serde::Deserialize`, encoded via `bincode` (1.x serde adapter)"로 수정.
 2. 또는 워크스페이스 `Cargo.toml`을 `bincode = "2.x"`로 업그레이드하고 ADR-004 문구는 그대로 유지하되 Migration 노트를 추가.
