@@ -29,9 +29,19 @@
 
 pub type BlockHash = [u8; 32];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum EventSource {
     Ingress,
     Normalizer,
@@ -43,17 +53,24 @@ pub enum EventSource {
     Relay,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ChainContext {
     pub chain_id: u64,
     pub block_number: u64,
     pub block_hash: BlockHash,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublishMeta {
     pub source: EventSource,
     pub chain_context: ChainContext,
@@ -61,16 +78,23 @@ pub struct PublishMeta {
     pub correlation_id: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct JournalPosition {
     pub sequence: u64,
     pub byte_offset: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct SmokeTestPayload {
     pub nonce: u64,
     pub data: [u8; 32],
@@ -84,10 +108,7 @@ pub enum TypesError {
         reason: &'static str,
     },
     #[error("unsupported event_version: found={found}, max_supported={max_supported}")]
-    UnsupportedEventVersion {
-        found: u16,
-        max_supported: u16,
-    },
+    UnsupportedEventVersion { found: u16, max_supported: u16 },
 }
 
 fn check_envelope_invariants(
@@ -116,9 +137,17 @@ fn check_envelope_invariants(
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct EventEnvelope<T> {
     sequence: u64,
     timestamp_ns: u64,
@@ -286,7 +315,10 @@ mod tests {
             .expect_err("timestamp_ns=0 must reject");
         assert!(matches!(
             err,
-            TypesError::InvalidEnvelope { field: "timestamp_ns", .. }
+            TypesError::InvalidEnvelope {
+                field: "timestamp_ns",
+                ..
+            }
         ));
 
         // 2. event_version = 0 must reject
@@ -296,7 +328,10 @@ mod tests {
             .expect_err("event_version=0 must reject");
         assert!(matches!(
             err,
-            TypesError::InvalidEnvelope { field: "event_version", .. }
+            TypesError::InvalidEnvelope {
+                field: "event_version",
+                ..
+            }
         ));
 
         // 3. chain_id = 0 must reject
@@ -306,7 +341,10 @@ mod tests {
             .expect_err("chain_id=0 must reject");
         assert!(matches!(
             err,
-            TypesError::InvalidEnvelope { field: "chain_context.chain_id", .. }
+            TypesError::InvalidEnvelope {
+                field: "chain_context.chain_id",
+                ..
+            }
         ));
 
         // 4. happy path - seal succeeds and getters return inputs verbatim
@@ -355,7 +393,10 @@ mod tests {
         };
         assert!(matches!(
             bad_ts.validate(),
-            Err(TypesError::InvalidEnvelope { field: "timestamp_ns", .. })
+            Err(TypesError::InvalidEnvelope {
+                field: "timestamp_ns",
+                ..
+            })
         ));
 
         // Case 2: event_version = 0
@@ -370,7 +411,10 @@ mod tests {
         };
         assert!(matches!(
             bad_ver.validate(),
-            Err(TypesError::InvalidEnvelope { field: "event_version", .. })
+            Err(TypesError::InvalidEnvelope {
+                field: "event_version",
+                ..
+            })
         ));
 
         // Case 3: chain_context.chain_id = 0
@@ -388,7 +432,10 @@ mod tests {
         };
         assert!(matches!(
             bad_chain.validate(),
-            Err(TypesError::InvalidEnvelope { field: "chain_context.chain_id", .. })
+            Err(TypesError::InvalidEnvelope {
+                field: "chain_context.chain_id",
+                ..
+            })
         ));
     }
 
@@ -402,20 +449,23 @@ mod tests {
         // Demonstrates the standard decode-boundary call pattern: every
         // deserialize path must call validate() before passing the envelope
         // downstream.
-        decoded.validate().expect("decoded envelope must pass validate()");
+        decoded
+            .validate()
+            .expect("decoded envelope must pass validate()");
     }
 
     #[test]
     fn rkyv_archive_round_trip_preserves_envelope() {
         let original = valid_envelope();
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original)
-            .expect("rkyv serialize");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).expect("rkyv serialize");
         let decoded: EventEnvelope<SmokeTestPayload> =
             rkyv::from_bytes::<EventEnvelope<SmokeTestPayload>, rkyv::rancor::Error>(&bytes)
                 .expect("rkyv deserialize");
 
         assert_eq!(original, decoded);
-        decoded.validate().expect("decoded envelope must pass validate()");
+        decoded
+            .validate()
+            .expect("decoded envelope must pass validate()");
     }
 }
