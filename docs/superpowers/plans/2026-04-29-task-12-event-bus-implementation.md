@@ -368,7 +368,7 @@ git add crates/event-bus/src/lib.rs
 git commit `
     -m 'feat(event-bus): add EventBus and EventConsumer traits with stub impls' `
     -m 'Adds the two trait definitions per spec section 5.2 with Send + Sync trait bounds and a static-lifetime requirement on T. Adds the private PublishState struct and the CrossbeamBoundedBus<T> / CrossbeamConsumer<T> concrete shells per spec section 7.1. CrossbeamConsumer deliberately does not derive Clone, enforcing the single-consumer contract per spec section 5.3 and DoD D4.' `
-    -m 'len(), capacity(), and stats() are fully implemented because they are trivial and Tasks 5 onward rely on them. publish(), recv(), try_recv() are unimplemented!() stubs - they all land in Task 5 driven by tests T1 and T2.' `
+    -m 'len(), capacity(), and stats() are fully implemented because they are trivial and Tasks 5 onward rely on them. publish(), recv(), try_recv() are unimplemented!() stubs - they all land in Task 5 driven by test T2; T1 drives only the new() constructor in Task 4.' `
     -m 'Co-Authored-By: Claude <noreply@anthropic.com>'
 ```
 
