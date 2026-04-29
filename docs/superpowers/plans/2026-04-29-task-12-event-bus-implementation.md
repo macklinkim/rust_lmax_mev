@@ -393,7 +393,7 @@ If clippy warns about `unimplemented!` panics in non-test code, ignore — Task 
 git add crates/event-bus/src/lib.rs
 git commit `
     -m 'feat(event-bus): add EventBus/EventConsumer traits and stub impls' `
-    -m 'Adds the two trait definitions per spec section 5.2 with Send + Sync bounds and where T: Send + 1static. Adds the private PublishState struct and the CrossbeamBoundedBus<T> / CrossbeamConsumer<T> concrete shells per spec section 7.1. CrossbeamConsumer deliberately does not derive Clone, enforcing the single-consumer contract per spec section 5.3 and DoD D4.' `
+    -m 'Adds the two trait definitions per spec section 5.2 with Send + Sync bounds and where T: Send + ''static. Adds the private PublishState struct and the CrossbeamBoundedBus<T> / CrossbeamConsumer<T> concrete shells per spec section 7.1. CrossbeamConsumer deliberately does not derive Clone, enforcing the single-consumer contract per spec section 5.3 and DoD D4.' `
     -m 'len(), capacity(), and stats() are fully implemented because they are trivial and Tasks 6 onward rely on them. publish(), recv(), try_recv() are unimplemented!() stubs - they land in Tasks 5-6 driven by tests T1 and T2.' `
     -m 'Co-Authored-By: Claude <noreply@anthropic.com>'
 ```
