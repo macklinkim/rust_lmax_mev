@@ -1,8 +1,8 @@
 # Task 12: `crates/event-bus` Design Spec
 
-**Version:** 0.1 (Draft)
+**Version:** 0.2
 **Date:** 2026-04-29
-**Status:** Draft — pending spec-document-reviewer pass + user approval
+**Status:** Reviewer-approved (spec-document-reviewer pass clean) — pending user approval
 **Implements:** Task 12 of Phase 1 plan (`CLAUDE.md` Phase 1 task checklist).
 **Depends on:** Task 11 (`crates/types`) — DONE as of commit `e2911cf`.
 **References:** ADR-005, ADR-008, `docs/specs/event-model.md`, `PHASE_1_DETAIL_REVISION.md` §3.1 / §3.4.
@@ -314,7 +314,12 @@ The `parking_lot::Mutex<PublishState>` serializes the entire publish path — in
            self.backpressure_total.fetch_add(1, Ordering::Relaxed);
            metrics::counter!("event_bus_backpressure_total").increment(1);
            self.sender.send(env).map_err(|_| BusError::Closed)?;
-                                                          // blocking send; lock still held
+                                                          // blocking send; lock still held.
+                                                          // §7.2's "stats() must not acquire the
+                                                          // publish-state mutex" rule exists
+                                                          // precisely so a main thread can call
+                                                          // stats() while another publisher is
+                                                          // parked here — see T3 in §10.
        }
        Err(Disconnected(_))         => return Err(BusError::Closed);
    }
@@ -391,6 +396,8 @@ Sequence assignment is solely the bus's responsibility. Callers never set or gue
 
 `event_bus_current_depth` is set, not incremented or decremented (`metrics::gauge!("...").set(x as f64)`). The bus does not maintain a separate atomic for depth; `stats().current_depth` is read via `sender.len()` and is therefore an observability sample, consistent with the `BusStats` contract in §5.1.
 
+The `usize as f64` cast loses precision only above 2^53 ≈ 9 × 10¹⁵. Phase 1 capacity is bounded by config and never approaches this limit, so the cast is safe. A `clippy::cast_precision_loss` lint here may be silenced with a local `#[allow(...)]` plus an explanatory comment, or with the workspace lint config in Task 18 — implementer's choice at plan time.
+
 ### 8.2 Label policy
 
 Phase 1 Task 12 emits no labels because the label policy is deferred to Task 15 (`crates/observability`). If more than one event-bus instance is wired into the running app before Task 15 is complete, metric labels become **mandatory before merge** — without per-instance labels, Prometheus time series from multiple buses collide.
@@ -428,6 +435,8 @@ Helpers (defined once at the top of the test module):
 fn meta() -> PublishMeta { /* ChainId 1, block_number 18_000_000, event_version 1, correlation_id 42 */ }
 fn payload(nonce: u64) -> SmokeTestPayload { SmokeTestPayload { nonce, data: [0xCD; 32] } }
 ```
+
+The tests rely on `PublishMeta: Clone`, which is already derived in Task 11 (`crates/types/src/lib.rs:73`). No additional derive is required.
 
 ### T1 `new_rejects_zero_capacity`
 
@@ -625,7 +634,7 @@ fn publish_rejects_invalid_meta_without_consuming_sequence() {
 
 ### T7 `sequence_exhausted_does_not_wrap` (white-box)
 
-Verifies the no-wrap policy at the `u64::MAX` boundary. This test relies on the same-module visibility of the private `state` field; tests live inside `mod tests` in `lib.rs`, so this is permitted.
+Verifies the no-wrap policy at the `u64::MAX` boundary. This test relies on the same-module visibility of the **private** `state` field on `CrossbeamBoundedBus<T>` — the field has no `pub` or `pub(crate)` modifier and is invisible outside `lib.rs`. Tests live inside `#[cfg(test)] mod tests` in `lib.rs`, which can read and mutate the parent module's private fields. This is the only test in the suite that crosses encapsulation; all others use the public API.
 
 ```rust
 #[test]
