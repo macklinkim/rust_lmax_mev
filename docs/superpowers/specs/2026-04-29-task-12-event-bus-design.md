@@ -1,8 +1,8 @@
 # Task 12: `crates/event-bus` Design Spec
 
-**Version:** 0.2
+**Version:** 0.3
 **Date:** 2026-04-29
-**Status:** Reviewer-approved (spec-document-reviewer pass clean) — pending user approval
+**Status:** Reviewer-approved + user feedback round 1 incorporated — pending final user approval
 **Implements:** Task 12 of Phase 1 plan (`CLAUDE.md` Phase 1 task checklist).
 **Depends on:** Task 11 (`crates/types`) — DONE as of commit `e2911cf`.
 **References:** ADR-005, ADR-008, `docs/specs/event-model.md`, `PHASE_1_DETAIL_REVISION.md` §3.1 / §3.4.
@@ -141,8 +141,12 @@ pub struct PublishAck {
 /// transaction snapshot** — concurrent publish / recv may interleave between
 /// the per-field reads.
 ///
-/// Marked `#[non_exhaustive]` so Phase 2 may add fields without breaking
-/// downstream callers' struct literals or pattern matches.
+/// Marked `#[non_exhaustive]` so downstream callers cannot rely on exhaustive
+/// construction or matching; Phase 2 may add fields while callers continue to
+/// read the values through `stats()` and pattern-match with `..` rest patterns.
+/// (Note: `#[non_exhaustive]` on a public struct forbids struct-literal
+/// construction outside this crate, which is the desired contract here —
+/// `BusStats` is produced only by `EventBus::stats()`.)
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BusStats {
@@ -404,9 +408,11 @@ Phase 1 Task 12 emits no labels because the label policy is deferred to Task 15 
 
 ### 8.3 In-process counters vs `metrics` facade
 
-The four metrics are emitted twice per side-effect: once via the `metrics::counter!` / `metrics::gauge!` macros (consumed by the Prometheus exporter once Task 15 is wired), and once as in-process `AtomicU64` updates exposed through `BusStats` for tests and runtime introspection. The two paths stay synchronized because the same publish/recv code increments both within the same critical section (publish) or before returning (recv).
+The three counters (`published_total`, `consumed_total`, `backpressure_total`) are emitted through the `metrics` facade (consumed by the Prometheus exporter once Task 15 is wired) **and** mirrored in in-process `AtomicU64` counters exposed through `BusStats`. The two paths stay synchronized because the same publish/recv code updates both within the same critical section (publish) or before returning (recv).
 
-The `metrics` facade does not let callers read back the current counter value — only the exporter consumes it. The in-process atomics exist to bridge that read-back gap.
+`current_depth` is emitted as a gauge via `metrics::gauge!` and read in-process directly from `sender.len()` / `receiver.len()`; it has **no separate `AtomicU64` mirror**. `stats().current_depth` is the same channel-len observability sample.
+
+The `metrics` facade does not let callers read back current counter values — only the exporter consumes them. The in-process atomics exist to bridge that read-back gap for tests and runtime introspection.
 
 ---
 
@@ -445,8 +451,15 @@ Verifies the rendezvous-semantics rejection.
 ```rust
 #[test]
 fn new_rejects_zero_capacity() {
-    let err = CrossbeamBoundedBus::<SmokeTestPayload>::new(0)
-        .expect_err("capacity 0 must reject");
+    // Note: `Result::expect_err` would require the Ok variant
+    // `(CrossbeamBoundedBus<T>, CrossbeamConsumer<T>)` to implement `Debug`,
+    // which is not part of the Phase 1 contract. Use an explicit `match`
+    // instead so the test does not silently demand a Debug derive on the
+    // bus/consumer pair.
+    let err = match CrossbeamBoundedBus::<SmokeTestPayload>::new(0) {
+        Err(err) => err,
+        Ok(_)    => panic!("capacity 0 must reject"),
+    };
     assert!(matches!(err, BusError::InvalidCapacity(0)));
 }
 ```
@@ -649,10 +662,15 @@ fn sequence_exhausted_does_not_wrap() {
         .expect_err("must be SequenceExhausted at u64::MAX");
     assert!(matches!(err, BusError::SequenceExhausted));
 
-    // No advance, no envelope sent.
+    // No advance, no envelope sent, and crucially no progress past step 4 of
+    // §7.3: backpressure_total and current_depth must both be 0 to confirm
+    // the publish path returned before reaching seal/try_send.
     assert_eq!(bus.state.lock().next_sequence, u64::MAX);
     assert!(matches!(consumer.try_recv().expect("try_recv ok"), None));
-    assert_eq!(bus.stats().published_total, 0);
+    let stats = bus.stats();
+    assert_eq!(stats.published_total,    0);
+    assert_eq!(stats.backpressure_total, 0);
+    assert_eq!(stats.current_depth,      0);
 }
 ```
 
@@ -667,9 +685,9 @@ fn sequence_exhausted_does_not_wrap() {
 - [ ] **D5** `PublishAck`, `BusStats` (`#[non_exhaustive]`), and `BusError` (`#[non_exhaustive]`, 5 variants) defined per §5.1 / §5.4.
 - [ ] **D6** Publish path enforces invariants: `parking_lot::Mutex` held end-to-end across the `try_send` → optional blocking `send` flow; `state.next_sequence` advanced **only** on success; `try_send → Full` increments `backpressure_total` (both atomic and metric counter) before the blocking `send`; `SequenceExhausted` fires before `seal` when `next_sequence == u64::MAX`.
 - [ ] **D7** `recv` / `try_recv` advance `consumed_total` (atomic + metric counter) only on the `Some` path; `Ok(None)` from `try_recv` performs no side effects.
-- [ ] **D8** All four metrics emit through the `metrics` facade. The three counters (`published_total`, `consumed_total`, `backpressure_total`) keep `AtomicU64` in-process counters. `current_depth` does **not** keep a separate atomic — it is read live from `sender.len()` / `receiver.len()` and `set` on the `metrics` gauge. `BusStats::current_depth` is the same channel-len observability sample.
+- [ ] **D8** All four metrics emit through the `metrics` facade. The three counters (`published_total`, `consumed_total`, `backpressure_total`) keep `AtomicU64` in-process counters. `current_depth` does **not** keep a separate atomic — it is read live from `sender.len()` / `receiver.len()` and `set` on the `metrics` gauge. `BusStats::current_depth` is the same channel-len observability sample. **`stats()` must not acquire the publish-state mutex; it reads only the atomics and the channel `len`/`capacity`.** This is a hard correctness requirement — T3 calls `stats()` from the main thread while a publisher thread holds the lock.
 - [ ] **D9** Seven inline tests (T1–T7) all PASS.
-- [ ] **D10** `cargo fmt --check`, `cargo clippy -p rust-lmax-mev-event-bus -- -D warnings`, `cargo build -p rust-lmax-mev-event-bus`, `cargo test -p rust-lmax-mev-event-bus` all clean.
+- [ ] **D10** Run in this order — `cargo fmt --check`, `cargo build -p rust-lmax-mev-event-bus`, `cargo test -p rust-lmax-mev-event-bus`, `cargo clippy -p rust-lmax-mev-event-bus -- -D warnings`. All clean. (Order surfaces formatting / compile / logic / lint failures from cheapest to most expensive.)
 - [ ] **D11** Crate-level docstring + per-item docstrings on `EventBus`, `EventConsumer`, `CrossbeamBoundedBus::new`, `publish`, `recv`, `try_recv`, `stats`, `PublishAck`, `BusStats`, and `BusError`. The crate docstring covers: timestamp/ordering semantics, sequence ownership, the `stats()` non-linearizability + no-mutex-acquisition contract, and the `#[non_exhaustive]` extension policy.
 
 ---
