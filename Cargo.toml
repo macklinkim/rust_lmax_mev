@@ -2,8 +2,9 @@
 resolver = "2"
 members = [
     "crates/types",
-    # crates/event-bus, crates/journal, crates/config, crates/observability,
-    # crates/app are added in Task 12-16 as those crates are created.
+    "crates/event-bus",
+    # crates/journal, crates/config, crates/observability, crates/app
+    # are added in Task 13-16 as those crates are created.
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ tokio = { version = "1", features = ["full"] }
 
 # channels
 crossbeam-channel = "0.5"
+parking_lot = "0.12"
 
 # storage
 rocksdb = "0.22"
