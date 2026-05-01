@@ -144,8 +144,8 @@ pub enum BusError {
     Closed,
 }
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -174,6 +174,15 @@ where
 
     /// Returns the current channel depth (`sender.len()`).
     fn len(&self) -> usize;
+
+    /// Returns whether the current producer-side channel depth is zero.
+    ///
+    /// Same observability-sample caveat as [`EventBus::len`] — concurrent
+    /// publish / recv may change the depth between the read and the caller's
+    /// next action.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Returns the configured channel capacity (set at `new()` time).
     fn capacity(&self) -> usize;
@@ -207,6 +216,11 @@ where
 
     /// Returns the current channel depth (`receiver.len()`).
     fn len(&self) -> usize;
+
+    /// Returns whether the current consumer-side channel depth is zero.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 // === Internal state ===
@@ -416,8 +430,8 @@ mod tests {
 
     #[test]
     fn publish_assigns_sequence_nonzero_timestamp_and_preserves_envelope() {
-        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(8)
-            .expect("capacity 8 valid");
+        let (bus, consumer) =
+            CrossbeamBoundedBus::<SmokeTestPayload>::new(8).expect("capacity 8 valid");
 
         let m = meta();
         let p = payload(7);
@@ -459,8 +473,8 @@ mod tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
-        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(2)
-            .expect("capacity 2 valid");
+        let (bus, consumer) =
+            CrossbeamBoundedBus::<SmokeTestPayload>::new(2).expect("capacity 2 valid");
         let bus = Arc::new(bus);
 
         let ack0 = bus.publish(payload(0), meta()).expect("publish 0");
@@ -522,11 +536,13 @@ mod tests {
 
     #[test]
     fn publish_after_consumer_drop_returns_closed() {
-        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(4)
-            .expect("capacity 4 valid");
+        let (bus, consumer) =
+            CrossbeamBoundedBus::<SmokeTestPayload>::new(4).expect("capacity 4 valid");
         drop(consumer);
 
-        let err = bus.publish(payload(0), meta()).expect_err("publish must fail");
+        let err = bus
+            .publish(payload(0), meta())
+            .expect_err("publish must fail");
         assert!(matches!(err, BusError::Closed));
 
         // Failed publish does not advance the sequence counter.
@@ -535,8 +551,12 @@ mod tests {
 
     #[test]
     fn try_recv_empty_returns_none_and_recv_after_bus_drop_returns_closed() {
-        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(2)
-            .expect("capacity 2 valid");
+        let (bus, consumer) =
+            CrossbeamBoundedBus::<SmokeTestPayload>::new(2).expect("capacity 2 valid");
+
+        // After new(...): both sides report empty.
+        assert!(bus.is_empty());
+        assert!(consumer.is_empty());
 
         // (a) try_recv on empty queue: Ok(None), consumed_total stays at 0.
         assert!(matches!(consumer.try_recv().expect("try_recv ok"), None));
@@ -545,9 +565,21 @@ mod tests {
 
         // (b) After one publish, try_recv returns Ok(Some(_)) and consumed_total advances.
         let ack = bus.publish(payload(0), meta()).expect("publish");
-        let env = consumer.try_recv().expect("try_recv ok").expect("event present");
+
+        // After publish: both sides report non-empty.
+        assert!(!bus.is_empty());
+        assert!(!consumer.is_empty());
+
+        let env = consumer
+            .try_recv()
+            .expect("try_recv ok")
+            .expect("event present");
         assert_eq!(env.sequence(), ack.sequence);
         assert_eq!(bus.stats().consumed_total, 1);
+
+        // After try_recv drains the only event: both sides report empty again.
+        assert!(bus.is_empty());
+        assert!(consumer.is_empty());
 
         // (c) After dropping the bus, recv returns BusError::Closed.
         drop(bus);
@@ -557,8 +589,8 @@ mod tests {
 
     #[test]
     fn publish_rejects_invalid_meta_without_consuming_sequence() {
-        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(2)
-            .expect("capacity 2 valid");
+        let (bus, consumer) =
+            CrossbeamBoundedBus::<SmokeTestPayload>::new(2).expect("capacity 2 valid");
 
         // Invalid meta: chain_id = 0 violates Phase 1 envelope invariant.
         let mut bad_meta = meta();
@@ -581,8 +613,8 @@ mod tests {
 
     #[test]
     fn sequence_exhausted_does_not_wrap() {
-        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(2)
-            .expect("capacity 2 valid");
+        let (bus, consumer) =
+            CrossbeamBoundedBus::<SmokeTestPayload>::new(2).expect("capacity 2 valid");
 
         // Force the boundary: next publish would attempt sequence == u64::MAX.
         bus.state.lock().next_sequence = u64::MAX;
