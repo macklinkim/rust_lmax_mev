@@ -601,7 +601,7 @@ fn try_recv_empty_returns_none_and_recv_after_bus_drop_returns_closed() {
         .expect("capacity 2 valid");
 
     // (a) try_recv on empty queue: Ok(None), consumed_total stays at 0.
-    assert!(matches!(consumer.try_recv().expect("try_recv ok"), None));
+    assert!(consumer.try_recv().expect("try_recv ok").is_none());
     assert_eq!(consumer.len(), 0);
     assert_eq!(bus.stats().consumed_total, 0);
 
@@ -668,7 +668,7 @@ fn sequence_exhausted_does_not_wrap() {
     // §7.3: backpressure_total and current_depth must both be 0 to confirm
     // the publish path returned before reaching seal/try_send.
     assert_eq!(bus.state.lock().next_sequence, u64::MAX);
-    assert!(matches!(consumer.try_recv().expect("try_recv ok"), None));
+    assert!(consumer.try_recv().expect("try_recv ok").is_none());
     let stats = bus.stats();
     assert_eq!(stats.published_total,    0);
     assert_eq!(stats.backpressure_total, 0);
@@ -689,7 +689,7 @@ fn sequence_exhausted_does_not_wrap() {
 - [ ] **D7** `recv` / `try_recv` advance `consumed_total` (atomic + metric counter) only on the `Some` path; `Ok(None)` from `try_recv` performs no side effects.
 - [ ] **D8** All four metrics emit through the `metrics` facade. The three counters (`published_total`, `consumed_total`, `backpressure_total`) keep `AtomicU64` in-process counters. `current_depth` does **not** keep a separate atomic — it is read live from `sender.len()` / `receiver.len()` and `set` on the `metrics` gauge. `BusStats::current_depth` is the same channel-len observability sample. **`stats()` must not acquire the publish-state mutex; it reads only the atomics and the channel `len`/`capacity`.** This is a hard correctness requirement — T3 calls `stats()` from the main thread while a publisher thread holds the lock.
 - [ ] **D9** Seven inline tests (T1–T7) all PASS.
-- [ ] **D10** Run in this order — `cargo fmt --check`, `cargo build -p rust-lmax-mev-event-bus`, `cargo test -p rust-lmax-mev-event-bus`, `cargo clippy -p rust-lmax-mev-event-bus -- -D warnings`. All clean. (Order surfaces formatting / compile / logic / lint failures from cheapest to most expensive.)
+- [ ] **D10** Run in this order — `cargo fmt --check`, `cargo build -p rust-lmax-mev-event-bus`, `cargo test -p rust-lmax-mev-event-bus`, `cargo clippy -p rust-lmax-mev-event-bus -- -D warnings`. All clean. (Order surfaces formatting / compile / logic / lint failures from cheapest to most expensive.) Additionally, `cargo clippy -p rust-lmax-mev-event-bus --all-targets -- -D warnings` must pass as a Task 18 CI preview.
 - [ ] **D11** Crate-level docstring + per-item docstrings on `EventBus`, `EventConsumer`, `CrossbeamBoundedBus::new`, `publish`, `recv`, `try_recv`, `stats`, `is_empty`, `PublishAck`, `BusStats`, and `BusError`. The crate docstring covers: timestamp/ordering semantics, sequence ownership, the `stats()` non-linearizability + no-mutex-acquisition contract, and the `#[non_exhaustive]` extension policy.
 
 ---

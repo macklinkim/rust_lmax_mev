@@ -559,7 +559,7 @@ mod tests {
         assert!(consumer.is_empty());
 
         // (a) try_recv on empty queue: Ok(None), consumed_total stays at 0.
-        assert!(matches!(consumer.try_recv().expect("try_recv ok"), None));
+        assert!(consumer.try_recv().expect("try_recv ok").is_none());
         assert_eq!(consumer.len(), 0);
         assert_eq!(bus.stats().consumed_total, 0);
 
@@ -628,7 +628,7 @@ mod tests {
         // section 7.3: backpressure_total and current_depth must both be 0 to
         // confirm the publish path returned before reaching seal/try_send.
         assert_eq!(bus.state.lock().next_sequence, u64::MAX);
-        assert!(matches!(consumer.try_recv().expect("try_recv ok"), None));
+        assert!(consumer.try_recv().expect("try_recv ok").is_none());
         let stats = bus.stats();
         assert_eq!(stats.published_total, 0);
         assert_eq!(stats.backpressure_total, 0);

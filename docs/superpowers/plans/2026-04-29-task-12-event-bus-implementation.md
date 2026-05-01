@@ -919,7 +919,7 @@ fn try_recv_empty_returns_none_and_recv_after_bus_drop_returns_closed() {
         .expect("capacity 2 valid");
 
     // (a) try_recv on empty queue: Ok(None), consumed_total stays at 0.
-    assert!(matches!(consumer.try_recv().expect("try_recv ok"), None));
+    assert!(consumer.try_recv().expect("try_recv ok").is_none());
     assert_eq!(consumer.len(), 0);
     assert_eq!(bus.stats().consumed_total, 0);
 
@@ -1052,7 +1052,7 @@ fn sequence_exhausted_does_not_wrap() {
     // section 7.3: backpressure_total and current_depth must both be 0 to
     // confirm the publish path returned before reaching seal/try_send.
     assert_eq!(bus.state.lock().next_sequence, u64::MAX);
-    assert!(matches!(consumer.try_recv().expect("try_recv ok"), None));
+    assert!(consumer.try_recv().expect("try_recv ok").is_none());
     let stats = bus.stats();
     assert_eq!(stats.published_total, 0);
     assert_eq!(stats.backpressure_total, 0);
@@ -1381,6 +1381,8 @@ cargo clippy -p rust-lmax-mev-event-bus -- -D warnings
 ```
 
 Expected: no warnings, exits 0. The `clippy::cast_precision_loss` lint is already addressed by the `depth_as_f64` helper introduced in Task 5 step 5.3, so it should not fire on the `as f64` cast inside that helper (the `#[allow]` is local) and there are no other `as f64` cast sites.
+
+Additionally, `cargo clippy -p rust-lmax-mev-event-bus --all-targets -- -D warnings` must pass as a Task 18 CI preview.
 
 If clippy fires any other lint:
 - Stylistic ones (e.g. `redundant_field_names`, `needless_return`) — fix by editing.
