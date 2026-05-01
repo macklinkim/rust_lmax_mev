@@ -378,4 +378,17 @@ mod tests {
         assert_eq!(stats.current_depth, 0);
         assert_eq!(stats.capacity, 2);
     }
+
+    #[test]
+    fn publish_after_consumer_drop_returns_closed() {
+        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(4)
+            .expect("capacity 4 valid");
+        drop(consumer);
+
+        let err = bus.publish(payload(0), meta()).expect_err("publish must fail");
+        assert!(matches!(err, BusError::Closed));
+
+        // Failed publish does not advance the sequence counter.
+        assert_eq!(bus.stats().published_total, 0);
+    }
 }
