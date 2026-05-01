@@ -11,17 +11,17 @@ Rust LMAX Disruptor-style MEV detection and execution engine for Ethereum mainne
 - 4 frozen spec docs written (`docs/specs/`)
 - No code — documentation only phase
 
-**Phase 1: IN PROGRESS** — Task 11 (crates/types) next
-- Task 10 (workspace scaffold) complete: Cargo.toml, toolchain, configs committed
-- Tasks 11-19 remain (6 crates + smoke tests + CI)
+**Phase 1: IN PROGRESS** — Task 13 (crates/journal) next
+- Tasks 10, 11, 12 complete: workspace scaffold, `crates/types`, and `crates/event-bus` all merged on master.
+- Tasks 13-19 remain (4 crates + smoke tests + CI + phase-1-complete tag).
 
 ## Resume Instructions
 
-1. Read the spec: `docs/superpowers/specs/2026-04-24-phase-0-6-plan-design.md`
-2. Read the plan: `docs/superpowers/plans/2026-04-24-phase-0-1-implementation.md`
-3. Resume from **Task 11: crates/types** — create the types crate (EventEnvelope<T>, primitives, stub events)
-4. Use `superpowers:subagent-driven-development` skill to continue execution
-5. Tasks 12-19 follow sequentially after Task 11
+1. Read the Phase 0 plan/spec for context if needed: `docs/superpowers/specs/2026-04-24-phase-0-6-plan-design.md`, `docs/superpowers/plans/2026-04-24-phase-0-1-implementation.md`.
+2. For per-task references, the Task 11 + Task 12 design specs and implementation plans live under `docs/superpowers/specs/` and `docs/superpowers/plans/` (`YYYY-MM-DD-task-N-<crate>-{design,implementation}.md`). Mirror the same naming for Task 13.
+3. Resume from **Task 13: crates/journal** — draft a design spec, get user approval, draft the implementation plan, get user approval, then execute.
+4. Use `superpowers:subagent-driven-development` skill to execute the Task 13 plan once both spec and plan are user-approved.
+5. Tasks 14-19 follow sequentially after Task 13.
 
 ## Key Decisions (frozen in ADRs)
 
@@ -35,8 +35,8 @@ Rust LMAX Disruptor-style MEV detection and execution engine for Ethereum mainne
 ## Task Checklist (Phase 1)
 
 - [x] Task 10: Workspace scaffold (Cargo.toml, configs)
-- [ ] Task 11: crates/types (EventEnvelope<T>, primitives, events, error)
-- [ ] Task 12: crates/event-bus (EventBus trait, CrossbeamBoundedBus)
+- [x] Task 11: crates/types (EventEnvelope<T>, primitives, events, error)
+- [x] Task 12: crates/event-bus (EventBus trait, CrossbeamBoundedBus)
 - [ ] Task 13: crates/journal (FileJournal, RocksDbSnapshot)
 - [ ] Task 14: crates/config (TOML loading, env overlay)
 - [ ] Task 15: crates/observability (tracing, Prometheus)

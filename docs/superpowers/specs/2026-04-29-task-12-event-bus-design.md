@@ -17,7 +17,9 @@ The crate `crates/event-bus` introduces:
 - **Two traits** — `EventBus<T>` for the producer side, `EventConsumer<T>` for the consumer side.
 - **One concrete pair of impls** — `CrossbeamBoundedBus<T>` and `CrossbeamConsumer<T>`, backed by `crossbeam_channel::bounded`.
 - **Three small support types** — `PublishAck`, `BusStats`, `BusError`.
-- **Four metrics** — `event_bus_published_total`, `event_bus_consumed_total`, `event_bus_backpressure_total`, `event_bus_current_depth` — emitted via the `metrics` facade and also readable in-process via `BusStats`.
+- **Four metrics — three counters + one gauge:**
+  - Counters: `event_bus_published_total`, `event_bus_consumed_total`, `event_bus_backpressure_total` — emitted via the `metrics` facade **and** mirrored as in-process `AtomicU64` values readable through `BusStats`.
+  - Gauge: `event_bus_current_depth` — emitted via the `metrics` facade only; **no separate `AtomicU64` mirror**. The in-process `BusStats::current_depth` reads it live from `Sender::len()` / `Receiver::len()`.
 - **Seven inline unit tests** covering capacity validation, sequence/timestamp assignment with envelope preservation, backpressure registration, closed-channel error mapping, empty-queue try_recv semantics, retry safety on invalid meta, and sequence-exhaustion no-wrap policy.
 
 The crate provides, at each domain pipeline stage boundary, a single logical consumer bounded queue. It does **not** put a single global queue in front of the whole engine; downstream wiring (Task 16 `crates/app`) decides how many bus instances exist and which stage owns which.
@@ -35,7 +37,7 @@ The crate provides, at each domain pipeline stage boundary, a single logical con
 | 3 | `EventConsumer<T>` trait | Consumer side: `recv`, `try_recv`, `len`. |
 | 4 | `CrossbeamBoundedBus<T>` + `CrossbeamConsumer<T>` | Sole Phase 1 impl. |
 | 5 | `PublishAck`, `BusStats`, `BusError` | `BusStats` and `BusError` carry `#[non_exhaustive]`. |
-| 6 | Four metrics emitted | `metrics::counter!` / `metrics::gauge!` macros, no labels (see §8). |
+| 6 | Four metrics emitted (three counters + one gauge) | `metrics::counter!` for the three counter totals, `metrics::gauge!` for `current_depth`. Counter mirrors are in-process `AtomicU64`; the gauge has no atomic mirror (live channel `len()`). No labels (see §8). |
 | 7 | Seven inline unit tests (T1–T7) | See §10. |
 | 8 | Workspace `Cargo.toml` updates | Re-add `crates/event-bus` to `members`; add `parking_lot = "0.12"` to `[workspace.dependencies]`. |
 
@@ -423,13 +425,13 @@ The `metrics` facade does not let callers read back current counter values — o
 | Variant | Emit site | Trigger condition | `state.next_sequence` after error | Recommended caller action |
 |---|---|---|---|---|
 | `InvalidCapacity(usize)` | `CrossbeamBoundedBus::new` | `capacity == 0` | n/a (bus never built) | Retry with `capacity > 0`. |
-| `ClockUnavailable` | publish step 2 (`now_ns()`) | `SystemTime::now() < UNIX_EPOCH`, nanos exceed `u64`, or nanos is exactly 0 | unchanged | Inspect host clock; retry. Same sequence is reserved for the next attempt. |
+| `ClockUnavailable` | publish step 2 (`now_ns()`) | `SystemTime::now() < UNIX_EPOCH`, nanos exceed `u64`, or nanos is exactly 0 | unchanged | Inspect host clock; retry by reconstructing equivalent `payload`/`meta`. Same sequence is reserved for the next successful publish. |
 | `SequenceExhausted` | publish step 4 | `state.next_sequence == u64::MAX` | unchanged (already `u64::MAX`) | **Terminal**: discard the bus instance and create a new one. |
-| `Envelope(TypesError)` | publish step 5 (`EventEnvelope::seal`) | Caller-supplied `PublishMeta` violates a Phase 1 envelope invariant (e.g. `chain_id == 0`, `event_version == 0`) | unchanged | Fix `PublishMeta`; retry with same payload. Same sequence is reserved. |
+| `Envelope(TypesError)` | publish step 5 (`EventEnvelope::seal`) | Caller-supplied `PublishMeta` violates a Phase 1 envelope invariant (e.g. `chain_id == 0`, `event_version == 0`) | unchanged | Fix the invariant violation; retry by reconstructing an equivalent `payload` and corrected `meta`. Same sequence is reserved for the next successful publish. |
 | `Closed` (publish-side) | publish step 6 (`try_send` Disconnected, or blocking `send` Disconnected) | Consumer dropped | unchanged (no advance) | **Bus is dead**: discard the instance. Do not retry — there is no receiver. |
 | `Closed` (recv-side) | `recv` / `try_recv` (`RecvError` / `TryRecvError::Disconnected`) | Bus dropped | n/a | Discard the consumer; the producer side is gone. |
 
-The "success path is the only path that advances `next_sequence`" rule, combined with `#[non_exhaustive]` on `BusError`, ensures retry safety for all transient errors and additive room for new variants in Phase 2.
+The "success path is the only path that advances `next_sequence`" rule, combined with `#[non_exhaustive]` on `BusError`, ensures retry safety for all transient errors and additive room for new variants in Phase 2. Note that `publish` consumes `payload` and `meta` by value and `BusError` does **not** return them — the bus-side guarantee is sequence preservation, not literal argument reuse. Callers reconstruct equivalent `payload`/`meta` for the retry after fixing the underlying problem.
 
 ---
 

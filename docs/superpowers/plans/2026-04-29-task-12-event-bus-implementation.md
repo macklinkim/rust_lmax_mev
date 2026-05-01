@@ -1164,12 +1164,19 @@ Replace the placeholder line at the top of `lib.rs` with:
 //! ## Retry safety
 //!
 //! `state.next_sequence` advances **only on publish success**. All failed
-//! publish paths leave the counter unchanged, so the next publish attempt
-//! reuses the would-have-been sequence. Among the failure modes:
+//! publish paths leave the counter unchanged, so the next successful publish
+//! is assigned the same would-have-been sequence. Among the failure modes:
 //!
 //! - [`BusError::ClockUnavailable`] and [`BusError::Envelope`] are
-//!   **retryable** — the underlying problem (system clock or caller-supplied
-//!   `PublishMeta`) can be corrected and the same publish re-attempted.
+//!   **retryable at the bus layer** — `next_sequence` is preserved, so a
+//!   subsequent successful publish lands at the would-have-been sequence
+//!   after the underlying problem (system clock, caller-supplied
+//!   `PublishMeta`) is corrected.
+//!
+//!   Note: [`EventBus::publish`] consumes `payload` and `meta` by value, and
+//!   `BusError` does **not** return them. The bus-side guarantee is sequence
+//!   preservation, not literal argument reuse — the caller must construct an
+//!   equivalent `payload` and corrected `meta` for the retry.
 //! - [`BusError::Closed`] is **terminal** — the consumer has dropped and no
 //!   further publish on this bus can succeed; the caller should discard the
 //!   bus instance. The "does not consume a sequence" rule still applies, so
