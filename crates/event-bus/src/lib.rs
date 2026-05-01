@@ -194,9 +194,10 @@ where
     /// Returns the configured channel capacity (set at `new()` time).
     fn capacity(&self) -> usize;
 
-    /// Returns an in-process snapshot of the four metrics + structural
-    /// quantities. **Must not acquire the publish-state mutex** — reads
-    /// only the atomic counters and the channel `len`/`capacity`.
+    /// Returns an in-process snapshot of the three counter mirrors, the
+    /// `current_depth` gauge sample, and `capacity`. **Must not acquire the
+    /// publish-state mutex** — reads only the atomic counters and the
+    /// channel `len`/`capacity`.
     fn stats(&self) -> BusStats;
 }
 

@@ -4,7 +4,7 @@
 
 **Plan version:** 0.2 (revised after user review of v0.1).
 
-**Goal:** Implement the `crates/event-bus` crate per `docs/superpowers/specs/2026-04-29-task-12-event-bus-design.md` (v0.3 Approved). Output: a Lean single-file crate exposing `EventBus<T>` + `EventConsumer<T>` traits, `CrossbeamBoundedBus<T>` + `CrossbeamConsumer<T>` impls, three support types (`PublishAck`, `BusStats`, `BusError`), four metrics emitted via the `metrics` facade, and seven inline TDD-driven unit tests, plus the workspace `Cargo.toml` updates required for it to build.
+**Goal:** Implement the `crates/event-bus` crate per `docs/superpowers/specs/2026-04-29-task-12-event-bus-design.md` (v0.3 Approved). Output: a Lean single-file crate exposing `EventBus<T>` + `EventConsumer<T>` traits, `CrossbeamBoundedBus<T>` + `CrossbeamConsumer<T>` impls, three support types (`PublishAck`, `BusStats`, `BusError`), four metrics (three counters + one gauge) emitted via the `metrics` facade, and seven inline TDD-driven unit tests, plus the workspace `Cargo.toml` updates required for it to build.
 
 **Architecture:** Single `lib.rs` (~500–600 LOC) housing every type and the `#[cfg(test)] mod tests`. Publish path is serialized end-to-end by a `parking_lot::Mutex<PublishState>` so that sequence assignment, the optional blocking `send`, and the success-only sequence advance all happen atomically per publisher. `try_send → Full` increments `backpressure_total` exactly once before the blocking `send` fallback. Consumer side is lock-free; `consumed_total` is shared via `Arc<AtomicU64>` so the bus can read the value back through `stats()` without coordinating with the consumer.
 
@@ -1224,9 +1224,10 @@ where
     /// Returns the configured channel capacity (set at `new()` time).
     fn capacity(&self) -> usize;
 
-    /// Returns an in-process snapshot of the four metrics + structural
-    /// quantities. **Must not acquire the publish-state mutex** — reads
-    /// only the atomic counters and the channel `len`/`capacity`.
+    /// Returns an in-process snapshot of the three counter mirrors, the
+    /// `current_depth` gauge sample, and `capacity`. **Must not acquire the
+    /// publish-state mutex** — reads only the atomic counters and the
+    /// channel `len`/`capacity`.
     fn stats(&self) -> BusStats;
 }
 ```
