@@ -89,6 +89,38 @@ pub struct CrossbeamConsumer<T> {
     consumed_total: Arc<AtomicU64>,
 }
 
+impl<T> CrossbeamBoundedBus<T>
+where
+    T: Send + 'static,
+{
+    /// Constructs a paired `(bus, consumer)`.
+    ///
+    /// `capacity == 0` is rejected with `BusError::InvalidCapacity(0)`.
+    /// Crossbeam's zero-capacity rendezvous semantics are deliberately
+    /// excluded — they conflict with the Phase 1 metric definitions of
+    /// `current_depth`, `capacity`, and `backpressure_total`.
+    pub fn new(capacity: usize) -> Result<(Self, CrossbeamConsumer<T>), BusError> {
+        if capacity == 0 {
+            return Err(BusError::InvalidCapacity(0));
+        }
+        let (sender, receiver) = crossbeam_channel::bounded(capacity);
+        let consumed_total = Arc::new(AtomicU64::new(0));
+        let bus = CrossbeamBoundedBus {
+            sender,
+            state: Mutex::new(PublishState { next_sequence: 0 }),
+            published_total: AtomicU64::new(0),
+            backpressure_total: AtomicU64::new(0),
+            consumed_total: Arc::clone(&consumed_total),
+            capacity,
+        };
+        let consumer = CrossbeamConsumer {
+            receiver,
+            consumed_total,
+        };
+        Ok((bus, consumer))
+    }
+}
+
 impl<T> EventBus<T> for CrossbeamBoundedBus<T>
 where
     T: Send + 'static,
@@ -130,5 +162,45 @@ where
 
     fn len(&self) -> usize {
         self.receiver.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_lmax_mev_types::{ChainContext, EventSource, SmokeTestPayload};
+
+    fn meta() -> PublishMeta {
+        PublishMeta {
+            source: EventSource::Ingress,
+            chain_context: ChainContext {
+                chain_id: 1,
+                block_number: 18_000_000,
+                block_hash: [0xAB; 32],
+            },
+            event_version: 1,
+            correlation_id: 42,
+        }
+    }
+
+    fn payload(nonce: u64) -> SmokeTestPayload {
+        SmokeTestPayload {
+            nonce,
+            data: [0xCD; 32],
+        }
+    }
+
+    #[test]
+    fn new_rejects_zero_capacity() {
+        // Note: Result::expect_err would require the Ok variant
+        // (CrossbeamBoundedBus<T>, CrossbeamConsumer<T>) to implement Debug,
+        // which is not part of the Phase 1 contract. Use an explicit match
+        // instead so the test does not silently demand a Debug derive on the
+        // bus/consumer pair.
+        let err = match CrossbeamBoundedBus::<SmokeTestPayload>::new(0) {
+            Err(err) => err,
+            Ok(_) => panic!("capacity 0 must reject"),
+        };
+        assert!(matches!(err, BusError::InvalidCapacity(0)));
     }
 }
