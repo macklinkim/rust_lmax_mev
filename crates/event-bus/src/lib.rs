@@ -157,9 +157,17 @@ where
 
         let envelope = EventEnvelope::seal(meta, payload, sequence, timestamp_ns)?;
 
-        self.sender
-            .send(envelope)
-            .map_err(|_| BusError::Closed)?;
+        match self.sender.try_send(envelope) {
+            Ok(()) => { /* fast path */ }
+            Err(crossbeam_channel::TrySendError::Full(env)) => {
+                self.backpressure_total.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("event_bus_backpressure_total").increment(1);
+                self.sender.send(env).map_err(|_| BusError::Closed)?;
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                return Err(BusError::Closed);
+            }
+        }
 
         state.next_sequence = sequence + 1;
         self.published_total.fetch_add(1, Ordering::Relaxed);
@@ -303,5 +311,71 @@ mod tests {
         assert_eq!(stats.backpressure_total, 0);
         assert_eq!(stats.current_depth, 0);
         assert_eq!(stats.capacity, 8);
+    }
+
+    #[test]
+    fn publish_registers_backpressure_when_full_and_completes_after_recv() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(2)
+            .expect("capacity 2 valid");
+        let bus = Arc::new(bus);
+
+        let ack0 = bus.publish(payload(0), meta()).expect("publish 0");
+        let ack1 = bus.publish(payload(1), meta()).expect("publish 1");
+        assert_eq!([ack0.sequence, ack1.sequence], [0, 1]);
+        assert_eq!(bus.len(), 2);
+        assert_eq!(bus.stats().backpressure_total, 0);
+
+        let bus_t = Arc::clone(&bus);
+        let handle = std::thread::spawn(move || bus_t.publish(payload(2), meta()));
+
+        // backpressure_total advances inside the publish lock just before the
+        // blocking send, so a non-zero value implies the publisher thread has
+        // entered the full-queue branch. yield_now() avoids burning CPU; the
+        // 3s deadline is a bug guard only.
+        //
+        // Cleanup-on-failure: if the deadline expires (e.g., during the TDD red
+        // phase, where the implementation does not yet increment
+        // backpressure_total and the publisher is genuinely blocked inside
+        // send()), drain a slot and join the spawned thread before panicking.
+        // This ensures the test does not leak a parked thread when it fails.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if bus.stats().backpressure_total > 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                // Drain one slot so the publisher's blocking send completes,
+                // then join.
+                let _ = consumer.recv();
+                let _ = handle.join();
+                panic!("publisher thread never registered backpressure within 3s");
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(bus.stats().backpressure_total, 1);
+
+        let env0 = consumer.recv().expect("drain 0");
+        assert_eq!(env0.sequence(), 0);
+
+        let ack2 = handle
+            .join()
+            .expect("publisher thread did not panic")
+            .expect("publish 2 succeeded after drain");
+        assert_eq!(ack2.sequence, 2);
+
+        let env1 = consumer.recv().expect("drain 1");
+        let env2 = consumer.recv().expect("drain 2");
+        assert_eq!(env1.sequence(), 1);
+        assert_eq!(env2.sequence(), 2);
+
+        let stats = bus.stats();
+        assert_eq!(stats.published_total, 3);
+        assert_eq!(stats.consumed_total, 3);
+        assert_eq!(stats.backpressure_total, 1);
+        assert_eq!(stats.current_depth, 0);
+        assert_eq!(stats.capacity, 2);
     }
 }
