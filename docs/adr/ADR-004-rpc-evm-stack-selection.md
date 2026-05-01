@@ -45,7 +45,7 @@ These choices have long-lived consequences: migrating an RPC library or async ru
 ## Consequences
 
 - All event bus message types must derive `rkyv::Archive`, `rkyv::Serialize`, and `rkyv::Deserialize`.
-- Snapshot types must derive `bincode::Encode` and `bincode::Decode`.
+- Snapshot types must implement `serde::Serialize` and `serde::Deserialize`, encoded via the `bincode` 1.x serde adapter (`bincode::serialize` / `bincode::deserialize`).
 - CI must include a `cargo deny` check to ensure no transitive JSON-on-hot-path dependencies are silently introduced.
 - `alloy` version must be pinned in `Cargo.toml`; upgrades require explicit review.
 - `revm` fork-state provider must be configured to pull storage slots lazily from the local Geth node to avoid loading the full world state into memory.
