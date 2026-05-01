@@ -168,6 +168,7 @@ where
     fn publish(&self, payload: T, meta: PublishMeta)
         -> Result<PublishAck, BusError>;
     fn len(&self)      -> usize;
+    fn is_empty(&self) -> bool { self.len() == 0 }   // default method
     fn capacity(&self) -> usize;
     fn stats(&self)    -> BusStats;
 }
@@ -179,6 +180,7 @@ where
     fn recv(&self)     -> Result<EventEnvelope<T>, BusError>;
     fn try_recv(&self) -> Result<Option<EventEnvelope<T>>, BusError>;
     fn len(&self)      -> usize;
+    fn is_empty(&self) -> bool { self.len() == 0 }   // default method
 }
 ```
 
@@ -680,7 +682,7 @@ fn sequence_exhausted_does_not_wrap() {
 
 - [ ] **D1** Workspace `Cargo.toml`: `[workspace] members` re-adds `crates/event-bus`; `[workspace.dependencies]` adds `parking_lot = "0.12"`.
 - [ ] **D2** `crates/event-bus/Cargo.toml` matches §4.2 verbatim.
-- [ ] **D3** `EventBus<T>` and `EventConsumer<T>` traits defined with `Send + Sync` and `where T: Send + 'static`, signatures matching §5.2.
+- [ ] **D3** `EventBus<T>` and `EventConsumer<T>` traits defined with `Send + Sync` and `where T: Send + 'static`, signatures matching §5.2 (including the `is_empty()` default method).
 - [ ] **D4** `CrossbeamBoundedBus<T>` and `CrossbeamConsumer<T>` structs implemented. **`CrossbeamConsumer<T>` does not derive or implement `Clone`.**
 - [ ] **D5** `PublishAck`, `BusStats` (`#[non_exhaustive]`), and `BusError` (`#[non_exhaustive]`, 5 variants) defined per §5.1 / §5.4.
 - [ ] **D6** Publish path enforces invariants: `parking_lot::Mutex` held end-to-end across the `try_send` → optional blocking `send` flow; `state.next_sequence` advanced **only** on success; `try_send → Full` increments `backpressure_total` (both atomic and metric counter) before the blocking `send`; `SequenceExhausted` fires before `seal` when `next_sequence == u64::MAX`.
@@ -688,7 +690,7 @@ fn sequence_exhausted_does_not_wrap() {
 - [ ] **D8** All four metrics emit through the `metrics` facade. The three counters (`published_total`, `consumed_total`, `backpressure_total`) keep `AtomicU64` in-process counters. `current_depth` does **not** keep a separate atomic — it is read live from `sender.len()` / `receiver.len()` and `set` on the `metrics` gauge. `BusStats::current_depth` is the same channel-len observability sample. **`stats()` must not acquire the publish-state mutex; it reads only the atomics and the channel `len`/`capacity`.** This is a hard correctness requirement — T3 calls `stats()` from the main thread while a publisher thread holds the lock.
 - [ ] **D9** Seven inline tests (T1–T7) all PASS.
 - [ ] **D10** Run in this order — `cargo fmt --check`, `cargo build -p rust-lmax-mev-event-bus`, `cargo test -p rust-lmax-mev-event-bus`, `cargo clippy -p rust-lmax-mev-event-bus -- -D warnings`. All clean. (Order surfaces formatting / compile / logic / lint failures from cheapest to most expensive.)
-- [ ] **D11** Crate-level docstring + per-item docstrings on `EventBus`, `EventConsumer`, `CrossbeamBoundedBus::new`, `publish`, `recv`, `try_recv`, `stats`, `PublishAck`, `BusStats`, and `BusError`. The crate docstring covers: timestamp/ordering semantics, sequence ownership, the `stats()` non-linearizability + no-mutex-acquisition contract, and the `#[non_exhaustive]` extension policy.
+- [ ] **D11** Crate-level docstring + per-item docstrings on `EventBus`, `EventConsumer`, `CrossbeamBoundedBus::new`, `publish`, `recv`, `try_recv`, `stats`, `is_empty`, `PublishAck`, `BusStats`, and `BusError`. The crate docstring covers: timestamp/ordering semantics, sequence ownership, the `stats()` non-linearizability + no-mutex-acquisition contract, and the `#[non_exhaustive]` extension policy.
 
 ---
 
