@@ -1,14 +1,114 @@
-// Crate-level docstring is added in Task 11. Traits, concrete impls, and tests
-// land in subsequent tasks.
+//! # rust-lmax-mev-event-bus
+//!
+//! Phase 1 single-consumer bounded event bus for the LMAX-style MEV engine.
+//!
+//! ## Topology
+//!
+//! Each domain pipeline stage boundary owns one `(CrossbeamBoundedBus<T>,
+//! CrossbeamConsumer<T>)` pair. There is **no global engine-wide queue** —
+//! the number of bus instances is decided by the wiring crate (Task 16,
+//! `crates/app`) and each instance carries one ordered stream.
+//!
+//! Multi-consumer cursors, broadcast semantics, and `subscribe(name)`-style
+//! APIs are explicitly forbidden in Phase 1 and are deferred to Phase 2 per
+//! ADR-005 §"Phase 1 baseline" + `PHASE_1_DETAIL_REVISION` §3.1.
+//!
+//! ## Sequence and timestamp ownership
+//!
+//! `EventEnvelope::sequence` and `EventEnvelope::timestamp_ns` are
+//! **bus-assigned**. Callers pass `PublishMeta` and a payload to
+//! [`EventBus::publish`]; the bus internally calls
+//! [`rust_lmax_mev_types::EventEnvelope::seal`] with values it owns and
+//! returns a [`PublishAck`] containing the assigned sequence and timestamp.
+//! Envelope itself flows only to the consumer side — the publish path is
+//! clone-free.
+//!
+//! `timestamp_ns` is captured at publish attempt time before a potentially
+//! blocking send. It may therefore be earlier than the actual enqueue/receive
+//! time. Ordering is defined by `sequence`, not timestamp monotonicity.
+//!
+//! ## Publish-path serialization
+//!
+//! The publish path is serialized end-to-end by a `parking_lot::Mutex`. The
+//! lock is held across the optional blocking `send`, which is intentional:
+//! it ensures sequence assignment order matches channel arrival order, and
+//! it propagates backpressure to all publishers via the mutex. The mutex
+//! does **not** guarantee strict FIFO acquisition fairness.
+//!
+//! [`EventBus::stats`] **must not** acquire the publish-state mutex. It
+//! reads only atomics and the channel `len`/`capacity`. This is a hard
+//! correctness requirement: tests (and operational diagnostics) must be
+//! able to call `stats()` while another thread holds the lock inside a
+//! blocking `send`.
+//!
+//! ## Sequence-exhaustion policy
+//!
+//! `u64::MAX` is reserved as the exhaustion sentinel and is **never
+//! published**. Phase 1 publishable sequence range is `0..u64::MAX`
+//! (half-open); the maximum published value is `u64::MAX - 1`. When
+//! `next_sequence` reaches `u64::MAX`, [`EventBus::publish`] returns
+//! [`BusError::SequenceExhausted`] terminally — the bus instance must be
+//! discarded. Silent wrap is forbidden.
+//!
+//! ## Retry safety
+//!
+//! `state.next_sequence` advances **only on publish success**. All failed
+//! publish paths leave the counter unchanged, so the next publish attempt
+//! reuses the would-have-been sequence. Among the failure modes:
+//!
+//! - [`BusError::ClockUnavailable`] and [`BusError::Envelope`] are
+//!   **retryable** — the underlying problem (system clock or caller-supplied
+//!   `PublishMeta`) can be corrected and the same publish re-attempted.
+//! - [`BusError::Closed`] is **terminal** — the consumer has dropped and no
+//!   further publish on this bus can succeed; the caller should discard the
+//!   bus instance. The "does not consume a sequence" rule still applies, so
+//!   a Closed-failed publish leaves `next_sequence` unchanged for the
+//!   bookkeeping symmetry.
+//! - [`BusError::SequenceExhausted`] is also **terminal** — the bus has
+//!   reached `u64::MAX` and must be discarded.
+//!
+//! This is the foundation of the retry-safety invariant verified by T6.
+//!
+//! ## Phase 2 extension policy
+//!
+//! [`BusStats`] and [`BusError`] both carry `#[non_exhaustive]` so future
+//! Phase 2 work (e.g. backpressure timeout variants, additional metric
+//! fields) can land additively. New impls of [`EventBus`] / [`EventConsumer`]
+//! (e.g. lock-free ring buffer, cursor-aware multi-consumer) are also
+//! additive — gated on benchmark proof per ADR-005.
 
 use rust_lmax_mev_types::TypesError;
 
+/// Returned from `publish` on success.
+///
+/// Carries only the bus-assigned identity of the published event; the
+/// envelope itself flows exclusively to the consumer side. Keeping the
+/// publish path clone-free is the reason `publish` does not return
+/// `EventEnvelope<T>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishAck {
     pub sequence: u64,
     pub timestamp_ns: u64,
 }
 
+/// In-process readable bus snapshot.
+///
+/// Comprised of three counters (`published_total`, `consumed_total`,
+/// `backpressure_total`), one gauge (`current_depth`), and one structural
+/// quantity (`capacity`).
+///
+/// Each field is read independently from its underlying atomic or channel,
+/// so the returned value is an **observability sample, not a linearizable
+/// transaction snapshot** — concurrent publish / recv may interleave between
+/// the per-field reads.
+///
+/// Marked `#[non_exhaustive]` so downstream callers cannot rely on
+/// exhaustive construction or matching; Phase 2 may add fields while
+/// callers continue to read the values through `stats()` and pattern-match
+/// with `..` rest patterns. (Note: `#[non_exhaustive]` on a public struct
+/// forbids struct-literal construction outside this crate, which is the
+/// desired contract here — `BusStats` is produced only by
+/// [`EventBus::stats`].)
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BusStats {
@@ -19,6 +119,12 @@ pub struct BusStats {
     pub capacity: usize,
 }
 
+/// Errors returned by [`EventBus`] / [`EventConsumer`] operations.
+///
+/// Marked `#[non_exhaustive]` so Phase 2 may add variants (e.g.
+/// `BackpressureTimeout`, `MetricsBackendUnavailable`) without breaking
+/// downstream `match` consumers — they will route the new variants
+/// through the `_ =>` arm.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum BusError {
@@ -49,22 +155,57 @@ use rust_lmax_mev_types::{EventEnvelope, PublishMeta};
 
 // === Traits ===
 
+/// Producer-side handle to a single ordered event stream.
+///
+/// Domain events block on a full queue; telemetry-channel saturation drops
+/// are the responsibility of a separate channel (Task 15) and are not
+/// modeled here. See ADR-005 for the policy.
 pub trait EventBus<T>: Send + Sync
 where
     T: Send + 'static,
 {
+    /// Publishes `payload` with the caller-supplied `meta`. Returns the
+    /// bus-assigned identity. The envelope itself flows only to the
+    /// consumer; the publish path is clone-free.
+    ///
+    /// On success, `state.next_sequence` is advanced by 1. On any error,
+    /// the counter is unchanged — see the crate-level "Retry safety" section.
     fn publish(&self, payload: T, meta: PublishMeta) -> Result<PublishAck, BusError>;
+
+    /// Returns the current channel depth (`sender.len()`).
     fn len(&self) -> usize;
+
+    /// Returns the configured channel capacity (set at `new()` time).
     fn capacity(&self) -> usize;
+
+    /// Returns an in-process snapshot of the four metrics + structural
+    /// quantities. **Must not acquire the publish-state mutex** — reads
+    /// only the atomic counters and the channel `len`/`capacity`.
     fn stats(&self) -> BusStats;
 }
 
+/// Consumer-side handle to a single ordered event stream.
+///
+/// `CrossbeamConsumer<T>` (the only Phase 1 impl) does not implement
+/// `Clone`. The single-consumer contract is enforced by construction:
+/// `CrossbeamBoundedBus::new` returns exactly one consumer per bus.
+///
+/// Sharing a consumer across multiple worker threads (which would
+/// distribute order-dependent processing) is **outside** the Phase 1
+/// contract. Producer-side sharing across threads is supported via
+/// `Arc<CrossbeamBoundedBus<T>>`.
 pub trait EventConsumer<T>: Send + Sync
 where
     T: Send + 'static,
 {
+    /// Blocks until an envelope is available or the bus is dropped.
     fn recv(&self) -> Result<EventEnvelope<T>, BusError>;
+
+    /// Returns immediately. `Ok(None)` indicates an empty queue and is
+    /// **not an error**; `consumed_total` is not advanced on this branch.
     fn try_recv(&self) -> Result<Option<EventEnvelope<T>>, BusError>;
+
+    /// Returns the current channel depth (`receiver.len()`).
     fn len(&self) -> usize;
 }
 
