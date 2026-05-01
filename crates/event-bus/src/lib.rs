@@ -413,4 +413,28 @@ mod tests {
         let err = consumer.recv().expect_err("recv must be closed");
         assert!(matches!(err, BusError::Closed));
     }
+
+    #[test]
+    fn publish_rejects_invalid_meta_without_consuming_sequence() {
+        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(2)
+            .expect("capacity 2 valid");
+
+        // Invalid meta: chain_id = 0 violates Phase 1 envelope invariant.
+        let mut bad_meta = meta();
+        bad_meta.chain_context.chain_id = 0;
+
+        let err = bus
+            .publish(payload(0), bad_meta)
+            .expect_err("invalid meta must reject");
+        assert!(matches!(err, BusError::Envelope(_)));
+        assert_eq!(bus.stats().published_total, 0);
+
+        // Valid retry must reuse sequence = 0.
+        let ack = bus.publish(payload(0), meta()).expect("valid publish");
+        assert_eq!(ack.sequence, 0);
+
+        let env = consumer.recv().expect("recv");
+        assert_eq!(env.sequence(), 0);
+        assert_eq!(bus.stats().published_total, 1);
+    }
 }
