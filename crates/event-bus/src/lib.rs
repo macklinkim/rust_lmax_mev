@@ -391,4 +391,26 @@ mod tests {
         // Failed publish does not advance the sequence counter.
         assert_eq!(bus.stats().published_total, 0);
     }
+
+    #[test]
+    fn try_recv_empty_returns_none_and_recv_after_bus_drop_returns_closed() {
+        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(2)
+            .expect("capacity 2 valid");
+
+        // (a) try_recv on empty queue: Ok(None), consumed_total stays at 0.
+        assert!(matches!(consumer.try_recv().expect("try_recv ok"), None));
+        assert_eq!(consumer.len(), 0);
+        assert_eq!(bus.stats().consumed_total, 0);
+
+        // (b) After one publish, try_recv returns Ok(Some(_)) and consumed_total advances.
+        let ack = bus.publish(payload(0), meta()).expect("publish");
+        let env = consumer.try_recv().expect("try_recv ok").expect("event present");
+        assert_eq!(env.sequence(), ack.sequence);
+        assert_eq!(bus.stats().consumed_total, 1);
+
+        // (c) After dropping the bus, recv returns BusError::Closed.
+        drop(bus);
+        let err = consumer.recv().expect_err("recv must be closed");
+        assert!(matches!(err, BusError::Closed));
+    }
 }
