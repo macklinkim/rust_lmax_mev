@@ -40,6 +40,7 @@ pub enum BusError {
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -89,6 +90,25 @@ pub struct CrossbeamConsumer<T> {
     consumed_total: Arc<AtomicU64>,
 }
 
+fn now_ns() -> Result<u64, BusError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .filter(|&ns| ns != 0)
+        .ok_or(BusError::ClockUnavailable)
+}
+
+/// Centralized `usize → f64` cast for the `current_depth` gauge.
+///
+/// Phase 1 capacities are well below 2^53, so precision loss does not apply
+/// (per spec §8.1). Centralizing the cast keeps the `#[allow(...)]` rationale
+/// in one place rather than scattered across publish/recv call sites.
+#[allow(clippy::cast_precision_loss)]
+fn depth_as_f64(depth: usize) -> f64 {
+    depth as f64
+}
+
 impl<T> CrossbeamBoundedBus<T>
 where
     T: Send + 'static,
@@ -125,8 +145,31 @@ impl<T> EventBus<T> for CrossbeamBoundedBus<T>
 where
     T: Send + 'static,
 {
-    fn publish(&self, _payload: T, _meta: PublishMeta) -> Result<PublishAck, BusError> {
-        unimplemented!("publish lands in Task 5")
+    fn publish(&self, payload: T, meta: PublishMeta) -> Result<PublishAck, BusError> {
+        let mut state = self.state.lock();
+
+        let timestamp_ns = now_ns()?;
+
+        let sequence = state.next_sequence;
+        if sequence == u64::MAX {
+            return Err(BusError::SequenceExhausted);
+        }
+
+        let envelope = EventEnvelope::seal(meta, payload, sequence, timestamp_ns)?;
+
+        self.sender
+            .send(envelope)
+            .map_err(|_| BusError::Closed)?;
+
+        state.next_sequence = sequence + 1;
+        self.published_total.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("event_bus_published_total").increment(1);
+        metrics::gauge!("event_bus_current_depth").set(depth_as_f64(self.sender.len()));
+
+        Ok(PublishAck {
+            sequence,
+            timestamp_ns,
+        })
     }
 
     fn len(&self) -> usize {
@@ -153,11 +196,29 @@ where
     T: Send + 'static,
 {
     fn recv(&self) -> Result<EventEnvelope<T>, BusError> {
-        unimplemented!("recv lands in Task 5")
+        match self.receiver.recv() {
+            Ok(env) => {
+                self.consumed_total.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("event_bus_consumed_total").increment(1);
+                metrics::gauge!("event_bus_current_depth").set(depth_as_f64(self.receiver.len()));
+                Ok(env)
+            }
+            Err(_) => Err(BusError::Closed),
+        }
     }
 
     fn try_recv(&self) -> Result<Option<EventEnvelope<T>>, BusError> {
-        unimplemented!("try_recv lands in Task 5")
+        use crossbeam_channel::TryRecvError;
+        match self.receiver.try_recv() {
+            Ok(env) => {
+                self.consumed_total.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("event_bus_consumed_total").increment(1);
+                metrics::gauge!("event_bus_current_depth").set(depth_as_f64(self.receiver.len()));
+                Ok(Some(env))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(BusError::Closed),
+        }
     }
 
     fn len(&self) -> usize {
@@ -202,5 +263,45 @@ mod tests {
             Ok(_) => panic!("capacity 0 must reject"),
         };
         assert!(matches!(err, BusError::InvalidCapacity(0)));
+    }
+
+    #[test]
+    fn publish_assigns_sequence_nonzero_timestamp_and_preserves_envelope() {
+        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(8)
+            .expect("capacity 8 valid");
+
+        let m = meta();
+        let p = payload(7);
+
+        let ack0 = bus.publish(payload(0), m.clone()).expect("publish 0");
+        let ack1 = bus.publish(payload(1), m.clone()).expect("publish 1");
+        let ack2 = bus.publish(p.clone(), m.clone()).expect("publish 2");
+
+        assert_eq!([ack0.sequence, ack1.sequence, ack2.sequence], [0, 1, 2]);
+        assert!(ack0.timestamp_ns != 0);
+        assert!(ack1.timestamp_ns != 0);
+        assert!(ack2.timestamp_ns != 0);
+        // No timestamp monotonicity assertion - wall clock may move backward.
+
+        // Drain and verify the third envelope matches its ack and preserves all
+        // meta + payload.
+        let _e0 = consumer.recv().expect("recv 0");
+        let _e1 = consumer.recv().expect("recv 1");
+        let e2 = consumer.recv().expect("recv 2");
+
+        assert_eq!(e2.sequence(), ack2.sequence);
+        assert_eq!(e2.timestamp_ns(), ack2.timestamp_ns);
+        assert_eq!(e2.source(), m.source);
+        assert_eq!(e2.event_version(), m.event_version);
+        assert_eq!(e2.correlation_id(), m.correlation_id);
+        assert_eq!(e2.chain_context(), &m.chain_context);
+        assert_eq!(e2.payload(), &p);
+
+        let stats = bus.stats();
+        assert_eq!(stats.published_total, 3);
+        assert_eq!(stats.consumed_total, 3);
+        assert_eq!(stats.backpressure_total, 0);
+        assert_eq!(stats.current_depth, 0);
+        assert_eq!(stats.capacity, 8);
     }
 }
