@@ -1,8 +1,8 @@
 # Task 13: `crates/journal` Design Spec — Batch A (Architecture / Scope / API surface / Resolved Decisions)
 
-**Version:** 0.6 (Batch A v0.4 + Batch B v0.5 + Batch C v0.6, all user-approved 2026-05-01)
-**Date:** 2026-05-01
-**Status:** Batch A v0.4 user-approved 2026-05-01; Batch B v0.5 user-approved 2026-05-01; Batch C v0.6 user-approved 2026-05-01 (Codex final pass complete: APPROVED FOR USER SIGN-OFF + STILL APPROVED post-polish; 3 P3 polish items + 1 residual D19 polish all applied). Spec is final at v0.6; commit gate per §C.5 pending explicit user approval.
+**Version:** 0.7 (v0.6 user-approved + 2026-05-02 rocksdb staged-deferral amendment per Codex resolution path B)
+**Date:** 2026-05-02
+**Status:** Batch A v0.4 + B v0.5 + C v0.6 user-approved 2026-05-01 (committed at `6f0368c`). v0.7 amendment 2026-05-02 documents rocksdb staged-deferral in §4.2 Notes and §C.1.2 after Gate 3 scaffold attempt found `libclang` transitive build dep on host (`bindgen` requirement of `rocksdb` crate). RocksDB remains the Phase 1 snapshot backend; only the dep listing is staged to Gate 5 implementation. Codex APPROVED resolution path B 2026-05-02 (HIGH confidence). §C.5 gate 3 (workspace + scaffold) retry blocked on host LLVM/libclang installation.
 **Implements:** Task 13 of Phase 1 plan (`CLAUDE.md` Phase 1 task checklist).
 **Depends on:** Task 11 (`crates/types`) — DONE; Task 12 (`crates/event-bus`) — DONE (final HEAD `bb2e020`).
 **References:** ADR-003 (mempool/relay/persistence), ADR-004 (RPC/EVM stack), ADR-008 (observability + CI baseline), Task 11 spec §11.1 (deferred ADR-004 bincode wording reconciliation), Task 12 spec (`#[non_exhaustive]` policy + augmented D10 `--all-targets` clippy gate).
@@ -139,6 +139,7 @@ tempfile = "3"                      # filesystem-backed test fixtures
 ```
 
 Notes:
+- **Staged dependency note (amended 2026-05-02): the `rocksdb = { workspace = true }` line is staged-deferred — Gate 3 scaffold ships `crates/journal/Cargo.toml` WITHOUT this line. `rocksdb` is added during Gate 5 implementation at the time the `RocksDbSnapshot` impl lands.** Reason: the `rocksdb` crate transitively requires `libclang` for `bindgen` FFI generation (host-side build prerequisite). Gate 3 scaffold ships without `rocksdb` so the workspace builds on hosts where `libclang` is not yet configured. **RocksDB remains the Phase 1 snapshot backend per ADR-003 + §5.2 + §B.2.5–§B.2.7; no alternate backend is selected; only the dep listing is deferred.**
 - `crc32fast` is new to the workspace and must be added to `[workspace.dependencies]` in this task's first commit.
 - `tempfile` follows the CLAUDE.md "Config crate needs `tempfile = '3'` in dev-dependencies" precedent. NOT a workspace dep — local dev-dep only.
 - `serde` is needed for the snapshot generic API's `<V: serde::Serialize + serde::de::DeserializeOwned>` bounds (under bincode 1.3 serde adapter).
@@ -1402,6 +1403,8 @@ tempfile = "3"
 ```
 
 Identical to the §4.2 specification.
+
+**Staged inclusion (amended 2026-05-02): the `rocksdb = { workspace = true }` line is omitted from the Gate 3 scaffold commit.** Gate 3 ships `crates/journal/Cargo.toml` with 7 runtime deps (rust-lmax-mev-types path-dep + rkyv + bincode + metrics + thiserror + serde + crc32fast) plus 1 dev-dep (tempfile). `rocksdb` is added during Gate 5 implementation at the time `RocksDbSnapshot` impl lands; see §4.2 Notes for the libclang rationale. RocksDbSnapshot remains the Phase 1 snapshot backend per ADR-003 + §5.2 + §B.2.5–§B.2.7.
 
 ### C.2 — Workspace-edit chore commit body
 
