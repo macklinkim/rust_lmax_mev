@@ -437,4 +437,28 @@ mod tests {
         assert_eq!(env.sequence(), 0);
         assert_eq!(bus.stats().published_total, 1);
     }
+
+    #[test]
+    fn sequence_exhausted_does_not_wrap() {
+        let (bus, consumer) = CrossbeamBoundedBus::<SmokeTestPayload>::new(2)
+            .expect("capacity 2 valid");
+
+        // Force the boundary: next publish would attempt sequence == u64::MAX.
+        bus.state.lock().next_sequence = u64::MAX;
+
+        let err = bus
+            .publish(payload(0), meta())
+            .expect_err("must be SequenceExhausted at u64::MAX");
+        assert!(matches!(err, BusError::SequenceExhausted));
+
+        // No advance, no envelope sent, and crucially no progress past step 4 of
+        // section 7.3: backpressure_total and current_depth must both be 0 to
+        // confirm the publish path returned before reaching seal/try_send.
+        assert_eq!(bus.state.lock().next_sequence, u64::MAX);
+        assert!(matches!(consumer.try_recv().expect("try_recv ok"), None));
+        let stats = bus.stats();
+        assert_eq!(stats.published_total, 0);
+        assert_eq!(stats.backpressure_total, 0);
+        assert_eq!(stats.current_depth, 0);
+    }
 }
