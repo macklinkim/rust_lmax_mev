@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::Address;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const ENV_PREFIX: &str = "RUST_LMAX_MEV";
 const ENV_SEPARATOR: &str = "__";
@@ -150,7 +150,7 @@ pub struct PoolConfig {
     pub address: Address,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub enum PoolKind {
     #[serde(rename = "uniswap_v2")]
     UniswapV2,
