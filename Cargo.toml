@@ -4,8 +4,9 @@ members = [
     "crates/types",
     "crates/event-bus",
     "crates/journal",
-    # crates/config, crates/observability, crates/app are added in Task 14-16
-    # as those crates are created.
+    "crates/config",
+    "crates/observability",
+    # crates/app is added in Batch B (Task 16) when that crate is created.
 ]
 
 [workspace.package]
@@ -39,6 +40,7 @@ metrics-exporter-prometheus = "0.15"
 
 # config
 toml = "0.8"
+config = "0.14"
 
 # testing
 proptest = "1.4"
