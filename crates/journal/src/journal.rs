@@ -951,6 +951,183 @@ mod tests {
         assert_eq!(journal.stats().corrupt_frames_total, 1);
     }
 
+    /// J-15 (synthetic byte-patch; Task 7): write a valid envelope with a
+    /// sentinel `timestamp_ns` value, locate the sentinel bytes inside the
+    /// rkyv-encoded payload, patch them to `0`, recompute the CRC, and write
+    /// the corrupted record directly. On `iter_all().next()` the
+    /// `EventEnvelope::validate()` boundary call (spec §5.4 step g) MUST
+    /// surface `Err(JournalError::Types(TypesError::InvalidEnvelope {
+    /// field: "timestamp_ns", .. }))` because `validate()` rejects
+    /// `timestamp_ns == 0`. The iterator then fuses to `None`;
+    /// `corrupt_frames_total` increments by exactly 1.
+    ///
+    /// Sentinel value `0x0123456789ABCDEF` is chosen because it is unlikely
+    /// to appear elsewhere in a SmokeTestPayload-bearing envelope (the other
+    /// fields use small fixed values: chain_id=1, block_number=18_000_000,
+    /// event_version=1, correlation_id=42, sequence=100, nonce=107, data
+    /// `[0xCD; 32]`); the test asserts the sentinel pattern occurs exactly
+    /// once in the rkyv encoding before patching. If a future rkyv 0.8
+    /// patch alters the archived layout so the sentinel appears multiple
+    /// times, the exactly-once assertion trips and the implementer must
+    /// adjust the sentinel-search per spec section B.5.2 J-15 closing note.
+    #[test]
+    fn invariant_violating_decoded_envelope_is_rejected_via_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+
+        // Step 1-2: build a valid envelope with a sentinel timestamp_ns and
+        // rkyv-serialize it into an AlignedVec.
+        let sentinel_ts: u64 = 0x0123_4567_89AB_CDEF;
+        let env = EventEnvelope::seal(
+            valid_meta(),
+            SmokeTestPayload {
+                nonce: 107,
+                data: [0xCD; 32],
+            },
+            /* sequence */ 100,
+            sentinel_ts,
+        )
+        .expect("sentinel envelope must seal (timestamp_ns is non-zero)");
+        let payload =
+            rkyv::to_bytes::<RancorError>(&env).expect("rkyv must serialize sentinel envelope");
+
+        // Step 3-4: search for the sentinel byte pattern. timestamp_ns is
+        // serialized little-endian by rkyv.
+        let sentinel_bytes = sentinel_ts.to_le_bytes();
+        let matches: Vec<usize> = payload
+            .as_slice()
+            .windows(8)
+            .enumerate()
+            .filter_map(|(idx, window)| (window == sentinel_bytes).then_some(idx))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "sentinel bytes {sentinel_bytes:?} must appear exactly once in the rkyv payload \
+             (found {} occurrences); update the J-15 sentinel-search per spec §B.5.2 J-15 \
+             closing note if a future rkyv 0.8 patch alters the archived layout",
+            matches.len()
+        );
+
+        // Step 5: patch the sentinel bytes to zero (timestamp_ns = 0).
+        let mut patched = payload.as_slice().to_vec();
+        let patch_offset = matches[0];
+        for byte in &mut patched[patch_offset..patch_offset + 8] {
+            *byte = 0;
+        }
+
+        // Step 6: recompute CRC32 of the patched payload.
+        let crc = crc32fast::hash(&patched);
+
+        // Step 7: write the corrupted record directly to a fresh file. The
+        // file consists of the 8-byte header + length prefix + patched
+        // payload + recomputed CRC.
+        let mut frame_bytes = Vec::with_capacity(4 + patched.len() + 4);
+        frame_bytes.extend_from_slice(&(patched.len() as u32).to_le_bytes());
+        frame_bytes.extend_from_slice(&patched);
+        frame_bytes.extend_from_slice(&crc.to_le_bytes());
+        write_journal_file_with_bytes(&path, &frame_bytes);
+
+        // Step 8: reopen the journal.
+        let journal = FileJournal::<SmokeTestPayload>::open(&path).unwrap();
+
+        // Step 9-10: iter_all yields Err(Types(InvalidEnvelope{field:
+        // "timestamp_ns", ..})) then None on the SAME iterator.
+        let mut iter = journal.iter_all();
+        let first = iter.next().expect("must yield validate() failure");
+        match first {
+            Err(JournalError::Types(rust_lmax_mev_types::TypesError::InvalidEnvelope {
+                field,
+                ..
+            })) => {
+                assert_eq!(field, "timestamp_ns");
+            }
+            other => panic!(
+                "expected JournalError::Types(InvalidEnvelope{{field:\"timestamp_ns\"}}), \
+                 got {other:?}"
+            ),
+        }
+        assert!(
+            iter.next().is_none(),
+            "iterator must fuse after validate() boundary failure per spec §X.8"
+        );
+
+        // Step 11: corrupt_frames_total increments by exactly 1.
+        assert_eq!(
+            journal.stats().corrupt_frames_total,
+            1,
+            "exactly one corrupt-frame counter increment per spec §B.4 row 2"
+        );
+    }
+
+    /// J-16 (synthetic; Task 7): bind `let mut iter = journal.iter_all();`
+    /// ONCE; the first `next()` yields an `Err`; the second `next()` on the
+    /// SAME iterator yields `None` per spec §X.8 fused-on-first-Err. Re-
+    /// calling `journal.iter_all()` returns a fresh iterator that re-yields
+    /// the same `Err` on its first `next()` — that is intentional re-read,
+    /// NOT a violation; the fuse property is per-iterator-instance, not
+    /// per-journal.
+    #[test]
+    fn corrupt_then_next_returns_none_on_same_iterator_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        // Use the J-13 zero-length-frame corruption shape: header + [u32
+        // 0_le] + [u32 0_le]. Any corrupt file works; this one is the
+        // smallest and most deterministic.
+        write_journal_file_with_bytes(&path, &[0u8; 8]);
+
+        let journal = FileJournal::<SmokeTestPayload>::open(&path).unwrap();
+
+        // First iter binding — assert fuse-on-first-Err on the SAME instance.
+        let mut iter = journal.iter_all();
+        let first = iter.next().expect("first call must yield Err");
+        assert!(
+            matches!(
+                first,
+                Err(JournalError::InvalidFrameLength { length: 0, .. })
+            ),
+            "expected InvalidFrameLength{{length:0}}, got {first:?}"
+        );
+        assert!(
+            iter.next().is_none(),
+            "second next() on the SAME iterator must return None per spec §X.8"
+        );
+        assert!(
+            iter.next().is_none(),
+            "third next() on the SAME iterator must also return None (fused)"
+        );
+
+        // Counter increments per the first iter's single Err. The second
+        // iter (below) increments again, so we snapshot here before the
+        // second iter to confirm exactly one increment per iterator.
+        assert_eq!(
+            journal.stats().corrupt_frames_total,
+            1,
+            "exactly one corrupt-frame increment from the first iter"
+        );
+
+        // Re-calling iter_all yields a FRESH iterator that re-reads from
+        // offset 8; the same Err is yielded again. This is intentional
+        // re-read per spec §X.8, not a fuse violation.
+        let mut iter2 = journal.iter_all();
+        let first2 = iter2.next().expect("fresh iter must yield Err again");
+        assert!(
+            matches!(
+                first2,
+                Err(JournalError::InvalidFrameLength { length: 0, .. })
+            ),
+            "fresh iter must re-yield the same Err (intentional re-read)"
+        );
+        assert!(iter2.next().is_none(), "fresh iter also fuses after Err");
+
+        // The fresh iter incremented corrupt_frames_total once more.
+        assert_eq!(
+            journal.stats().corrupt_frames_total,
+            2,
+            "fresh iter contributes its own +1 to the journal-wide counter"
+        );
+    }
+
     /// J-18 (synthetic; Task 6, parameterized over 1, 2, 3 partial bytes):
     /// file consists of the 8-byte header followed by 1/2/3 bytes of would-
     /// be length prefix. `iter_all().next()` yields `Err(TruncatedFrame {
