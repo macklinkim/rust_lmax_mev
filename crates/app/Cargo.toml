@@ -1,0 +1,23 @@
+[package]
+name = "rust-lmax-mev-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "rust-lmax-mev-app"
+path = "src/main.rs"
+
+[dependencies]
+rust-lmax-mev-types = { path = "../types" }
+rust-lmax-mev-event-bus = { path = "../event-bus" }
+rust-lmax-mev-journal = { path = "../journal" }
+rust-lmax-mev-config = { path = "../config" }
+rust-lmax-mev-observability = { path = "../observability" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
