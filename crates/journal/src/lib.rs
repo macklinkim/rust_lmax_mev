@@ -31,3 +31,4 @@ pub mod journal;
 pub mod snapshot;
 
 pub use error::JournalError;
+pub use journal::{FileJournal, JournalStats};
