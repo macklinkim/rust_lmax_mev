@@ -148,6 +148,46 @@ impl RocksDbSnapshot {
             loaded_total: self.loaded_total.load(Ordering::Relaxed),
         }
     }
+
+    /// Writes the `last_sequence` watermark per spec §B.2.7. bincode-
+    /// serializes the `u64` via the 1.x serde adapter (per spec §X.4) and
+    /// writes it directly to `LAST_SEQUENCE_KEY`, **bypassing the user-
+    /// facing reserved-prefix rejection** because the reserved key IS the
+    /// target.
+    ///
+    /// **Does NOT increment `saved_total`** per spec §B.2.7: the watermark
+    /// is bookkeeping (replay-cursor advance) rather than user data, so
+    /// inflating `saved_total` with bookkeeping writes would make the
+    /// counter less useful as an operational signal.
+    pub fn set_last_sequence(&self, seq: u64) -> Result<(), JournalError> {
+        let encoded = bincode::serialize(&seq).map_err(JournalError::BincodeSerialize)?;
+        self.db.put(LAST_SEQUENCE_KEY, encoded)?;
+        Ok(())
+    }
+
+    /// Reads the `last_sequence` watermark per spec §B.2.7.
+    ///
+    /// - `db.get(LAST_SEQUENCE_KEY)?` — RocksDB error surfaces as
+    ///   `Err(RocksDb(...))`.
+    /// - If `None` (no prior `set_last_sequence` call): returns
+    ///   `Err(JournalError::LastSequenceUnavailable)` per spec §X.12.
+    ///   `0` is intentionally NOT used as a sentinel because `0` is a
+    ///   valid sequence value (Task 11 sequences start at 0).
+    /// - If `Some(bytes)`: bincode-deserialize the `u64`; on decode failure
+    ///   `Err(BincodeDeserialize(...))`. NO counter increment (read-only
+    ///   bookkeeping; symmetric with `set_last_sequence`'s no-write-counter
+    ///   semantic).
+    pub fn last_sequence(&self) -> Result<u64, JournalError> {
+        let bytes = self.db.get(LAST_SEQUENCE_KEY)?;
+        match bytes {
+            None => Err(JournalError::LastSequenceUnavailable),
+            Some(raw) => {
+                let seq: u64 =
+                    bincode::deserialize(&raw).map_err(JournalError::BincodeDeserialize)?;
+                Ok(seq)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -269,5 +309,99 @@ mod tests {
             stats.loaded_total, 1,
             "only the present-load increments; absent-load does not"
         );
+    }
+
+    /// S-3 (TDD red→green; Task 10): set_last_sequence then last_sequence
+    /// returns the same u64 value. Asserts the bookkeeping watermark
+    /// round-trips and does NOT inflate `saved_total` per spec §B.2.7.
+    #[test]
+    fn snapshot_last_sequence_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = RocksDbSnapshot::open(dir.path().join("rocks")).unwrap();
+
+        let stats_before = snap.stats();
+        snap.set_last_sequence(42).unwrap();
+        let stats_after = snap.stats();
+        assert_eq!(
+            stats_after, stats_before,
+            "set_last_sequence is bookkeeping; must NOT bump saved_total per spec §B.2.7"
+        );
+
+        let seq = snap.last_sequence().unwrap();
+        assert_eq!(seq, 42);
+
+        let stats_final = snap.stats();
+        assert_eq!(
+            stats_final, stats_before,
+            "last_sequence is read-only bookkeeping; must NOT bump loaded_total"
+        );
+    }
+
+    /// S-4 (test-first; Task 10): fresh snapshot with no prior
+    /// set_last_sequence call returns Err(LastSequenceUnavailable). 0 is
+    /// NOT used as a sentinel because 0 is a valid sequence value per
+    /// spec §X.12 (Task 11 sequences start at 0).
+    #[test]
+    fn snapshot_last_sequence_before_set_returns_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = RocksDbSnapshot::open(dir.path().join("rocks")).unwrap();
+        let err = snap.last_sequence().unwrap_err();
+        assert!(
+            matches!(err, JournalError::LastSequenceUnavailable),
+            "expected LastSequenceUnavailable, got {err:?}"
+        );
+    }
+
+    /// I-1 (smoke; Task 11): FileJournal and RocksDbSnapshot can coexist
+    /// in separate directories within the same tempdir. Exercises the
+    /// full save → set_last_sequence → load → last_sequence → iter_all
+    /// path per spec §B.5.4. The two primitives operate on independent
+    /// paths and do NOT share state in Phase 1 (split-stack snapshot vs
+    /// journal per spec §4.4).
+    #[test]
+    fn journal_and_snapshot_can_coexist_in_separate_directories() {
+        use crate::journal::FileJournal;
+        use rust_lmax_mev_types::{
+            ChainContext, EventEnvelope, EventSource, PublishMeta,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.log");
+        let snapshot_path = dir.path().join("rocks");
+
+        let mut journal = FileJournal::<SmokeTestPayload>::open(&journal_path).unwrap();
+        let snapshot = RocksDbSnapshot::open(&snapshot_path).unwrap();
+
+        let payload = sample_payload(7);
+        let env = EventEnvelope::seal(
+            PublishMeta {
+                source: EventSource::Ingress,
+                chain_context: ChainContext {
+                    chain_id: 1,
+                    block_number: 18_000_000,
+                    block_hash: [0xAB; 32],
+                },
+                event_version: 1,
+                correlation_id: 42,
+            },
+            payload.clone(),
+            /* sequence */ 100,
+            /* timestamp_ns */ 1_700_000_000_000_000_000,
+        )
+        .expect("valid envelope must seal");
+
+        journal.append(&env).unwrap(); // &mut self per spec §5.1
+        journal.flush().unwrap();      // &mut self per spec §5.1
+        snapshot.save(b"checkpoint", &payload).unwrap();
+        snapshot.set_last_sequence(env.sequence()).unwrap();
+
+        let read_back: Option<SmokeTestPayload> = snapshot.load(b"checkpoint").unwrap();
+        assert_eq!(read_back, Some(payload));
+        assert_eq!(snapshot.last_sequence().unwrap(), env.sequence());
+
+        let mut iter = journal.iter_all();
+        let decoded = iter.next().expect("journal has one record").unwrap();
+        assert_eq!(decoded, env);
+        assert!(iter.next().is_none(), "journal exhausts after one record");
     }
 }
