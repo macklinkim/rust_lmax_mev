@@ -3456,6 +3456,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-lmax-mev-state"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "async-trait",
+ "bincode",
+ "rust-lmax-mev-config",
+ "rust-lmax-mev-journal",
+ "rust-lmax-mev-node",
+ "rust-lmax-mev-types",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rust-lmax-mev-types"
 version = "0.1.0"
 dependencies = [

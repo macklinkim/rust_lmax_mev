@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use rust_lmax_mev_config::{
     BusConfig, Config, FallbackRpcConfig, IngressConfig, IngressTokens, JournalConfig, LogFormat,
-    NodeConfig, ObservabilityConfig,
+    NodeConfig, ObservabilityConfig, PoolConfig, PoolKind, StateConfig,
 };
 
 /// Builds a `Config` whose journal + snapshot paths live under
@@ -57,6 +57,14 @@ pub fn make_config(tempdir: &std::path::Path) -> Config {
             watched_addresses: vec!["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
                 .parse()
                 .unwrap()],
+        },
+        state: StateConfig {
+            pools: vec![PoolConfig {
+                kind: PoolKind::UniswapV2,
+                address: "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
+                    .parse()
+                    .unwrap(),
+            }],
         },
     }
 }

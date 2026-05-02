@@ -10,6 +10,7 @@ members = [
     "crates/smoke-tests",
     "crates/node",
     "crates/ingress",
+    "crates/state",
 ]
 
 [workspace.package]

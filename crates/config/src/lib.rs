@@ -38,6 +38,7 @@ pub struct Config {
     pub journal: JournalConfig,
     pub bus: BusConfig,
     pub ingress: IngressConfig,
+    pub state: StateConfig,
 }
 
 /// Node topology section per ADR-007. Primary Geth WS + HTTP plus at least
@@ -133,6 +134,34 @@ pub struct IngressTokens {
     pub usdc: Address,
 }
 
+/// Phase 2 P2-B state-engine pool registry per ADR-002 thin-path scope
+/// (WETH/USDC on UniV2 + UniV3 0.05%). `Config::validate` rejects an
+/// empty pool list and duplicate pool addresses.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StateConfig {
+    pub pools: Vec<PoolConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PoolConfig {
+    pub kind: PoolKind,
+    pub address: Address,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum PoolKind {
+    #[serde(rename = "uniswap_v2")]
+    UniswapV2,
+    /// Uniswap V3 0.05% fee tier. snake_case auto-renaming would map
+    /// the variant name to `uniswap_v3_fee005` (no boundary between
+    /// `fee` and `005`); explicit rename keeps the more readable
+    /// `uniswap_v3_fee_005` TOML form.
+    #[serde(rename = "uniswap_v3_fee_005")]
+    UniswapV3Fee005,
+}
+
 /// All errors produced by [`Config::load`] and [`Config::from_toml_str`].
 ///
 /// `#[non_exhaustive]` so Phase 2 may add variants additively without
@@ -181,6 +210,16 @@ pub enum ConfigError {
     /// they identify distinct sides of the WETH/USDC pair per ADR-002.
     #[error("ingress.tokens.weth and ingress.tokens.usdc must differ")]
     DuplicateIngressTokens,
+
+    /// `state.pools` must contain at least one pool entry — an empty
+    /// list would leave the State Engine with nothing to refresh.
+    #[error("state.pools must contain at least one pool entry")]
+    EmptyStatePools,
+
+    /// Duplicate pool address in `state.pools` — every pool address
+    /// must be unique so per-pool snapshot keys do not collide.
+    #[error("state.pools contains duplicate pool address {0}")]
+    DuplicatePoolAddress(Address),
 }
 
 impl Config {
@@ -239,6 +278,16 @@ impl Config {
         if self.ingress.tokens.weth == self.ingress.tokens.usdc {
             return Err(ConfigError::DuplicateIngressTokens);
         }
+        if self.state.pools.is_empty() {
+            return Err(ConfigError::EmptyStatePools);
+        }
+        for (i, pool) in self.state.pools.iter().enumerate() {
+            for other in &self.state.pools[i + 1..] {
+                if pool.address == other.address {
+                    return Err(ConfigError::DuplicatePoolAddress(pool.address));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -279,6 +328,14 @@ watched_addresses = [
     "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc",
     "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
 ]
+
+[[state.pools]]
+kind = "uniswap_v2"
+address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
+
+[[state.pools]]
+kind = "uniswap_v3_fee_005"
+address = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
 "#
     }
 
@@ -337,6 +394,10 @@ usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 
 [ingress]
 watched_addresses = ["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"]
+
+[[state.pools]]
+kind = "uniswap_v2"
+address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
 "#;
         let err = Config::from_toml_str(toml).unwrap_err();
         assert!(
@@ -377,6 +438,10 @@ usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 
 [ingress]
 watched_addresses = ["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"]
+
+[[state.pools]]
+kind = "uniswap_v2"
+address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
 "#;
         let err = Config::from_toml_str(toml).unwrap_err();
         assert!(
