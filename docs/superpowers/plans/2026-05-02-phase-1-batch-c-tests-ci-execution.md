@@ -1,7 +1,7 @@
 # Phase 1 Batch C — Smoke Tests + CI Execution Note
 
 **Date:** 2026-05-02
-**Status:** Draft v0.3 (revised after Codex 2026-05-02 16:43:55 +09:00 HIGH-confidence REVISION REQUIRED — B-1 cleanup-on-timeout path is now non-deadlocking by running the same full drain as the success path before panicking, instead of attempting a single-slot drain that cannot unblock 99,936 pending publishes)
+**Status:** Draft v0.4 (impl-time correction in commit 4 — bumped cargo-deny pin from `^0.16` to `^0.18` because cargo-deny 0.16.4 cannot parse RustSec advisories with CVSS 4.0, e.g., RUSTSEC-2026-0066 in `astral-tokio-tar`; 0.18 series adds CVSS 4.0 support. v0.3's deterministic-backpressure cleanup path is unchanged.)
 **Scope:** Tasks 17 (integration smoke tests) + 18 (CI workflow + `deny.toml` refresh).
 **Predecessor:** Batch B closed at `2b82272` (Codex APPROVED 2026-05-02 16:30:10 +09:00 MEDIUM).
 **Authoritative sources:** ADR-005 (bus capacity + backpressure), ADR-008 (CI baseline — 7 checks defined verbatim), CLAUDE.md (test policy: "Backpressure test must be fully implemented (not stub)"), the four frozen `docs/specs/` documents. No detailed batch spec is produced; this note IS the planning artifact.
@@ -39,7 +39,7 @@ No real producer pipeline (Phase 3), no Grafana dashboards (Phase 5), no multi-O
 | 1 | fmt | `cargo fmt --check` |
 | 2 | clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
 | 3 | test | `cargo test --workspace` |
-| 4 | deny | `cargo install cargo-deny --version 0.16 --locked` then `cargo deny check` |
+| 4 | deny | `cargo install cargo-deny --version "^0.18" --locked` then `cargo deny check` |
 | 5+6+7 | smoke | included in (3) since smoke tests are `#[test]` functions in `crates/smoke-tests/tests/` |
 
 Jobs 1-4 run on `ubuntu-latest` with `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2` for build caching, and `apt-get install -y clang libclang-dev` for `librocksdb-sys`'s `bindgen` precondition.
@@ -63,7 +63,7 @@ No new transitive C/C++ build dependencies (rocksdb is already pulled by `crates
 
 1. **Smoke tests live in dedicated `crates/smoke-tests`, NOT in `tests/` directories of frozen `event-bus` / `journal` crates.** Adding `tests/` files to a frozen crate IS a source-tree edit even if no `src/` files change, and the `task-13-complete` tag freezes that subtree. Dedicated crate keeps the frozen tags meaningful and isolates smoke tests in one location.
 2. **CI on `ubuntu-latest` only for Phase 1.** Multi-OS matrix (windows-latest, macos-latest) is Phase 4 hardening per ADR-001's vertical-slice ordering. Adding it now would triple CI runtime + multiply cache-invalidation surface for no Phase 1 thin-path benefit.
-3. **`cargo-deny` install pinned to an explicit version via `cargo install cargo-deny --version 0.16 --locked`.** The same `--version 0.16` is used in CI and locally so the gate behaves identically in both environments. `--locked` only forces use of cargo-deny's own bundled `Cargo.lock` (it does NOT pin to *this* project's resolved version — Codex 2026-05-02 16:37:11 corrected an earlier draft on this point). Drift risk: when cargo-deny ships a 0.17, the explicit `--version 0.16` keeps both CI and local runs deterministic until a follow-on commit bumps both call sites in lockstep. Direct install (rather than `EmbarkStudios/cargo-deny-action@v2`) eliminates a third-party action dependency and works identically; caching via `Swatinem/rust-cache@v2` covers the install cost on warm runs.
+3. **`cargo-deny` install pinned to an explicit version via `cargo install cargo-deny --version "^0.18" --locked`.** The same `--version "^0.18"` is used in CI and locally so the gate behaves identically in both environments. `--locked` only forces use of cargo-deny's own bundled `Cargo.lock` (it does NOT pin to *this* project's resolved version — Codex 2026-05-02 16:37:11 corrected an earlier draft on this point). Drift risk: when cargo-deny ships a 0.17, the explicit `--version "^0.18"` keeps both CI and local runs deterministic until a follow-on commit bumps both call sites in lockstep. Direct install (rather than `EmbarkStudios/cargo-deny-action@v2`) eliminates a third-party action dependency and works identically; caching via `Swatinem/rust-cache@v2` covers the install cost on warm runs.
 4. **Bus smoke = 100k events with DETERMINISTIC backpressure observation AND non-deadlocking cleanup** (per ADR-008 verbatim, per CLAUDE.md "not stub" override, per Codex 2026-05-02 16:37:11 + 16:43:55 substantive items). Mirrors the existing event-bus T2 test pattern (`crates/event-bus/src/lib.rs` lines ~480-541 — `publish_registers_backpressure_when_full_and_completes_after_recv`) with cleanup hardened for the 100k scale:
    1. Open `CrossbeamBoundedBus<SmokeTestPayload>` with capacity 64.
    2. Spawn a producer thread (`std::thread::spawn`) that publishes 100_000 envelopes sequentially; the first 64 succeed instantly, #65 blocks at the crossbeam send.
@@ -102,7 +102,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo doc -p rust-lmax-mev-smoke-tests --no-deps
 
 # cargo-deny gate, pinned to the same version as CI:
-cargo install cargo-deny --version 0.16 --locked     # idempotent if already installed at 0.16
+cargo install cargo-deny --version "^0.18" --locked     # idempotent if already installed at 0.16
 cargo deny check                                     # advisories + licenses + bans per deny.toml
 # CI YAML lint: GitHub Actions schema is validated server-side on push;
 # locally we rely on `actionlint` if installed (optional, not gating).

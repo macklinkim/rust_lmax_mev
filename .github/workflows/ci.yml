@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    name: cargo clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # librocksdb-sys requires libclang for bindgen at compile time.
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test --workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - run: cargo test --workspace
+
+  deny:
+    name: cargo deny check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Pin cargo-deny to ^0.18 (matches local Batch C close gate).
+      # 0.18 series adds CVSS 4.0 RustSec advisory parsing support that
+      # 0.16.x lacks; the original Batch C v0.3 plan said ^0.16 but
+      # impl-time discovery forced the bump (see execution note v0.4).
+      - run: cargo install cargo-deny --version "^0.18" --locked
+      - run: cargo deny check

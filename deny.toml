@@ -1,10 +1,48 @@
+# cargo-deny configuration. Schema v2 per cargo-deny 0.16+
+# (https://github.com/EmbarkStudios/cargo-deny/pull/611). The Phase 1
+# CI gate is `cargo deny check` per ADR-008.
+
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+version = 2
+ignore = [
+    # bincode 1.3 is "unmaintained" per RUSTSEC-2025-0141 (project-team
+    # cessation). ADR-004 deliberately chose bincode 1.x as the cold-path
+    # serializer for Phase 1; the 1.3 branch is feature-complete for our
+    # use case. Migration to wincode/postcard/bitcode is deferred to a
+    # future ADR revision.
+    "RUSTSEC-2025-0141",
+]
 
 [licenses]
-unlicensed = "deny"
-allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+version = 2
+# Skip license checks for internal `publish = false` crates so the
+# workspace's own crates do not need a license field. Without this, every
+# `crates/*/Cargo.toml` would need `license = "..."` even though they are
+# not published.
+private = { ignore = true }
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
 
 [bans]
 multiple-versions = "warn"
+wildcards = "deny"
+# Path-only intra-workspace deps look like wildcards to cargo-deny;
+# allow them since they resolve to specific local crates at build time.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
