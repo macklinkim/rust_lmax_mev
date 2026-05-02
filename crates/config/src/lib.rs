@@ -19,6 +19,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use alloy_primitives::Address;
 use serde::Deserialize;
 
 const ENV_PREFIX: &str = "RUST_LMAX_MEV";
@@ -36,6 +37,7 @@ pub struct Config {
     pub observability: ObservabilityConfig,
     pub journal: JournalConfig,
     pub bus: BusConfig,
+    pub ingress: IngressConfig,
 }
 
 /// Node topology section per ADR-007. Primary Geth WS + HTTP plus at least
@@ -105,6 +107,32 @@ pub struct BusConfig {
     pub capacity: usize,
 }
 
+/// Phase 2 ingress section per ADR-003. Carries the typed WETH/USDC
+/// token identities consumed by P2-B's pool-state code, plus the
+/// `watched_addresses` filter scope consumed by P2-A's normalizer.
+/// `tokens` and `watched_addresses` are intentionally separate: tokens
+/// carry semantic identity; watched_addresses define what tx.to values
+/// the normalizer keeps.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IngressConfig {
+    pub tokens: IngressTokens,
+    /// Filter scope: `Normalizer::filter` keeps a tx iff
+    /// `tx.to ∈ watched_addresses`. `Config::validate` rejects an empty
+    /// list with `ConfigError::EmptyWatchedAddresses`.
+    pub watched_addresses: Vec<Address>,
+}
+
+/// Typed WETH/USDC role identities per ADR-002 thin-path scope.
+/// `Config::validate` rejects `weth == usdc` with
+/// `ConfigError::DuplicateIngressTokens`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IngressTokens {
+    pub weth: Address,
+    pub usdc: Address,
+}
+
 /// All errors produced by [`Config::load`] and [`Config::from_toml_str`].
 ///
 /// `#[non_exhaustive]` so Phase 2 may add variants additively without
@@ -143,6 +171,16 @@ pub enum ConfigError {
     /// the first publish under crossbeam semantics.
     #[error("bus.capacity must be >= 1 per ADR-005, got {value}")]
     InvalidBusCapacity { value: usize },
+
+    /// `ingress.watched_addresses` must contain at least 1 entry — an
+    /// empty list would drop every mempool tx at the normalizer.
+    #[error("ingress.watched_addresses must contain at least one address")]
+    EmptyWatchedAddresses,
+
+    /// `ingress.tokens.weth` and `ingress.tokens.usdc` must differ —
+    /// they identify distinct sides of the WETH/USDC pair per ADR-002.
+    #[error("ingress.tokens.weth and ingress.tokens.usdc must differ")]
+    DuplicateIngressTokens,
 }
 
 impl Config {
@@ -195,6 +233,12 @@ impl Config {
         if self.bus.capacity == 0 {
             return Err(ConfigError::InvalidBusCapacity { value: 0 });
         }
+        if self.ingress.watched_addresses.is_empty() {
+            return Err(ConfigError::EmptyWatchedAddresses);
+        }
+        if self.ingress.tokens.weth == self.ingress.tokens.usdc {
+            return Err(ConfigError::DuplicateIngressTokens);
+        }
         Ok(())
     }
 }
@@ -225,6 +269,16 @@ rocksdb_snapshot_path = "/var/lib/lmax/snapshot"
 
 [bus]
 capacity = 1024
+
+[ingress.tokens]
+weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+
+[ingress]
+watched_addresses = [
+    "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc",
+    "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
+]
 "#
     }
 
@@ -276,6 +330,13 @@ rocksdb_snapshot_path = "/tmp/snapshot"
 
 [bus]
 capacity = 64
+
+[ingress.tokens]
+weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+
+[ingress]
+watched_addresses = ["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"]
 "#;
         let err = Config::from_toml_str(toml).unwrap_err();
         assert!(
@@ -309,6 +370,13 @@ rocksdb_snapshot_path = "/tmp/snapshot"
 
 [bus]
 capacity = 0
+
+[ingress.tokens]
+weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+
+[ingress]
+watched_addresses = ["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"]
 "#;
         let err = Config::from_toml_str(toml).unwrap_err();
         assert!(
