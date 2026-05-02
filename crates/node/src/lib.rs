@@ -21,6 +21,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::eips::BlockId;
 use alloy::network::Ethereum;
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::types::eth::{Filter, Header, Log, Transaction, TransactionRequest};
@@ -42,6 +43,11 @@ pub use reconnect::ReconnectingStream;
 #[async_trait]
 trait HttpRpc: Send + Sync {
     async fn eth_call(&self, req: TransactionRequest) -> Result<Bytes, NodeError>;
+    async fn eth_call_at_block(
+        &self,
+        req: TransactionRequest,
+        block_id: BlockId,
+    ) -> Result<Bytes, NodeError>;
     async fn eth_get_transaction_by_hash(
         &self,
         hash: B256,
@@ -55,6 +61,14 @@ struct AlloyHttp(RootProvider<Http<ReqwestClient>, Ethereum>);
 impl HttpRpc for AlloyHttp {
     async fn eth_call(&self, req: TransactionRequest) -> Result<Bytes, NodeError> {
         self.0.call(&req).await.map_err(classify)
+    }
+
+    async fn eth_call_at_block(
+        &self,
+        req: TransactionRequest,
+        block_id: BlockId,
+    ) -> Result<Bytes, NodeError> {
+        self.0.call(&req).block(block_id).await.map_err(classify)
     }
 
     async fn eth_get_transaction_by_hash(
@@ -110,6 +124,34 @@ impl NodeProvider {
                 match self.primary_http.eth_call(req.clone()).await {
                     Err(NodeError::Transport(_)) => match &self.fallback_http {
                         Some(fb) => fb.eth_call(req).await,
+                        None => Err(NodeError::Transport(
+                            "primary transport failed (after retry); no fallback configured"
+                                .to_string(),
+                        )),
+                    },
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// `eth_call` pinned at `block_id` with the same retry-then-fallback
+    /// policy as [`Self::eth_call`]. Phase 2 P2-B additive API per the
+    /// approved P2-B execution note v0.4 (Risk Decision 2): `crates/state`
+    /// needs block-hash-pinned reads for State Correctness Gate
+    /// determinism, which the prepending-`Pending`-tag `eth_call` could
+    /// not deliver. `eth_call(req)` semantics are unchanged.
+    pub async fn eth_call_at_block(
+        &self,
+        req: TransactionRequest,
+        block_id: BlockId,
+    ) -> Result<Bytes, NodeError> {
+        match self.primary_http.eth_call_at_block(req.clone(), block_id).await {
+            Err(NodeError::Transport(_)) => {
+                match self.primary_http.eth_call_at_block(req.clone(), block_id).await {
+                    Err(NodeError::Transport(_)) => match &self.fallback_http {
+                        Some(fb) => fb.eth_call_at_block(req, block_id).await,
                         None => Err(NodeError::Transport(
                             "primary transport failed (after retry); no fallback configured"
                                 .to_string(),
@@ -308,6 +350,14 @@ mod tests {
             let n = self.call_count.fetch_add(1, Ordering::Relaxed);
             (self.outcome)(n)
         }
+        async fn eth_call_at_block(
+            &self,
+            _req: TransactionRequest,
+            _block_id: BlockId,
+        ) -> Result<Bytes, NodeError> {
+            let n = self.call_count.fetch_add(1, Ordering::Relaxed);
+            (self.outcome)(n)
+        }
         async fn eth_get_transaction_by_hash(
             &self,
             _hash: B256,
@@ -346,6 +396,49 @@ mod tests {
         assert_eq!(got, expected);
         assert_eq!(primary_calls.load(Ordering::Relaxed), 1);
         assert_eq!(fallback_calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// N-1b (P2-B additive API): `eth_call_at_block` returns expected
+    /// bytes from primary; fallback NOT consulted. Same retry-then-
+    /// fallback policy as `eth_call` (verified in companion N-2-style
+    /// case below by setting outcome to Transport-then-Ok).
+    #[tokio::test]
+    async fn eth_call_at_block_pins_block_id_and_returns_primary_result() {
+        let expected = Bytes::from_static(b"\xCA\xFE");
+        let (primary, p_calls) = MockHttp::new({
+            let e = expected.clone();
+            move |_| Ok(e.clone())
+        });
+        let (fallback, f_calls) = MockHttp::new(|_| Ok(Bytes::from_static(b"WRONG")));
+        let np = np_with(primary, Some(fallback));
+
+        let block_hash = B256::from([0xAB; 32]);
+        let got = np
+            .eth_call_at_block(TransactionRequest::default(), BlockId::Hash(block_hash.into()))
+            .await
+            .unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(p_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(f_calls.load(Ordering::Relaxed), 0);
+
+        // Retry-then-fallback symmetry: Transport then Ok on primary →
+        // p_calls == 2, f_calls == 0, returns Ok from retry.
+        let (primary2, p2) = MockHttp::new(|n| {
+            if n == 0 {
+                Err(NodeError::Transport("transient".to_string()))
+            } else {
+                Ok(Bytes::from_static(b"RETRY-OK"))
+            }
+        });
+        let (fallback2, f2) = MockHttp::new(|_| Ok(Bytes::from_static(b"WRONG")));
+        let np2 = np_with(primary2, Some(fallback2));
+        let got2 = np2
+            .eth_call_at_block(TransactionRequest::default(), BlockId::Hash(block_hash.into()))
+            .await
+            .unwrap();
+        assert_eq!(&got2[..], b"RETRY-OK");
+        assert_eq!(p2.load(Ordering::Relaxed), 2, "primary retried once");
+        assert_eq!(f2.load(Ordering::Relaxed), 0, "fallback NOT consulted");
     }
 
     /// N-2 failure: v0.4 retry-then-fallback policy.
