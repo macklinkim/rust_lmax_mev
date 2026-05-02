@@ -44,7 +44,9 @@ pub fn classify(e: RpcError<TransportErrorKind>) -> NodeError {
         RpcError::ErrorResp(resp) => NodeError::Rpc(resp.to_string()),
         RpcError::DeserError { err, .. } => NodeError::Decode(err.to_string()),
         RpcError::SerError(err) => NodeError::Decode(err.to_string()),
-        RpcError::NullResp => NodeError::Decode("server returned null when non-null expected".into()),
+        RpcError::NullResp => {
+            NodeError::Decode("server returned null when non-null expected".into())
+        }
         RpcError::UnsupportedFeature(s) => NodeError::Rpc(format!("unsupported feature: {s}")),
         RpcError::LocalUsageError(err) => NodeError::Rpc(format!("local usage error: {err}")),
         RpcError::Transport(kind) => NodeError::Transport(kind.to_string()),

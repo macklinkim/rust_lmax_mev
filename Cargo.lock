@@ -3389,6 +3389,7 @@ dependencies = [
  "alloy-primitives",
  "futures",
  "lru",
+ "parking_lot",
  "rkyv",
  "rust-lmax-mev-config",
  "rust-lmax-mev-node",

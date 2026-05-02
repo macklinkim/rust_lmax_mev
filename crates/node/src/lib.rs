@@ -233,10 +233,7 @@ async fn ws_subscribe_logs(
         .on_ws(ws)
         .await
         .map_err(|e| NodeError::WsConnect(e.to_string()))?;
-    let sub = provider
-        .subscribe_logs(&filter)
-        .await
-        .map_err(classify)?;
+    let sub = provider.subscribe_logs(&filter).await.map_err(classify)?;
     let stream = sub.into_stream().map(Ok::<_, NodeError>);
     Ok(Box::pin(stream))
 }
@@ -378,7 +375,10 @@ mod tests {
                 } else {
                     let base = (n * 3) as u64;
                     let s = stream::iter((0..3u64).map(move |i| Ok::<u64, NodeError>(base + i)));
-                    Ok(Box::pin(s) as Pin<Box<dyn Stream<Item = Result<u64, NodeError>> + Send>>)
+                    Ok(Box::pin(s)
+                        as Pin<
+                            Box<dyn Stream<Item = Result<u64, NodeError>> + Send>,
+                        >)
                 }
             })
                 as Pin<
@@ -393,8 +393,9 @@ mod tests {
                 >
         };
 
-        let mut stream = ReconnectingStream::new_with_backoff(factory, |_| Duration::from_millis(0))
-            .into_stream();
+        let mut stream =
+            ReconnectingStream::new_with_backoff(factory, |_| Duration::from_millis(0))
+                .into_stream();
         let mut got = Vec::new();
         while let Some(item) = stream.next().await {
             match item {
