@@ -386,18 +386,42 @@ where
             return self.fuse_with_corrupt(e);
         }
 
-        // Step c: read the payload bytes.
+        // Step c: read the payload bytes; mid-payload EOF surfaces as
+        // `TruncatedFrame { offset, needed: length, got: payload_filled }`
+        // per spec §B.4 row 9. Length is already validated to be in
+        // `1..=MAX_FRAME_LEN` (16 MiB) so the `as u32` cast is non-narrowing.
         let mut payload = vec![0u8; length as usize];
-        if let Err(e) = reader.read_exact(&mut payload) {
-            // For Task 4 happy path we surface raw Io; Task 6 distinguishes
-            // mid-payload EOF as TruncatedFrame.
-            return self.fuse_with_corrupt(JournalError::Io(e));
+        let mut payload_filled = 0usize;
+        while payload_filled < payload.len() {
+            match reader.read(&mut payload[payload_filled..]) {
+                Ok(0) => {
+                    return self.fuse_with_corrupt(JournalError::TruncatedFrame {
+                        offset: frame_start,
+                        needed: length as u32,
+                        got: payload_filled as u32,
+                    });
+                }
+                Ok(n) => payload_filled += n,
+                Err(e) => return self.fuse_with_corrupt(JournalError::Io(e)),
+            }
         }
 
-        // Step d: read the 4-byte CRC trailer.
+        // Step d: read the 4-byte CRC trailer; partial-EOF surfaces as
+        // `TruncatedFrame { needed: 4, got: crc_filled }` per spec §B.4 row 9.
         let mut crc_buf = [0u8; 4];
-        if let Err(e) = reader.read_exact(&mut crc_buf) {
-            return self.fuse_with_corrupt(JournalError::Io(e));
+        let mut crc_filled = 0usize;
+        while crc_filled < 4 {
+            match reader.read(&mut crc_buf[crc_filled..]) {
+                Ok(0) => {
+                    return self.fuse_with_corrupt(JournalError::TruncatedFrame {
+                        offset: frame_start,
+                        needed: 4,
+                        got: crc_filled as u32,
+                    });
+                }
+                Ok(n) => crc_filled += n,
+                Err(e) => return self.fuse_with_corrupt(JournalError::Io(e)),
+            }
         }
         let crc_read = u32::from_le_bytes(crc_buf);
 
@@ -757,5 +781,216 @@ mod tests {
             FILE_HEADER_LEN,
             "file must contain only the 8-byte header; no partial frame bytes"
         );
+    }
+
+    /// Helper: writes a synthetic journal file consisting of a valid 8-byte
+    /// header followed by `frame_bytes` raw bytes. Used by J-13 / J-14 / J-18
+    /// to construct corrupted records without going through `FileJournal::
+    /// append`. Pattern conventions per spec §B.5.5.
+    fn write_journal_file_with_bytes(path: &Path, frame_bytes: &[u8]) {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        file.write_all(&MAGIC).unwrap();
+        file.write_all(&[FILE_FORMAT_VERSION]).unwrap();
+        file.write_all(&RESERVED_HEADER).unwrap();
+        file.write_all(frame_bytes).unwrap();
+    }
+
+    /// J-11 (synthetic; Task 6): append two records, flush, drop; truncate
+    /// the file to `8 + 4 + 1` bytes (header + length prefix of frame 1 +
+    /// 1 byte of payload). `iter_all` yields `Err(TruncatedFrame { offset:
+    /// 8, .. })` then `None` on the SAME iterator instance per spec §X.8.
+    /// `corrupt_frames_total` increments by exactly 1.
+    #[test]
+    fn truncated_frame_is_rejected_and_iterator_is_fused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        {
+            let mut journal = FileJournal::<SmokeTestPayload>::open(&path).unwrap();
+            journal.append(&make_test_envelope(100)).unwrap();
+            journal.append(&make_test_envelope(101)).unwrap();
+            journal.flush().unwrap();
+        } // BufWriter drops; bytes durable in OS page cache.
+
+        // Truncate to header + length prefix + 1 byte of payload.
+        let truncate_to = (FILE_HEADER_LEN as u64) + 4 + 1;
+        let truncate_handle = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        truncate_handle.set_len(truncate_to).unwrap();
+        drop(truncate_handle);
+
+        let journal = FileJournal::<SmokeTestPayload>::open(&path).unwrap();
+        let mut iter = journal.iter_all();
+        let first = iter.next().expect("must yield TruncatedFrame");
+        match first {
+            Err(JournalError::TruncatedFrame { offset, got, .. }) => {
+                assert_eq!(offset, FILE_HEADER_LEN as u64);
+                assert_eq!(got, 1, "got = 1 byte of payload");
+            }
+            other => panic!("expected TruncatedFrame, got {other:?}"),
+        }
+        assert!(
+            iter.next().is_none(),
+            "iterator must fuse after first Err per spec §X.8"
+        );
+        assert_eq!(
+            journal.stats().corrupt_frames_total,
+            1,
+            "exactly one corrupt-frame counter increment"
+        );
+    }
+
+    /// J-12 (synthetic; Task 6): append one record, flush, drop; flip the
+    /// last byte of the CRC trailer. `iter_all` yields
+    /// `Err(ChecksumMismatch { offset: 8, .. })` then `None` on the SAME
+    /// iterator. `corrupt_frames_total` increments by exactly 1.
+    #[test]
+    fn checksum_mismatch_is_rejected_and_iterator_is_fused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        {
+            let mut journal = FileJournal::<SmokeTestPayload>::open(&path).unwrap();
+            journal.append(&make_test_envelope(100)).unwrap();
+            journal.flush().unwrap();
+        }
+
+        // Flip the last byte (final byte of the CRC trailer).
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let len = file.metadata().unwrap().len();
+        let last_offset = len - 1;
+        file.seek(SeekFrom::Start(last_offset)).unwrap();
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last).unwrap();
+        file.seek(SeekFrom::Start(last_offset)).unwrap();
+        file.write_all(&[!last[0]]).unwrap();
+        drop(file);
+
+        let journal = FileJournal::<SmokeTestPayload>::open(&path).unwrap();
+        let mut iter = journal.iter_all();
+        let first = iter.next().expect("must yield ChecksumMismatch");
+        match first {
+            Err(JournalError::ChecksumMismatch { offset, .. }) => {
+                assert_eq!(offset, FILE_HEADER_LEN as u64);
+            }
+            other => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
+        assert!(iter.next().is_none(), "fuses after first Err");
+        assert_eq!(journal.stats().corrupt_frames_total, 1);
+    }
+
+    /// J-13 (synthetic read-path; Task 6): manually written file with
+    /// `[u32 0_le]` length prefix + `[u32 0_le]` CRC trailer →
+    /// `Err(InvalidFrameLength { length: 0, .. })` (length 0 rejection per
+    /// spec §X.15). The write does NOT go through `FileJournal::append`
+    /// because Task 5 already proves append's pre-write rejection.
+    #[test]
+    fn zero_length_frame_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        // 4-byte zero length + 4-byte zero CRC.
+        write_journal_file_with_bytes(&path, &[0u8; 8]);
+
+        let journal = FileJournal::<SmokeTestPayload>::open(&path).unwrap();
+        let mut iter = journal.iter_all();
+        let first = iter.next().expect("must yield InvalidFrameLength");
+        match first {
+            Err(JournalError::InvalidFrameLength {
+                offset,
+                length,
+                max,
+            }) => {
+                assert_eq!(offset, FILE_HEADER_LEN as u64);
+                assert_eq!(length, 0);
+                assert_eq!(max, MAX_FRAME_LEN);
+            }
+            other => panic!("expected InvalidFrameLength{{length:0}}, got {other:?}"),
+        }
+        assert!(iter.next().is_none());
+        assert_eq!(journal.stats().corrupt_frames_total, 1);
+    }
+
+    /// J-14 (synthetic read-path; Task 6): manually written file with
+    /// length prefix `(MAX_FRAME_LEN + 1)` LE → `Err(InvalidFrameLength)`
+    /// IMMEDIATELY, before any payload buffer allocation per spec §X.15
+    /// allocation-DoS protection. Implicit "before allocation" assertion:
+    /// the file body after the length prefix is empty (the 4 bytes alone),
+    /// so any post-validate `Vec::with_capacity(corrupt_length)` would
+    /// over-allocate; since validate_frame_length runs first, no allocation
+    /// happens.
+    #[test]
+    fn oversized_length_frame_is_rejected_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        let length = MAX_FRAME_LEN + 1;
+        let length_bytes = (length as u32).to_le_bytes();
+        write_journal_file_with_bytes(&path, &length_bytes);
+
+        let journal = FileJournal::<SmokeTestPayload>::open(&path).unwrap();
+        let mut iter = journal.iter_all();
+        let first = iter.next().expect("must yield InvalidFrameLength");
+        match first {
+            Err(JournalError::InvalidFrameLength {
+                offset,
+                length: got_length,
+                max,
+            }) => {
+                assert_eq!(offset, FILE_HEADER_LEN as u64);
+                assert_eq!(got_length, length);
+                assert_eq!(max, MAX_FRAME_LEN);
+            }
+            other => panic!("expected InvalidFrameLength, got {other:?}"),
+        }
+        assert!(iter.next().is_none());
+        assert_eq!(journal.stats().corrupt_frames_total, 1);
+    }
+
+    /// J-18 (synthetic; Task 6, parameterized over 1, 2, 3 partial bytes):
+    /// file consists of the 8-byte header followed by 1/2/3 bytes of would-
+    /// be length prefix. `iter_all().next()` yields `Err(TruncatedFrame {
+    /// offset: 8, needed: 4, got: 1..4 })` then `None` on the SAME iterator
+    /// per spec §X.8. `corrupt_frames_total` increments by exactly 1.
+    /// Distinguishes step-a partial-EOF corruption from step-a 0-byte
+    /// clean-EOF (which yields `None` directly without incrementing the
+    /// counter — covered implicitly by J-1's "open + immediate iter_all on
+    /// header-only file yields None" baseline).
+    #[test]
+    fn partial_length_prefix_eof_is_truncated_frame_then_fused() {
+        for partial in [1u32, 2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("journal.log");
+            let bytes = vec![0xCD; partial as usize];
+            write_journal_file_with_bytes(&path, &bytes);
+
+            let journal = FileJournal::<SmokeTestPayload>::open(&path).unwrap();
+            let mut iter = journal.iter_all();
+            let first = iter.next().expect("must yield TruncatedFrame");
+            match first {
+                Err(JournalError::TruncatedFrame {
+                    offset,
+                    needed,
+                    got,
+                }) => {
+                    assert_eq!(offset, FILE_HEADER_LEN as u64, "partial = {partial}");
+                    assert_eq!(needed, 4, "partial = {partial}");
+                    assert_eq!(got, partial, "partial = {partial}");
+                }
+                other => {
+                    panic!("partial = {partial}: expected TruncatedFrame, got {other:?}")
+                }
+            }
+            assert!(iter.next().is_none(), "fuses (partial = {partial})");
+            assert_eq!(
+                journal.stats().corrupt_frames_total,
+                1,
+                "exactly one increment (partial = {partial})"
+            );
+        }
     }
 }
