@@ -1,13 +1,12 @@
 //! `JournalError` — unified error type for [`crate::journal::FileJournal`] and
 //! [`crate::snapshot::RocksDbSnapshot`].
 //!
-//! Ships 14 of 15 variants in this commit (Task 1). The 15th variant
-//! `RocksDb(rocksdb::Error)` is intentionally deferred to Task 9 alongside
-//! the rocksdb dep activation per spec v0.7 amendment + commit `aa5c7c4`
-//! staged-deferral; adding it here would require pulling the rocksdb crate
-//! into `crates/journal/Cargo.toml` before Task 9, breaking the staged
-//! deferral. The placeholder location is marked with a comment in the enum
-//! body.
+//! Task 1 (`a73818b`) shipped 14 of 15 variants; Task 9 (`<this commit>`)
+//! activates the 15th variant `RocksDb(rocksdb::Error)` alongside the
+//! `rocksdb = { workspace = true }` dep per spec v0.7 amendment + commit
+//! `aa5c7c4` staged-deferral. The full enum is now exhaustive against spec
+//! §B.4's 15-row error matrix (subject to `#[non_exhaustive]` for additive
+//! Phase 2 evolution).
 //!
 //! No `#[from]` is applied to `BincodeSerialize` or `BincodeDeserialize` per
 //! spec §X.4: both wrap `Box<bincode::ErrorKind>` and a blanket `#[from]`
@@ -130,6 +129,15 @@ pub enum JournalError {
     /// increment.
     #[error("reserved snapshot key prefix: {0:?}")]
     ReservedKey(Vec<u8>),
-    // RocksDb(rocksdb::Error) variant added in Task 9 alongside the rocksdb
-    // dep activation per spec v0.7 amendment + commit aa5c7c4.
+
+    /// Underlying RocksDB error (open / get / put / etc.). Emitted by all
+    /// `RocksDbSnapshot` operations per spec §B.4 row 3. NO counter
+    /// increment (snapshot errors are caller-actionable, not corruption).
+    /// Uses `#[from]` for callsite ergonomics per spec §B.4 row 3.
+    ///
+    /// Activated in Task 9 alongside the `rocksdb = { workspace = true }`
+    /// dep per spec v0.7 amendment + commit `aa5c7c4` staged-deferral. The
+    /// 14-of-15 placeholder in Task 1 (`a73818b`) marked this slot.
+    #[error("RocksDB error: {0}")]
+    RocksDb(#[from] rocksdb::Error),
 }

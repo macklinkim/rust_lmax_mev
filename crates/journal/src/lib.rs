@@ -32,3 +32,4 @@ pub mod snapshot;
 
 pub use error::JournalError;
 pub use journal::{FileJournal, JournalStats};
+pub use snapshot::{RocksDbSnapshot, SnapshotStats};
