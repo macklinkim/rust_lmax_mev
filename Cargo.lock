@@ -3444,6 +3444,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-lmax-mev-replay"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "async-trait",
+ "parking_lot",
+ "rust-lmax-mev-journal",
+ "rust-lmax-mev-node",
+ "rust-lmax-mev-state",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rust-lmax-mev-smoke-tests"
 version = "0.1.0"
 dependencies = [

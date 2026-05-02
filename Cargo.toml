@@ -11,6 +11,7 @@ members = [
     "crates/node",
     "crates/ingress",
     "crates/state",
+    "crates/replay",
 ]
 
 [workspace.package]
