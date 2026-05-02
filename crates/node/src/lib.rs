@@ -147,9 +147,17 @@ impl NodeProvider {
         req: TransactionRequest,
         block_id: BlockId,
     ) -> Result<Bytes, NodeError> {
-        match self.primary_http.eth_call_at_block(req.clone(), block_id).await {
+        match self
+            .primary_http
+            .eth_call_at_block(req.clone(), block_id)
+            .await
+        {
             Err(NodeError::Transport(_)) => {
-                match self.primary_http.eth_call_at_block(req.clone(), block_id).await {
+                match self
+                    .primary_http
+                    .eth_call_at_block(req.clone(), block_id)
+                    .await
+                {
                     Err(NodeError::Transport(_)) => match &self.fallback_http {
                         Some(fb) => fb.eth_call_at_block(req, block_id).await,
                         None => Err(NodeError::Transport(
@@ -414,7 +422,10 @@ mod tests {
 
         let block_hash = B256::from([0xAB; 32]);
         let got = np
-            .eth_call_at_block(TransactionRequest::default(), BlockId::Hash(block_hash.into()))
+            .eth_call_at_block(
+                TransactionRequest::default(),
+                BlockId::Hash(block_hash.into()),
+            )
             .await
             .unwrap();
         assert_eq!(got, expected);
@@ -433,7 +444,10 @@ mod tests {
         let (fallback2, f2) = MockHttp::new(|_| Ok(Bytes::from_static(b"WRONG")));
         let np2 = np_with(primary2, Some(fallback2));
         let got2 = np2
-            .eth_call_at_block(TransactionRequest::default(), BlockId::Hash(block_hash.into()))
+            .eth_call_at_block(
+                TransactionRequest::default(),
+                BlockId::Hash(block_hash.into()),
+            )
             .await
             .unwrap();
         assert_eq!(&got2[..], b"RETRY-OK");
