@@ -434,11 +434,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{FILE_FORMAT_VERSION, MAGIC, RESERVED_HEADER};
+    use crate::frame::{FILE_FORMAT_VERSION, MAGIC, MAX_FRAME_LEN, RESERVED_HEADER};
     use rust_lmax_mev_types::{ChainContext, EventSource, PublishMeta, SmokeTestPayload};
 
-    fn make_test_envelope(sequence: u64) -> EventEnvelope<SmokeTestPayload> {
-        let meta = PublishMeta {
+    /// Test-only payload whose rkyv-serialized size can be tuned past
+    /// `MAX_FRAME_LEN` (16 MiB) for the J-10 oversize-rejection test.
+    /// Implementer-discretion construction strategy per spec §B.5.2 J-10
+    /// (option (a): feature-equivalent test-only payload type with a large
+    /// dynamic byte buffer).
+    #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct OversizePayload {
+        data: Vec<u8>,
+    }
+
+    fn valid_meta() -> PublishMeta {
+        PublishMeta {
             source: EventSource::Ingress,
             chain_context: ChainContext {
                 chain_id: 1,
@@ -447,12 +457,15 @@ mod tests {
             },
             event_version: 1,
             correlation_id: 42,
-        };
+        }
+    }
+
+    fn make_test_envelope(sequence: u64) -> EventEnvelope<SmokeTestPayload> {
         let payload = SmokeTestPayload {
             nonce: sequence + 7,
             data: [0xCD; 32],
         };
-        EventEnvelope::seal(meta, payload, sequence, 1_700_000_000_000_000_000)
+        EventEnvelope::seal(valid_meta(), payload, sequence, 1_700_000_000_000_000_000)
             .expect("valid envelope must seal")
     }
 
@@ -682,5 +695,67 @@ mod tests {
         assert_eq!(final_stats.appended_total, envs.len() as u64);
         assert_eq!(final_stats.read_total, envs.len() as u64);
         assert_eq!(final_stats.corrupt_frames_total, 0);
+    }
+
+    /// J-10 (TDD red→green; Task 5): synthetic oversize payload triggers
+    /// pre-write rejection per spec §4.4 step 3 + §X.15. After the failed
+    /// `append` call, no counters increment, no bytes hit the file, and the
+    /// file size on disk remains exactly `FILE_HEADER_LEN` (success-only
+    /// counter semantic per spec §5.6; pre-write rejection per spec §B.4
+    /// row 8 — append-side `InvalidFrameLength` does NOT increment
+    /// `corrupt_frames_total`, only iter-side does).
+    ///
+    /// Payload construction strategy (spec §B.5.2 J-10 leaves to
+    /// implementer): `OversizePayload { data: Vec<u8> }` test-only type
+    /// declared above; populated with `MAX_FRAME_LEN + 1` bytes so the
+    /// rkyv-encoded payload exceeds the cap (the rkyv encoding adds a small
+    /// fixed header per Vec<u8>, so the raw byte count alone is enough to
+    /// trip the limit).
+    #[test]
+    fn append_rejects_oversized_payload_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        let mut journal = FileJournal::<OversizePayload>::open(&path).unwrap();
+
+        let oversize = OversizePayload {
+            data: vec![0xFFu8; (MAX_FRAME_LEN + 1) as usize],
+        };
+        let env = EventEnvelope::seal(
+            valid_meta(),
+            oversize,
+            /* sequence */ 100,
+            /* timestamp_ns */ 1_700_000_000_000_000_000,
+        )
+        .expect("seal must succeed; payload size is not validated by seal");
+
+        let err = journal.append(&env).unwrap_err();
+        match err {
+            JournalError::InvalidFrameLength { length, max, .. } => {
+                assert!(
+                    length > MAX_FRAME_LEN,
+                    "rkyv payload {length} must exceed MAX_FRAME_LEN {max}"
+                );
+                assert_eq!(max, MAX_FRAME_LEN);
+            }
+            other => panic!("expected InvalidFrameLength, got {other:?}"),
+        }
+
+        // Success-only counters: append-side rejection does NOT bump any
+        // counter per spec §5.6 + §B.4 row 8.
+        let stats = journal.stats();
+        assert_eq!(stats.appended_total, 0);
+        assert_eq!(stats.bytes_written_total, 0);
+        assert_eq!(stats.corrupt_frames_total, 0);
+
+        // No bytes written to the file: validate_frame_length runs BEFORE
+        // any of the three write_all() calls per spec §B.2.2 step 2.
+        journal.flush().unwrap();
+        drop(journal);
+        let file_bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            file_bytes.len(),
+            FILE_HEADER_LEN,
+            "file must contain only the 8-byte header; no partial frame bytes"
+        );
     }
 }
