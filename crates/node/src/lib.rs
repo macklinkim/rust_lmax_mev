@@ -96,36 +96,54 @@ impl NodeProvider {
         })
     }
 
-    /// `eth_call` against primary, with fallback ONLY on
-    /// `NodeError::Transport`. RPC error responses (`NodeError::Rpc`)
-    /// and decode errors are authoritative — fallback NOT consulted.
+    /// `eth_call` against primary with the v0.4 retry-then-fallback
+    /// policy: on first `Err(NodeError::Transport(_))`, retry primary
+    /// once. Only if the retry ALSO returns `Transport` is the fallback
+    /// consulted. Non-`Transport` retry outcomes (`Ok` / `Rpc` /
+    /// `Decode`) are authoritative and returned directly. RPC error
+    /// responses on the first call are also authoritative — fallback
+    /// NOT consulted.
     pub async fn eth_call(&self, req: TransactionRequest) -> Result<Bytes, NodeError> {
         match self.primary_http.eth_call(req.clone()).await {
-            Err(NodeError::Transport(_)) => match &self.fallback_http {
-                Some(fb) => fb.eth_call(req).await,
-                None => Err(NodeError::Transport(
-                    "primary transport failed; no fallback configured".to_string(),
-                )),
-            },
+            Err(NodeError::Transport(_)) => {
+                // Single primary retry per v0.4 Risk Decision 3.
+                match self.primary_http.eth_call(req.clone()).await {
+                    Err(NodeError::Transport(_)) => match &self.fallback_http {
+                        Some(fb) => fb.eth_call(req).await,
+                        None => Err(NodeError::Transport(
+                            "primary transport failed (after retry); no fallback configured"
+                                .to_string(),
+                        )),
+                    },
+                    other => other,
+                }
+            }
             other => other,
         }
     }
 
-    /// `eth_getTransactionByHash` against primary. A primary `Ok(None)`
-    /// (the node definitively does not know this hash) is **authoritative**
-    /// — fallback is NOT consulted. Fallback fires ONLY on primary
-    /// `NodeError::Transport`.
+    /// `eth_getTransactionByHash` against primary with the v0.4
+    /// retry-then-fallback policy (same as [`Self::eth_call`]). A
+    /// primary `Ok(None)` (the node definitively does not know this
+    /// hash) is **authoritative** — neither retry nor fallback is
+    /// consulted.
     pub async fn eth_get_transaction_by_hash(
         &self,
         hash: B256,
     ) -> Result<Option<Transaction>, NodeError> {
         match self.primary_http.eth_get_transaction_by_hash(hash).await {
-            Err(NodeError::Transport(_)) => match &self.fallback_http {
-                Some(fb) => fb.eth_get_transaction_by_hash(hash).await,
-                None => Err(NodeError::Transport(
-                    "primary transport failed; no fallback configured".to_string(),
-                )),
-            },
+            Err(NodeError::Transport(_)) => {
+                match self.primary_http.eth_get_transaction_by_hash(hash).await {
+                    Err(NodeError::Transport(_)) => match &self.fallback_http {
+                        Some(fb) => fb.eth_get_transaction_by_hash(hash).await,
+                        None => Err(NodeError::Transport(
+                            "primary transport failed (after retry); no fallback configured"
+                                .to_string(),
+                        )),
+                    },
+                    other => other,
+                }
+            }
             other => other,
         }
     }
@@ -260,14 +278,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Per-call deterministic outcome closure. Receives the 0-based
+    /// call index so tests can express sequences like "first call
+    /// Transport, second call Rpc" needed to exercise the v0.4
+    /// retry-then-fallback policy.
     struct MockHttp {
-        outcome: Box<dyn Fn() -> Result<Bytes, NodeError> + Send + Sync>,
+        outcome: Box<dyn Fn(usize) -> Result<Bytes, NodeError> + Send + Sync>,
         call_count: Arc<AtomicUsize>,
     }
 
     impl MockHttp {
         fn new(
-            outcome: impl Fn() -> Result<Bytes, NodeError> + Send + Sync + 'static,
+            outcome: impl Fn(usize) -> Result<Bytes, NodeError> + Send + Sync + 'static,
         ) -> (Self, Arc<AtomicUsize>) {
             let call_count = Arc::new(AtomicUsize::new(0));
             (
@@ -283,17 +305,17 @@ mod tests {
     #[async_trait]
     impl HttpRpc for MockHttp {
         async fn eth_call(&self, _req: TransactionRequest) -> Result<Bytes, NodeError> {
-            self.call_count.fetch_add(1, Ordering::Relaxed);
-            (self.outcome)()
+            let n = self.call_count.fetch_add(1, Ordering::Relaxed);
+            (self.outcome)(n)
         }
         async fn eth_get_transaction_by_hash(
             &self,
             _hash: B256,
         ) -> Result<Option<Transaction>, NodeError> {
-            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let n = self.call_count.fetch_add(1, Ordering::Relaxed);
             // Re-use eth_call's outcome shape: Ok(empty) → Ok(None);
             // Err(_) → Err(_). Tests for tx-by-hash live in N-2 below.
-            match (self.outcome)() {
+            match (self.outcome)(n) {
                 Ok(_) => Ok(None),
                 Err(e) => Err(e),
             }
@@ -309,15 +331,15 @@ mod tests {
     }
 
     /// N-1 happy: eth_call returns expected bytes from primary; fallback
-    /// is not consulted (call_count remains 0).
+    /// is not consulted (call_count remains 0). No retry on success.
     #[tokio::test]
     async fn eth_call_returns_primary_result_without_consulting_fallback() {
         let expected = Bytes::from_static(b"\x01\x02\x03");
         let (primary, primary_calls) = MockHttp::new({
             let e = expected.clone();
-            move || Ok(e.clone())
+            move |_| Ok(e.clone())
         });
-        let (fallback, fallback_calls) = MockHttp::new(|| Ok(Bytes::from_static(b"WRONG")));
+        let (fallback, fallback_calls) = MockHttp::new(|_| Ok(Bytes::from_static(b"WRONG")));
         let np = np_with(primary, Some(fallback));
 
         let got = np.eth_call(TransactionRequest::default()).await.unwrap();
@@ -326,25 +348,52 @@ mod tests {
         assert_eq!(fallback_calls.load(Ordering::Relaxed), 0);
     }
 
-    /// N-2 failure half (a): primary `Transport` → fallback consulted +
-    /// returns Ok. Half (b): primary `Rpc` → fallback NOT consulted.
+    /// N-2 failure: v0.4 retry-then-fallback policy.
+    /// Three cases:
+    /// - (a) Primary returns `Transport` on BOTH calls → primary called
+    ///   twice, then fallback consulted; final result is fallback's
+    ///   `Ok`. p_calls == 2, f_calls == 1.
+    /// - (b) Primary returns `Transport` then `Rpc` on retry → primary
+    ///   called twice, fallback NOT called (retry's non-Transport
+    ///   outcome is authoritative). p_calls == 2, f_calls == 0.
+    /// - (c) Primary returns `Rpc` on first call → no retry, fallback
+    ///   NOT called. p_calls == 1, f_calls == 0.
     #[tokio::test]
-    async fn eth_call_falls_over_only_on_transport_error() {
-        // Half (a): Transport → fallback fires.
+    async fn eth_call_retries_primary_once_then_falls_over_only_on_repeated_transport() {
+        // Case (a): Transport on both primary calls → fallback fires.
         {
             let (primary, p_calls) =
-                MockHttp::new(|| Err(NodeError::Transport("connect refused".to_string())));
-            let (fallback, f_calls) = MockHttp::new(|| Ok(Bytes::from_static(b"OK")));
+                MockHttp::new(|_| Err(NodeError::Transport("connect refused".to_string())));
+            let (fallback, f_calls) = MockHttp::new(|_| Ok(Bytes::from_static(b"OK")));
             let np = np_with(primary, Some(fallback));
             let got = np.eth_call(TransactionRequest::default()).await.unwrap();
             assert_eq!(&got[..], b"OK");
-            assert_eq!(p_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(p_calls.load(Ordering::Relaxed), 2, "primary retried once");
             assert_eq!(f_calls.load(Ordering::Relaxed), 1);
         }
-        // Half (b): Rpc (authoritative) → fallback NOT called.
+        // Case (b): Transport on call 0, Rpc on call 1 → fallback NOT called.
         {
-            let (primary, p_calls) = MockHttp::new(|| Err(NodeError::Rpc("revert".to_string())));
-            let (fallback, f_calls) = MockHttp::new(|| Ok(Bytes::from_static(b"WRONG")));
+            let (primary, p_calls) = MockHttp::new(|n| {
+                if n == 0 {
+                    Err(NodeError::Transport("transient".to_string()))
+                } else {
+                    Err(NodeError::Rpc("revert".to_string()))
+                }
+            });
+            let (fallback, f_calls) = MockHttp::new(|_| Ok(Bytes::from_static(b"WRONG")));
+            let np = np_with(primary, Some(fallback));
+            let err = np
+                .eth_call(TransactionRequest::default())
+                .await
+                .expect_err("retry returning Rpc must propagate as Rpc");
+            assert!(matches!(err, NodeError::Rpc(_)), "got {err:?}");
+            assert_eq!(p_calls.load(Ordering::Relaxed), 2, "primary retried once");
+            assert_eq!(f_calls.load(Ordering::Relaxed), 0, "fallback NOT consulted");
+        }
+        // Case (c): Rpc on first primary call → no retry, no fallback.
+        {
+            let (primary, p_calls) = MockHttp::new(|_| Err(NodeError::Rpc("revert".to_string())));
+            let (fallback, f_calls) = MockHttp::new(|_| Ok(Bytes::from_static(b"WRONG")));
             let np = np_with(primary, Some(fallback));
             let err = np
                 .eth_call(TransactionRequest::default())
