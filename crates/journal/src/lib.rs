@@ -29,3 +29,5 @@ pub mod error;
 pub mod frame;
 pub mod journal;
 pub mod snapshot;
+
+pub use error::JournalError;
