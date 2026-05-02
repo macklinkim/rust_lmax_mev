@@ -1,0 +1,17 @@
+[package]
+name = "rust-lmax-mev-smoke-tests"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+rust-lmax-mev-types = { path = "../types" }
+rust-lmax-mev-event-bus = { path = "../event-bus" }
+rust-lmax-mev-journal = { path = "../journal" }
+tempfile = "3"
+bincode = { workspace = true }
+serde = { workspace = true }

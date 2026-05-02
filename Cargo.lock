@@ -1406,6 +1406,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-lmax-mev-smoke-tests"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "rust-lmax-mev-event-bus",
+ "rust-lmax-mev-journal",
+ "rust-lmax-mev-types",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "rust-lmax-mev-types"
 version = "0.1.0"
 dependencies = [
