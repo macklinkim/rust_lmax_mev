@@ -6,7 +6,7 @@
 
 use alloy::eips::{BlockId, BlockNumberOrTag, RpcBlockHash};
 use alloy::rpc::types::eth::TransactionRequest;
-use alloy_primitives::{Bytes, B256};
+use alloy_primitives::{address, Bytes, B256};
 use rust_lmax_mev_node::NodeError;
 use rust_lmax_mev_state::{EthCaller, SELECTOR_GET_RESERVES};
 
@@ -60,4 +60,38 @@ async fn recorded_caller_rejects_unknown_block_hash() {
         }
         other => panic!("expected Rpc, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn recorded_caller_missing_fixture_does_not_append_to_witness() {
+    // Use a known block hash but a pool address that has no fixture.
+    let blocks = common::blocks();
+    let caller = common::build_caller(&blocks);
+    let recorded_hash = blocks[0].hash;
+    let unknown_pool = address!("dddddddddddddddddddddddddddddddddddddddd");
+    let req = TransactionRequest::default()
+        .to(unknown_pool)
+        .input(Bytes::from(SELECTOR_GET_RESERVES.to_vec()).into());
+    let baseline_witness_len = caller.witness().len();
+    let err = caller
+        .eth_call_at_block(
+            req,
+            BlockId::Hash(RpcBlockHash::from_hash(recorded_hash, None)),
+        )
+        .await
+        .expect_err("missing fixture must error");
+    match err {
+        NodeError::Rpc(msg) => {
+            assert!(
+                msg.contains("no fixture"),
+                "expected no-fixture message, got: {msg}"
+            );
+        }
+        other => panic!("expected Rpc, got {other:?}"),
+    }
+    assert_eq!(
+        caller.witness().len(),
+        baseline_witness_len,
+        "missing-fixture lookup MUST NOT append to witness (per RecordedEthCaller docs)"
+    );
 }

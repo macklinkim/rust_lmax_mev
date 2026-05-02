@@ -160,11 +160,19 @@ impl EthCaller for RecordedEthCaller {
         sel.copy_from_slice(&input[..4]);
         let key = (block_hash, sel, to);
         let response = self.state.lock().responses.get(&key).cloned();
-        self.witness.lock().push(key);
-        response.ok_or_else(|| {
-            NodeError::Rpc(format!(
+        // Witness records ONLY successful lookups per the documented
+        // contract. A missing-fixture path returns `NodeError::Rpc`
+        // without appending to the witness so tests can distinguish
+        // "engine called us with the right inputs but we had no
+        // recording" from "engine called us as expected".
+        match response {
+            Some(bytes) => {
+                self.witness.lock().push(key);
+                Ok(bytes)
+            }
+            None => Err(NodeError::Rpc(format!(
                 "no fixture for (block={block_hash}, selector={sel:02x?}, pool={to})"
-            ))
-        })
+            ))),
+        }
     }
 }
