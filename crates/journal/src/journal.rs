@@ -14,13 +14,12 @@
 //! J-16 validate-boundary + same-iterator-fused tests are added in Task 7;
 //! the J-17 flush-makes-visible contract test is added in Task 8.
 
-// Counter atomics, byte_offset, and path are populated by `open` / `append`
-// in this task but `corrupt_frames_total` is not yet incremented anywhere
-// outside JournalIter (no corruption tests until Task 6); FRAME_OVERHEAD is
-// re-exported from frame.rs for the append+iter math. The module-level
-// annotation matches the plan v0.3 dead-code policy and is removed in Task
-// 12 once every field has at least one non-test reader.
-#![allow(dead_code)]
+// Task 12 cleanup: the Task 3 module-level `#![allow(dead_code)]` annotation
+// has been removed because every `FileJournal<T>` field now has at least one
+// non-test reader (`writer` via `append` / `flush`; `path` via `iter_all`;
+// `byte_offset` via `append` / `iter_all`; the four counter atomics via
+// `stats` and the `JournalIter::fuse_with_corrupt` increment sites; `_marker`
+// via `PhantomData`'s implicit usage).
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};

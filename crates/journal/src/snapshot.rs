@@ -11,12 +11,12 @@
 //! (S-3, S-4) and the `last_sequence` / `set_last_sequence` methods land
 //! in Task 10. The cross-module I-1 integration test lands in Task 11.
 
-// `loaded_total` is populated by `load` in this task but not yet read
-// outside the in-tests `stats()` call; `LAST_SEQUENCE_KEY` is defined here
-// for use by Task 10's last_sequence / set_last_sequence. The module-level
-// annotation matches the plan v0.3 dead-code policy and is removed in Task
-// 12 once every constant and method has at least one non-test caller.
-#![allow(dead_code)]
+// Task 12 cleanup: the Task 9 module-level `#![allow(dead_code)]` annotation
+// has been removed because every `pub(crate)` constant and `RocksDbSnapshot`
+// field now has at least one non-test caller (`RESERVED_KEY_PREFIX` via the
+// reserved-prefix rejection in `save` / `load`; `LAST_SEQUENCE_KEY` via Task
+// 10's `set_last_sequence` / `last_sequence`; `db` via every method; counter
+// atomics via `save` / `load` increments and `stats` reads).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};

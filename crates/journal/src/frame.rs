@@ -8,13 +8,10 @@
 //! `FileJournal::open` / `append` / `iter_all` (Tasks 3-7) but are not part
 //! of the public API surface.
 
-// Task 2 ships frame constants and helpers ahead of their consumers
-// (`FileJournal::open` lands in Task 3; `append` / `iter_all` land in Tasks 4-7).
-// Per the approved plan v0.3, the module-level `allow(dead_code)` is the
-// "annotate the module, not individual items" approach; the annotation is
-// removed in Task 12 once every constant and helper has at least one
-// non-test caller.
-#![allow(dead_code)]
+// Task 12 cleanup: the Task 2 module-level `#![allow(dead_code)]` annotation
+// has been removed because every `pub(crate)` constant and helper in this
+// module now has at least one non-test caller (`FileJournal::open` /
+// `append` / `iter_all` / `JournalIter::next` from Tasks 3-7).
 
 use std::io::{Read, Write};
 
