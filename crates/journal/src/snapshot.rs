@@ -361,9 +361,7 @@ mod tests {
     #[test]
     fn journal_and_snapshot_can_coexist_in_separate_directories() {
         use crate::journal::FileJournal;
-        use rust_lmax_mev_types::{
-            ChainContext, EventEnvelope, EventSource, PublishMeta,
-        };
+        use rust_lmax_mev_types::{ChainContext, EventEnvelope, EventSource, PublishMeta};
 
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("journal.log");
@@ -391,7 +389,7 @@ mod tests {
         .expect("valid envelope must seal");
 
         journal.append(&env).unwrap(); // &mut self per spec §5.1
-        journal.flush().unwrap();      // &mut self per spec §5.1
+        journal.flush().unwrap(); // &mut self per spec §5.1
         snapshot.save(b"checkpoint", &payload).unwrap();
         snapshot.set_last_sequence(env.sequence()).unwrap();
 
