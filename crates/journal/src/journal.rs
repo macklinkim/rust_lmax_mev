@@ -1128,6 +1128,92 @@ mod tests {
         );
     }
 
+    /// J-17 (test-first; Task 8): `flush()` makes appended records visible
+    /// to a fresh `iter_all` reader. The contract is **process-local
+    /// visibility ONLY (BufWriter buffer → kernel page cache), NOT crash
+    /// durability** per spec sections B.2.3 + X.10; this test asserts the
+    /// post-flush read-back, NOT `sync_all` / `sync_data`.
+    ///
+    /// Pre-flush behavior is BufWriter-dependent: a small SmokeTestPayload
+    /// envelope (~120 bytes after rkyv encoding) typically sits in
+    /// `BufWriter`'s default 8 KiB buffer and is NOT visible to a fresh
+    /// `File::open` read handle. The test tolerates 0 records (or any value
+    /// `<= N` where `N` is the number of appends) on the pre-flush probe;
+    /// the strict assertion is reserved for the post-flush probe.
+    ///
+    /// Post-flush: `iter_all().collect()` MUST yield all `N` appended
+    /// records in order; `flush()` returns `Ok(())` and does NOT increment
+    /// any counter per spec section B.3 (no `event_journal_flushed_total`
+    /// metric exists).
+    #[test]
+    fn flush_makes_appends_visible_to_iter_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        let mut journal = FileJournal::<SmokeTestPayload>::open(&path).unwrap();
+
+        let envelopes = [
+            make_test_envelope(100),
+            make_test_envelope(101),
+            make_test_envelope(102),
+        ];
+        for env in &envelopes {
+            journal.append(env).unwrap();
+        }
+
+        // Pre-flush probe: tolerant of BufWriter buffering. Counts only
+        // successfully-decoded records; a partial-write at the BufWriter
+        // boundary could legitimately surface as Err on the pre-flush iter
+        // (TruncatedFrame on a half-written length prefix, etc.). Either
+        // way, the count of Ok records must be <= N.
+        let pre_flush_ok: usize = journal.iter_all().filter(|r| r.is_ok()).count();
+        assert!(
+            pre_flush_ok <= envelopes.len(),
+            "pre-flush iter_all yielded {pre_flush_ok} Ok records; must be <= {N} \
+             (BufWriter visibility is buffer-dependent per spec §B.2.3)",
+            N = envelopes.len()
+        );
+
+        // Flush must succeed and not bump any counter.
+        let stats_before_flush = journal.stats();
+        journal.flush().expect("flush must succeed");
+        let stats_after_flush = journal.stats();
+        assert_eq!(
+            stats_after_flush, stats_before_flush,
+            "flush() must NOT increment any counter per spec §B.3"
+        );
+
+        // Post-flush: all records visible deterministically.
+        let post_flush: Vec<_> = journal
+            .iter_all()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("post-flush iter_all must succeed");
+        assert_eq!(
+            post_flush.len(),
+            envelopes.len(),
+            "post-flush iter_all must yield all {} appended records",
+            envelopes.len()
+        );
+        for (got, want) in post_flush.iter().zip(envelopes.iter()) {
+            assert_eq!(
+                got, want,
+                "post-flush iter_all must yield records in append order"
+            );
+        }
+
+        // The successful iter_all reads bumped read_total; flush itself did
+        // not. corrupt_frames_total stays 0 because no corruption occurred
+        // (the pre-flush iter MAY have logged a TruncatedFrame increment if
+        // BufWriter happened to emit a partial frame — we do NOT assert
+        // corrupt_frames_total exact value because the BufWriter timing is
+        // not deterministic; we DO assert the appended counter is exact).
+        let final_stats = journal.stats();
+        assert_eq!(
+            final_stats.appended_total,
+            envelopes.len() as u64,
+            "appended_total reflects exactly N successful appends"
+        );
+    }
+
     /// J-18 (synthetic; Task 6, parameterized over 1, 2, 3 partial bytes):
     /// file consists of the 8-byte header followed by 1/2/3 bytes of would-
     /// be length prefix. `iter_all().next()` yields `Err(TruncatedFrame {
