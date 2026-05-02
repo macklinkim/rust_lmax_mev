@@ -3,8 +3,9 @@ resolver = "2"
 members = [
     "crates/types",
     "crates/event-bus",
-    # crates/journal, crates/config, crates/observability, crates/app
-    # are added in Task 13-16 as those crates are created.
+    "crates/journal",
+    # crates/config, crates/observability, crates/app are added in Task 14-16
+    # as those crates are created.
 ]
 
 [workspace.package]
@@ -16,6 +17,9 @@ rust-version = "1.80"
 rkyv = { version = "0.8", features = ["bytecheck"] }
 bincode = "1.3"
 serde = { version = "1", features = ["derive"] }
+
+# checksum
+crc32fast = "1"
 
 # async
 tokio = { version = "1", features = ["full"] }

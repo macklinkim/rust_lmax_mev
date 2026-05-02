@@ -1,0 +1,24 @@
+[package]
+name = "rust-lmax-mev-journal"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Phase 1 append-only journal + RocksDB snapshot for the LMAX-style MEV engine"
+
+[dependencies]
+rust-lmax-mev-types = { path = "../types" }
+rkyv = { workspace = true }
+bincode = { workspace = true }
+metrics = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+crc32fast = { workspace = true }
+# rocksdb = { workspace = true }  # staged-deferred per spec v0.7 amendment;
+# added during Gate 5 implementation when RocksDbSnapshot lands. Gate 3 ships
+# without it so the workspace builds on hosts where libclang is not yet
+# configured. RocksDbSnapshot remains the Phase 1 snapshot backend per
+# ADR-003 + spec sections 5.2 and B.2.5-B.2.7.
+
+[dev-dependencies]
+tempfile = "3"
