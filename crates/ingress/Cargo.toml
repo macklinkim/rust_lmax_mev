@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 rkyv = { workspace = true }
 lru = "0.12"
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

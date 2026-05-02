@@ -17,7 +17,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use rust_lmax_mev_config::{
-    BusConfig, Config, FallbackRpcConfig, JournalConfig, LogFormat, NodeConfig, ObservabilityConfig,
+    BusConfig, Config, FallbackRpcConfig, IngressConfig, IngressTokens, JournalConfig, LogFormat,
+    NodeConfig, ObservabilityConfig,
 };
 
 /// Builds a `Config` whose journal + snapshot paths live under
@@ -44,6 +45,19 @@ pub fn make_config(tempdir: &std::path::Path) -> Config {
             rocksdb_snapshot_path: tempdir.join("snapshot"),
         },
         bus: BusConfig { capacity: 8 },
+        ingress: IngressConfig {
+            tokens: IngressTokens {
+                weth: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+                    .parse()
+                    .unwrap(),
+                usdc: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+                    .parse()
+                    .unwrap(),
+            },
+            watched_addresses: vec!["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
+                .parse()
+                .unwrap()],
+        },
     }
 }
 

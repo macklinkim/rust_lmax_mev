@@ -11,6 +11,15 @@ ignore = [
     # use case. Migration to wincode/postcard/bitcode is deferred to a
     # future ADR revision.
     "RUSTSEC-2025-0141",
+    # `lru = "0.12"` IterMut Stacked-Borrows unsoundness per
+    # RUSTSEC-2026-0002. We use only `LruCache::put` for dedup
+    # bookkeeping (no IterMut access) so the unsoundness path is not
+    # exercised. Revisit when lru 0.13+ ships a fix.
+    "RUSTSEC-2026-0002",
+    # `paste` unmaintained per RUSTSEC-2024-0436. Pulled transitively
+    # by alloy 0.8's macro stack; out of our control until alloy
+    # migrates.
+    "RUSTSEC-2024-0436",
 ]
 
 [licenses]
@@ -32,6 +41,9 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CDLA-Permissive-2.0",
+    # Phase 2 P2-A alloy transitives:
+    "Unlicense",   # async_io_stream, pharos, ws_stream_wasm — public-domain equivalent
+    "CC0-1.0",     # tiny-keccak — public-domain equivalent
 ]
 confidence-threshold = 0.93
 
