@@ -35,6 +35,7 @@ pub struct Config {
     pub node: NodeConfig,
     pub observability: ObservabilityConfig,
     pub journal: JournalConfig,
+    pub bus: BusConfig,
 }
 
 /// Node topology section per ADR-007. Primary Geth WS + HTTP plus at least
@@ -91,6 +92,19 @@ pub struct JournalConfig {
     pub rocksdb_snapshot_path: PathBuf,
 }
 
+/// Event bus section per ADR-005. Capacity is a required tuning parameter
+/// that must NOT be hardcoded in the binary; ADR-005 §"Consequences"
+/// mandates exposure in the engine config file.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BusConfig {
+    /// Bounded `crossbeam::channel::bounded` capacity. Must be ≥ 1;
+    /// `Config::validate` rejects 0 with `ConfigError::InvalidBusCapacity`
+    /// because a 0-capacity channel deadlocks on the first publish under
+    /// crossbeam semantics.
+    pub capacity: usize,
+}
+
 /// All errors produced by [`Config::load`] and [`Config::from_toml_str`].
 ///
 /// `#[non_exhaustive]` so Phase 2 may add variants additively without
@@ -124,6 +138,11 @@ pub enum ConfigError {
     /// reserved for callers that want a more specific match in the future.
     #[error("invalid socket address for {field}: {reason}")]
     InvalidSocketAddr { field: &'static str, reason: String },
+
+    /// `bus.capacity` must be ≥ 1 per ADR-005; capacity 0 deadlocks on
+    /// the first publish under crossbeam semantics.
+    #[error("bus.capacity must be >= 1 per ADR-005, got {value}")]
+    InvalidBusCapacity { value: usize },
 }
 
 impl Config {
@@ -173,6 +192,9 @@ impl Config {
                 field: "node.geth_http_url",
             });
         }
+        if self.bus.capacity == 0 {
+            return Err(ConfigError::InvalidBusCapacity { value: 0 });
+        }
         Ok(())
     }
 }
@@ -200,6 +222,9 @@ log_format = "json"
 [journal]
 file_journal_path = "/var/lib/lmax/journal.log"
 rocksdb_snapshot_path = "/var/lib/lmax/snapshot"
+
+[bus]
+capacity = 1024
 "#
     }
 
@@ -227,6 +252,7 @@ rocksdb_snapshot_path = "/var/lib/lmax/snapshot"
             cfg.journal.rocksdb_snapshot_path,
             PathBuf::from("/var/lib/lmax/snapshot")
         );
+        assert_eq!(cfg.bus.capacity, 1024);
     }
 
     /// C-2 (failure): `fallback_rpc = []` → `Err(ConfigError::
@@ -247,11 +273,47 @@ log_format = "json"
 [journal]
 file_journal_path = "/tmp/journal.log"
 rocksdb_snapshot_path = "/tmp/snapshot"
+
+[bus]
+capacity = 64
 "#;
         let err = Config::from_toml_str(toml).unwrap_err();
         assert!(
             matches!(err, ConfigError::MissingFallbackRpc),
             "expected MissingFallbackRpc, got {err:?}"
+        );
+    }
+
+    /// C-4 (boundary): `[bus] capacity = 0` → `Err(InvalidBusCapacity)`.
+    /// Asserts the ADR-005 capacity-≥-1 invariant; capacity 0 would
+    /// deadlock on the first publish under crossbeam semantics.
+    #[test]
+    fn from_toml_str_rejects_zero_bus_capacity() {
+        let toml = r#"
+[node]
+geth_ws_url = "ws://localhost:8546"
+geth_http_url = "http://localhost:8545"
+
+[[node.fallback_rpc]]
+url = "https://eth-mainnet.g.alchemy.com/v2/demo"
+label = "alchemy"
+
+[observability]
+prometheus_listen = "0.0.0.0:9090"
+log_filter = "info"
+log_format = "json"
+
+[journal]
+file_journal_path = "/tmp/journal.log"
+rocksdb_snapshot_path = "/tmp/snapshot"
+
+[bus]
+capacity = 0
+"#;
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidBusCapacity { value: 0 }),
+            "expected InvalidBusCapacity {{ value: 0 }}, got {err:?}"
         );
     }
 
