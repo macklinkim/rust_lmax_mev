@@ -33,6 +33,14 @@ pub enum NodeError {
     /// Channel/handle closed by caller-side drop.
     #[error("provider closed")]
     Closed,
+
+    /// Phase 4 P4-A: archive RPC method called but `archive_rpc` was
+    /// not configured in `NodeConfig`. Per ADR-007 §"Archive access" +
+    /// the P4-A DP-1 no-fallback policy, archive reads MUST NOT fall
+    /// back to the primary HTTP endpoint (a non-archive node would
+    /// silently produce wrong historical answers).
+    #[error("archive RPC not configured (set node.archive_rpc in config)")]
+    ArchiveNotConfigured,
 }
 
 /// Classify an alloy `TransportError` into our 5-variant `NodeError`.

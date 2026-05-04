@@ -26,7 +26,8 @@ use alloy::network::Ethereum;
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::types::eth::{Filter, Header, Log, Transaction, TransactionRequest};
 use alloy::transports::http::{Client as ReqwestClient, Http};
-use alloy_primitives::{Bytes, B256};
+use alloy::rpc::types::eth::EIP1186AccountProofResponse;
+use alloy_primitives::{Address, Bytes, B256, U256};
 use async_trait::async_trait;
 use futures::Stream;
 use rust_lmax_mev_config::NodeConfig;
@@ -52,6 +53,43 @@ trait HttpRpc: Send + Sync {
         &self,
         hash: B256,
     ) -> Result<Option<Transaction>, NodeError>;
+
+    // Phase 4 P4-A archive-mode methods. Default-stubbed (additive) so
+    // existing P2-A test mocks compile unchanged; AlloyHttp overrides
+    // with real alloy::providers::Provider calls. NodeProvider
+    // dispatches archive calls to its archive_http handle (when
+    // configured) and NEVER falls back to primary (DP-1).
+    async fn eth_get_proof(
+        &self,
+        _address: Address,
+        _slots: Vec<B256>,
+        _block_id: BlockId,
+    ) -> Result<EIP1186AccountProofResponse, NodeError> {
+        Err(NodeError::Rpc(
+            "archive method `eth_get_proof` not implemented for this transport".to_string(),
+        ))
+    }
+
+    async fn eth_get_storage_at(
+        &self,
+        _address: Address,
+        _slot: U256,
+        _block_id: BlockId,
+    ) -> Result<B256, NodeError> {
+        Err(NodeError::Rpc(
+            "archive method `eth_get_storage_at` not implemented for this transport".to_string(),
+        ))
+    }
+
+    async fn eth_get_code(
+        &self,
+        _address: Address,
+        _block_id: BlockId,
+    ) -> Result<Bytes, NodeError> {
+        Err(NodeError::Rpc(
+            "archive method `eth_get_code` not implemented for this transport".to_string(),
+        ))
+    }
 }
 
 /// Production HTTP adapter wrapping alloy's HTTP-backed `RootProvider`.
@@ -77,14 +115,62 @@ impl HttpRpc for AlloyHttp {
     ) -> Result<Option<Transaction>, NodeError> {
         self.0.get_transaction_by_hash(hash).await.map_err(classify)
     }
+
+    async fn eth_get_proof(
+        &self,
+        address: Address,
+        slots: Vec<B256>,
+        block_id: BlockId,
+    ) -> Result<EIP1186AccountProofResponse, NodeError> {
+        self.0
+            .get_proof(address, slots)
+            .block_id(block_id)
+            .await
+            .map_err(classify)
+    }
+
+    async fn eth_get_storage_at(
+        &self,
+        address: Address,
+        slot: U256,
+        block_id: BlockId,
+    ) -> Result<B256, NodeError> {
+        self.0
+            .get_storage_at(address, slot)
+            .block_id(block_id)
+            .await
+            .map(B256::from)
+            .map_err(classify)
+    }
+
+    async fn eth_get_code(
+        &self,
+        address: Address,
+        block_id: BlockId,
+    ) -> Result<Bytes, NodeError> {
+        self.0
+            .get_code_at(address)
+            .block_id(block_id)
+            .await
+            .map_err(classify)
+    }
 }
 
 /// The public node-provider handle owned by upstream consumers
 /// (`crates/ingress`, `crates/state`, `crates/app`). One instance per
 /// process; clone via `Arc<NodeProvider>` if multiple consumers need it.
+///
+/// Phase 4 P4-A additive: `archive_http` is `Some` only when
+/// `NodeConfig.archive_rpc` is configured. Archive-mode methods
+/// (`eth_get_proof` / `eth_get_storage_at` / `eth_get_code`) dispatch
+/// to `archive_http` and return `Err(NodeError::ArchiveNotConfigured)`
+/// when it is `None`. They NEVER fall back to `primary_http` (DP-1
+/// no-fallback policy: silent fallback to a non-archive node would
+/// produce wrong historical answers).
 pub struct NodeProvider {
     primary_http: Box<dyn HttpRpc>,
     fallback_http: Option<Box<dyn HttpRpc>>,
+    archive_http: Option<Box<dyn HttpRpc>>,
     ws_url: String,
 }
 
@@ -103,9 +189,22 @@ impl NodeProvider {
             }
             None => None,
         };
+        // Phase 4 P4-A: archive endpoint is OPTIONAL. None default per
+        // Q8 fail-closed hardening; archive methods Err(ArchiveNotConfigured)
+        // when this is None. URL parsing is the only validation here —
+        // operational failures (provider unreachable, rate-limited, etc.)
+        // surface lazily on the first archive call (alloy lazy connect).
+        let archive = match &config.archive_rpc {
+            Some(a) => {
+                let u = parse_http_url(&a.url, "archive")?;
+                Some(Box::new(AlloyHttp(ProviderBuilder::new().on_http(u))) as Box<dyn HttpRpc>)
+            }
+            None => None,
+        };
         Ok(Self {
             primary_http: Box::new(AlloyHttp(primary)),
             fallback_http: fallback,
+            archive_http: archive,
             ws_url: config.geth_ws_url.clone(),
         })
     }
@@ -205,6 +304,53 @@ impl NodeProvider {
     /// helpers below cover the common cases.
     pub fn ws_url(&self) -> &str {
         &self.ws_url
+    }
+
+    /// Phase 4 P4-A archive method — pinned at `block_id` proof for
+    /// `address` over the given storage `slots`. Returns
+    /// `Err(NodeError::ArchiveNotConfigured)` if `NodeConfig.archive_rpc`
+    /// was not set at `connect()` time. **NEVER falls back to primary
+    /// HTTP** (DP-1; silent fallback to a non-archive node would
+    /// produce wrong historical answers).
+    pub async fn eth_get_proof(
+        &self,
+        address: Address,
+        slots: Vec<B256>,
+        block_id: BlockId,
+    ) -> Result<EIP1186AccountProofResponse, NodeError> {
+        match &self.archive_http {
+            Some(h) => h.eth_get_proof(address, slots, block_id).await,
+            None => Err(NodeError::ArchiveNotConfigured),
+        }
+    }
+
+    /// Phase 4 P4-A archive method — pinned at `block_id` storage read
+    /// for (`address`, `slot`). Same no-fallback policy as `eth_get_proof`.
+    pub async fn eth_get_storage_at(
+        &self,
+        address: Address,
+        slot: U256,
+        block_id: BlockId,
+    ) -> Result<B256, NodeError> {
+        match &self.archive_http {
+            Some(h) => h.eth_get_storage_at(address, slot, block_id).await,
+            None => Err(NodeError::ArchiveNotConfigured),
+        }
+    }
+
+    /// Phase 4 P4-A archive method — pinned at `block_id` deployed
+    /// bytecode at `address`. Same no-fallback policy (DP-1 covers all
+    /// three methods including `eth_getCode` per Codex 21:37:53 explicit
+    /// rejection of the special-case fallback).
+    pub async fn eth_get_code(
+        &self,
+        address: Address,
+        block_id: BlockId,
+    ) -> Result<Bytes, NodeError> {
+        match &self.archive_http {
+            Some(h) => h.eth_get_code(address, block_id).await,
+            None => Err(NodeError::ArchiveNotConfigured),
+        }
     }
 
     /// Subscribes to `newHeads`. Reconnect is transparent via
@@ -384,6 +530,20 @@ mod tests {
         NodeProvider {
             primary_http: Box::new(primary),
             fallback_http: fallback.map(|m| Box::new(m) as Box<dyn HttpRpc>),
+            archive_http: None,
+            ws_url: "ws://test".to_string(),
+        }
+    }
+
+    fn np_with_archive(
+        primary: MockHttp,
+        fallback: Option<MockHttp>,
+        archive: Option<Box<dyn HttpRpc>>,
+    ) -> NodeProvider {
+        NodeProvider {
+            primary_http: Box::new(primary),
+            fallback_http: fallback.map(|m| Box::new(m) as Box<dyn HttpRpc>),
+            archive_http: archive,
             ws_url: "ws://test".to_string(),
         }
     }
@@ -580,5 +740,215 @@ mod tests {
                 Duration::from_secs(60),
             ]
         );
+    }
+
+    // ----- Phase 4 P4-A archive method mocks + N4A-1..N4A-4 tests -----
+
+    /// Per-call deterministic outcome for archive `eth_get_storage_at`.
+    /// Mirrors `MockHttp` shape but specialized to the storage-at return
+    /// type. Other archive methods are stubbed to default Err so their
+    /// calls aren't accidentally observable.
+    struct MockArchiveStorage {
+        outcome: Box<dyn Fn(usize) -> Result<B256, NodeError> + Send + Sync>,
+        call_count: Arc<AtomicUsize>,
+    }
+    impl MockArchiveStorage {
+        fn new(
+            outcome: impl Fn(usize) -> Result<B256, NodeError> + Send + Sync + 'static,
+        ) -> (Self, Arc<AtomicUsize>) {
+            let cc = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    outcome: Box::new(outcome),
+                    call_count: Arc::clone(&cc),
+                },
+                cc,
+            )
+        }
+    }
+    #[async_trait]
+    impl HttpRpc for MockArchiveStorage {
+        async fn eth_call(&self, _: TransactionRequest) -> Result<Bytes, NodeError> {
+            Err(NodeError::Rpc("not used in archive tests".into()))
+        }
+        async fn eth_call_at_block(
+            &self,
+            _: TransactionRequest,
+            _: BlockId,
+        ) -> Result<Bytes, NodeError> {
+            Err(NodeError::Rpc("not used in archive tests".into()))
+        }
+        async fn eth_get_transaction_by_hash(
+            &self,
+            _: B256,
+        ) -> Result<Option<Transaction>, NodeError> {
+            Err(NodeError::Rpc("not used in archive tests".into()))
+        }
+        async fn eth_get_storage_at(
+            &self,
+            _address: Address,
+            _slot: U256,
+            _block_id: BlockId,
+        ) -> Result<B256, NodeError> {
+            let n = self.call_count.fetch_add(1, Ordering::Relaxed);
+            (self.outcome)(n)
+        }
+    }
+
+    /// Per-call deterministic outcome for archive `eth_get_proof` /
+    /// `eth_get_code`. Returns generic `Bytes` per call so we can drive
+    /// the get_code happy path AND inject `Transport` errors for the
+    /// no-fallback assertion (N4A-3).
+    struct MockArchiveProofCode {
+        proof_outcome: Box<dyn Fn(usize) -> Result<EIP1186AccountProofResponse, NodeError> + Send + Sync>,
+        code_outcome: Box<dyn Fn(usize) -> Result<Bytes, NodeError> + Send + Sync>,
+        proof_calls: Arc<AtomicUsize>,
+        code_calls: Arc<AtomicUsize>,
+    }
+    impl MockArchiveProofCode {
+        fn new(
+            proof_outcome: impl Fn(usize) -> Result<EIP1186AccountProofResponse, NodeError>
+                + Send
+                + Sync
+                + 'static,
+            code_outcome: impl Fn(usize) -> Result<Bytes, NodeError> + Send + Sync + 'static,
+        ) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            let pc = Arc::new(AtomicUsize::new(0));
+            let cc = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    proof_outcome: Box::new(proof_outcome),
+                    code_outcome: Box::new(code_outcome),
+                    proof_calls: Arc::clone(&pc),
+                    code_calls: Arc::clone(&cc),
+                },
+                pc,
+                cc,
+            )
+        }
+    }
+    #[async_trait]
+    impl HttpRpc for MockArchiveProofCode {
+        async fn eth_call(&self, _: TransactionRequest) -> Result<Bytes, NodeError> {
+            Err(NodeError::Rpc("not used in archive tests".into()))
+        }
+        async fn eth_call_at_block(
+            &self,
+            _: TransactionRequest,
+            _: BlockId,
+        ) -> Result<Bytes, NodeError> {
+            Err(NodeError::Rpc("not used in archive tests".into()))
+        }
+        async fn eth_get_transaction_by_hash(
+            &self,
+            _: B256,
+        ) -> Result<Option<Transaction>, NodeError> {
+            Err(NodeError::Rpc("not used in archive tests".into()))
+        }
+        async fn eth_get_proof(
+            &self,
+            _: Address,
+            _: Vec<B256>,
+            _: BlockId,
+        ) -> Result<EIP1186AccountProofResponse, NodeError> {
+            let n = self.proof_calls.fetch_add(1, Ordering::Relaxed);
+            (self.proof_outcome)(n)
+        }
+        async fn eth_get_code(&self, _: Address, _: BlockId) -> Result<Bytes, NodeError> {
+            let n = self.code_calls.fetch_add(1, Ordering::Relaxed);
+            (self.code_outcome)(n)
+        }
+    }
+
+    fn block_id_at(n: u64) -> BlockId {
+        BlockId::Number(alloy::eips::BlockNumberOrTag::Number(n))
+    }
+
+    /// N4A-1 happy: configured archive returns canned B256;
+    /// `NodeProvider::eth_get_storage_at` passes it through.
+    #[tokio::test]
+    async fn eth_get_storage_at_returns_archive_value() {
+        let expected = B256::from([0xAB; 32]);
+        let (archive, archive_calls) = MockArchiveStorage::new({
+            let e = expected;
+            move |_| Ok(e)
+        });
+        let (primary, _primary_calls) = MockHttp::new(|_| Ok(Bytes::from_static(b"NEVER")));
+        let np = np_with_archive(primary, None, Some(Box::new(archive) as Box<dyn HttpRpc>));
+
+        let got = np
+            .eth_get_storage_at(Address::ZERO, U256::ZERO, block_id_at(18_000_000))
+            .await
+            .unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(archive_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// N4A-2 abort: archive_http is None → ArchiveNotConfigured. NO
+    /// fallback to primary HTTP (DP-1).
+    #[tokio::test]
+    async fn eth_get_storage_at_returns_archive_not_configured_when_unset() {
+        let (primary, primary_calls) = MockHttp::new(|_| Ok(Bytes::from_static(b"NEVER")));
+        let np = np_with(primary, None);
+
+        let err = np
+            .eth_get_storage_at(Address::ZERO, U256::ZERO, block_id_at(18_000_000))
+            .await
+            .expect_err("archive_http=None must Err(ArchiveNotConfigured)");
+        assert!(matches!(err, NodeError::ArchiveNotConfigured));
+        assert_eq!(
+            primary_calls.load(Ordering::Relaxed),
+            0,
+            "primary must NOT be consulted (DP-1 no-fallback policy)"
+        );
+    }
+
+    /// N4A-3 abort: archive returns Transport error → propagates Err
+    /// directly. NO fallback to primary (DP-1).
+    #[tokio::test]
+    async fn eth_get_proof_does_not_fall_back_on_transport_error() {
+        let (archive, archive_calls, _) = MockArchiveProofCode::new(
+            |_| Err(NodeError::Transport("simulated".into())),
+            |_| Ok(Bytes::new()),
+        );
+        let (primary, primary_calls) = MockHttp::new(|_| Ok(Bytes::from_static(b"NEVER")));
+        let np = np_with_archive(primary, None, Some(Box::new(archive) as Box<dyn HttpRpc>));
+
+        let err = np
+            .eth_get_proof(Address::ZERO, vec![], block_id_at(18_000_000))
+            .await
+            .expect_err("must Err(Transport)");
+        assert!(
+            matches!(err, NodeError::Transport(_)),
+            "expected Transport, got {err:?}"
+        );
+        assert_eq!(archive_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            primary_calls.load(Ordering::Relaxed),
+            0,
+            "primary must NOT be consulted on archive Transport error (DP-1)"
+        );
+    }
+
+    /// N4A-4 boundary: archive returns empty Bytes for eth_get_code →
+    /// passed through unchanged (covers the empty-bytecode case for an
+    /// EOA address).
+    #[tokio::test]
+    async fn eth_get_code_round_trips_empty_bytes() {
+        let (archive, _, code_calls) = MockArchiveProofCode::new(
+            |_| {
+                Err(NodeError::Rpc("proof not exercised in this test".into()))
+            },
+            |_| Ok(Bytes::new()),
+        );
+        let (primary, _) = MockHttp::new(|_| Ok(Bytes::from_static(b"NEVER")));
+        let np = np_with_archive(primary, None, Some(Box::new(archive) as Box<dyn HttpRpc>));
+
+        let got = np
+            .eth_get_code(Address::ZERO, block_id_at(18_000_000))
+            .await
+            .unwrap();
+        assert_eq!(got, Bytes::new());
+        assert_eq!(code_calls.load(Ordering::Relaxed), 1);
     }
 }
