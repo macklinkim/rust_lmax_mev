@@ -44,43 +44,64 @@ pub fn array_element_slot(array_slot: U256, i: U256, element_words: u32) -> U256
 mod tests {
     use super::*;
 
-    /// S-K-1: mapping derivation matches a hand-computed known-good
-    /// vector. `keccak256(abi.encode(uint256(0x42), uint256(1)))` is the
-    /// canonical Solidity-doc example. Computed once via the same
-    /// `keccak256` primitive over the same 64-byte buffer to avoid
-    /// hard-coding a magic constant that could mask a regression in the
-    /// helper's own buffer assembly.
+    /// Independently-computed expected hashes — produced via the
+    /// `tiny-keccak` crate (a separate keccak256 implementation from
+    /// `alloy_primitives::keccak256`, which uses the `sha3` crate
+    /// internally). Sanity-checked against the well-known Ethereum
+    /// constant `keccak256("") == c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`.
+    /// These constants are HARDCODED snapshots: a future regression in
+    /// either `mapping_slot_u256`'s buffer assembly OR in
+    /// `alloy_primitives::keccak256` would diverge from them and fail
+    /// the test.
+    ///
+    /// `keccak256(abi.encode(uint256(0x42), uint256(1)))` — the storage
+    /// slot for `mapping(uint256 => _) m` declared at slot 1, indexed
+    /// by key `0x42`. Computed via `tiny-keccak` over the 64-byte ABI
+    /// buffer.
+    const SK1_EXPECTED_MAPPING_SLOT_HEX: [u8; 32] = [
+        0xe9, 0x96, 0x35, 0xfc, 0xcc, 0x85, 0x93, 0xe1, 0x8a, 0x8f, 0x8d, 0x41, 0xf3, 0x81, 0x9f,
+        0xbb, 0xb2, 0x3d, 0x11, 0x6b, 0x5e, 0x97, 0x9c, 0xc6, 0x8c, 0x43, 0xa9, 0x8e, 0x9c, 0x10,
+        0xe5, 0x2a,
+    ];
+
+    /// `keccak256(uint256(2))` — base slot of a dynamic array declared
+    /// at storage slot 2. Computed via `tiny-keccak`.
+    const SK2_EXPECTED_ARRAY_BASE_HEX: [u8; 32] = [
+        0x40, 0x57, 0x87, 0xfa, 0x12, 0xa8, 0x23, 0xe0, 0xf2, 0xb7, 0x63, 0x1c, 0xc4, 0x1b, 0x3b,
+        0xa8, 0x82, 0x8b, 0x33, 0x21, 0xca, 0x81, 0x11, 0x11, 0xfa, 0x75, 0xcd, 0x3a, 0xa3, 0xbb,
+        0x5a, 0xce,
+    ];
+
+    /// S-K-1: `mapping_slot_u256(1, B256(uint256(0x42)))` matches the
+    /// independently-computed `tiny-keccak` snapshot.
     #[test]
-    fn mapping_slot_u256_matches_solidity_known_good_vector() {
+    fn mapping_slot_u256_matches_independent_keccak_vector() {
         let mapping_slot = U256::from(1u64);
-        let key_u: u64 = 0x42;
-        let key = B256::from(U256::from(key_u).to_be_bytes::<32>());
+        let key = B256::from(U256::from(0x42u64).to_be_bytes::<32>());
         let got = mapping_slot_u256(mapping_slot, key);
-        // Hand-assemble the same 64-byte buffer the way the Solidity ABI
-        // would for `mapping(uint256 => _)`.
-        let mut buf = [0u8; 64];
-        buf[..32].copy_from_slice(&U256::from(key_u).to_be_bytes::<32>());
-        buf[32..].copy_from_slice(&U256::from(1u64).to_be_bytes::<32>());
-        let expected = U256::from_be_bytes(keccak256(buf).0);
+        let expected = U256::from_be_bytes(SK1_EXPECTED_MAPPING_SLOT_HEX);
         assert_eq!(
             got, expected,
-            "mapping_slot_u256 must match keccak256(abi.encode(key, mapping_slot))"
+            "mapping_slot_u256(1, key=0x42) must match the tiny-keccak-computed slot \
+             0xe99635fccc8593e18a8f8d41f3819fbbb23d116b5e979cc68c43a98e9c10e52a"
         );
-        // And cross-check with a different mapping_slot to catch
-        // accidental slot-arg ignored bugs.
+        // Cross-check: a different mapping_slot must yield a different
+        // slot (catches accidental slot-arg-ignored bugs).
         let other = mapping_slot_u256(U256::from(2u64), key);
         assert_ne!(
             got, other,
-            "different mapping_slot must yield different slot"
+            "different mapping_slot must yield different storage slot"
         );
     }
 
-    /// S-K-2: array element derivation matches `keccak256(slot) + i * w`.
+    /// S-K-2: `array_element_slot(2, i, w)` matches the
+    /// independently-computed `tiny-keccak` base PLUS the documented
+    /// `i * element_words` offset arithmetic.
     #[test]
-    fn array_element_slot_matches_solidity_known_good_vector() {
+    fn array_element_slot_matches_independent_keccak_vector() {
         let array_slot = U256::from(2u64);
-        let base = U256::from_be_bytes(keccak256(array_slot.to_be_bytes::<32>()).0);
-        // i = 0 → base; i = 5, words = 1 → base + 5; words = 2 → base + 10.
+        let base = U256::from_be_bytes(SK2_EXPECTED_ARRAY_BASE_HEX);
+        // i=0, words=1 → base; i=5, words=1 → base+5; i=5, words=2 → base+10.
         assert_eq!(array_element_slot(array_slot, U256::from(0u64), 1), base);
         assert_eq!(
             array_element_slot(array_slot, U256::from(5u64), 1),
@@ -89,6 +110,14 @@ mod tests {
         assert_eq!(
             array_element_slot(array_slot, U256::from(5u64), 2),
             base + U256::from(10u64),
+        );
+        // Confirm the helper's own `keccak256` call agrees with the
+        // tiny-keccak snapshot (i.e., alloy_primitives::keccak256 and
+        // tiny-keccak produce the same digest for the same input).
+        let alloy_base = U256::from_be_bytes(keccak256(array_slot.to_be_bytes::<32>()).0);
+        assert_eq!(
+            alloy_base, base,
+            "alloy_primitives::keccak256 must agree with tiny-keccak snapshot"
         );
     }
 }
