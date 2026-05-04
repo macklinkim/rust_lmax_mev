@@ -14,11 +14,15 @@
 //! events and shutdown without `tokio::signal::ctrl_c`.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use rust_lmax_mev_config::Config;
 use rust_lmax_mev_event_bus::{CrossbeamBoundedBus, CrossbeamConsumer, EventConsumer};
+use rust_lmax_mev_ingress::IngressEvent;
 use rust_lmax_mev_journal::{FileJournal, JournalError, RocksDbSnapshot};
+use rust_lmax_mev_node::{NodeError, NodeProvider};
+use rust_lmax_mev_state::{PoolId, StateEngine, StateError};
 use rust_lmax_mev_types::SmokeTestPayload;
 
 /// All errors produced by [`run`] / [`wire`].
@@ -51,6 +55,18 @@ pub enum AppError {
     /// Consumer thread panicked or otherwise failed to join cleanly.
     #[error("consumer thread join failed: {0}")]
     ConsumerJoin(String),
+
+    /// Phase 2 P2-D: `NodeProvider::connect` failure (URL parse / WS
+    /// connect / RPC). Surfaces as `AppError::Node` so callers can
+    /// distinguish node-side problems from filesystem/journal/bus.
+    #[error("node error: {0}")]
+    Node(#[from] NodeError),
+
+    /// Phase 2 P2-D: state-engine failure (snapshot persistence,
+    /// ABI decode, unknown-pool). Constructed via `#[from]` from
+    /// `rust_lmax_mev_state::StateError`.
+    #[error("state error: {0}")]
+    State(#[from] StateError),
 }
 
 /// Optional knobs for [`wire`]. The production [`run`] always passes
@@ -138,17 +154,118 @@ pub fn wire(config: &Config, opts: WireOptions) -> Result<AppHandle, AppError> {
     })
 }
 
-/// Production entrypoint: load config, wire, await `ctrl_c`, shut down.
+/// Production entrypoint: load config, wire the Phase 2 producer-side
+/// stack, await `ctrl_c`, shut down.
+///
+/// Phase 2 P2-D wiring per the approved Batch D execution note:
+/// constructs the runtime FIRST and keeps it alive for the full
+/// process lifetime so `NodeProvider`'s alloy WS handle is never
+/// orphaned (runtime-lifetime risk mitigation).
 pub fn run(config_path: impl AsRef<Path>) -> Result<(), AppError> {
     let config = Config::load(config_path)?;
-    let handle = wire(&config, WireOptions::default())?;
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let handle = runtime.block_on(wire_phase2(&config, WireOptions::default()))?;
     runtime.block_on(async { tokio::signal::ctrl_c().await })?;
+    handle.shutdown()?;
+    drop(runtime);
+    Ok(())
+}
 
-    handle.shutdown()
+/// Phase 2 P2-D producer-side handle. Holds the `NodeProvider` and
+/// `StateEngine` so they survive until `shutdown` returns; holds the
+/// ingress→state bus producer for Phase 3 to drive. No consumer
+/// thread is spawned: `IngressEvent` does not yet impl `rkyv::Archive`
+/// (would require an additive edit to the P2-A-frozen `crates/ingress`),
+/// so a `FileJournal<IngressEvent>`-draining consumer is deferred to
+/// Phase 3 along with the producer-task spawn that publishes events.
+pub struct AppHandle2 {
+    bus: CrossbeamBoundedBus<IngressEvent>,
+    _consumer: CrossbeamConsumer<IngressEvent>,
+    provider: Arc<NodeProvider>,
+    engine: Arc<StateEngine>,
+}
+
+impl std::fmt::Debug for AppHandle2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppHandle2").finish_non_exhaustive()
+    }
+}
+
+impl AppHandle2 {
+    /// Borrow the ingress→state bus producer (for Phase 3 wiring).
+    pub fn bus(&self) -> &CrossbeamBoundedBus<IngressEvent> {
+        &self.bus
+    }
+
+    /// Borrow the held `NodeProvider`.
+    pub fn provider(&self) -> &Arc<NodeProvider> {
+        &self.provider
+    }
+
+    /// Borrow the held `StateEngine`.
+    pub fn engine(&self) -> &Arc<StateEngine> {
+        &self.engine
+    }
+
+    /// Drops the bus, consumer handle, engine, and provider. There is
+    /// no consumer thread to join (see `AppHandle2` doc).
+    pub fn shutdown(self) -> Result<(), AppError> {
+        let Self {
+            bus,
+            _consumer,
+            provider,
+            engine,
+        } = self;
+        drop(bus);
+        drop(_consumer);
+        drop(engine);
+        drop(provider);
+        Ok(())
+    }
+}
+
+/// Phase 2 P2-D async constructor. Builds:
+/// - `observability::init` (gated by `WireOptions.init_observability`).
+/// - `NodeProvider::connect(&config.node).await` — URL parse only;
+///   actual HTTP/WS dialing is lazy (alloy default).
+/// - `RocksDbSnapshot::open(&config.journal.rocksdb_snapshot_path)`.
+/// - `StateEngine::new(provider, snapshot, pools_from_config)`.
+/// - `CrossbeamBoundedBus::<IngressEvent>::new(config.bus.capacity)`.
+///
+/// Does NOT spawn a producer task (Phase 3 owns the 6-stage pipeline)
+/// and does NOT spawn a journal-draining consumer thread (`IngressEvent`
+/// is not `rkyv::Archive` today). The bus producer + held consumer
+/// handle are returned in `AppHandle2` so Phase 3 can swap in both ends
+/// without the wire surface changing.
+pub async fn wire_phase2(
+    config: &Config,
+    opts: WireOptions,
+) -> Result<AppHandle2, AppError> {
+    if opts.init_observability {
+        let _obs = rust_lmax_mev_observability::init(&config.observability)?;
+    }
+
+    let provider = Arc::new(NodeProvider::connect(&config.node).await?);
+    let snapshot = Arc::new(RocksDbSnapshot::open(
+        &config.journal.rocksdb_snapshot_path,
+    )?);
+    let pools: Vec<PoolId> = config.state.pools.iter().map(PoolId::from).collect();
+    let engine = Arc::new(StateEngine::new(
+        Arc::clone(&provider),
+        snapshot,
+        pools,
+    ));
+
+    let (bus, consumer) = CrossbeamBoundedBus::<IngressEvent>::new(config.bus.capacity)?;
+
+    Ok(AppHandle2 {
+        bus,
+        _consumer: consumer,
+        provider,
+        engine,
+    })
 }
 
 /// Drains the bus into the journal until the bus closes. Best-effort

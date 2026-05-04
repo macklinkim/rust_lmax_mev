@@ -3350,8 +3350,11 @@ version = "0.1.0"
 dependencies = [
  "rust-lmax-mev-config",
  "rust-lmax-mev-event-bus",
+ "rust-lmax-mev-ingress",
  "rust-lmax-mev-journal",
+ "rust-lmax-mev-node",
  "rust-lmax-mev-observability",
+ "rust-lmax-mev-state",
  "rust-lmax-mev-types",
  "tempfile",
  "thiserror 2.0.18",
