@@ -1,10 +1,10 @@
 //! Phase 3 P3-D test R-7: rkyv envelope round-trip on
 //! `RiskCheckedOpportunity` per the approved Batch D execution note v0.2
-//! + `docs/specs/event-model.md` mandatory derives. Mirrors the P3-A
-//! ingress/state/replay round-trip pattern + the P3-C opportunity
-//! envelope test; proves the spec-compliance derives + per-crate
-//! `rkyv_compat::U256AsBytes` adapter work end-to-end through
-//! `EventEnvelope<T>`.
+//! plus the `docs/specs/event-model.md` mandatory derives. Mirrors
+//! the P3-A ingress/state/replay round-trip pattern and the P3-C
+//! opportunity envelope test; proves the spec-compliance derives plus
+//! the per-crate `rkyv_compat::U256AsBytes` adapter work end-to-end
+//! through `EventEnvelope<T>`.
 
 use alloy_primitives::{Address, B256, U256};
 use rust_lmax_mev_opportunity::{OpportunityEvent, GAS_ESTIMATE_TWO_HOP_ARB};
