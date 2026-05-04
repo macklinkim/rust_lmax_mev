@@ -18,14 +18,27 @@ Rust LMAX Disruptor-style MEV detection and execution engine for Ethereum mainne
 - CI: `.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo deny check` on `ubuntu-latest`. ADR-008 checks 5+6+7 (bus 100k smoke, journal round-trip, snapshot smoke) exercised inside the test job.
 - `deny.toml` v2 schema (cargo-deny 0.18+); RUSTSEC-2025-0141 (bincode 1.3 unmaintained) ignored per ADR-004 cold-path serializer choice.
 
-**Phase 2: NOT STARTED** — mempool ingestion + replay hooks + simulation per ADR-001 vertical-slice ordering. Wait for explicit user prompt to begin.
+**Phase 2: COMPLETE** (git tag: `phase-2-complete` at `b5ed4cd`, pushed to `origin`)
+- All four batches CLOSED via the lean-batching policy:
+  - P2-A node + ingress (`d9e7d48..9487cce`)
+  - P2-B state engine (`9311d8d..310f6c7`)
+  - P2-C replay + EXIT gates (`8f297ed..239ea86`)
+  - P2-D `crates/app` producer wiring + final DoD audit + tag draft (`8192439..b5ed4cd`)
+- 11 workspace crates: Phase 1 7 + new `node`, `ingress`, `state`, `replay`. `crates/config` and `crates/app` were the only previously-frozen crates touched (additive only).
+- 71 workspace tests passing in CI (52 P1 baseline + 6 P2-A + 6 P2-B + 5 P2-C + 2 P2-D), plus 1 ignored live-smoke env-contract stub.
+- ADR-001 Phase 2 EXIT gates passing in CI:
+  - **Replay Gate** — `crates/replay/tests/g_replay.rs` byte-identical assertion across two runs.
+  - **State Correctness Gate** — `crates/replay/tests/g_state.rs` + `g_pin.rs` (3 cases: non-Hash BlockId, unknown-hash, missing-fixture-no-witness).
+- `master` and `phase-2-complete` tag pushed to `origin`.
+
+**Phase 3: NOT STARTED** — 6-stage pipeline + revm simulation per ADR-001. Wait for explicit user prompt to begin. Known follow-up before Phase 3 can wire a `FileJournal<IngressEvent>`-draining consumer downstream of `wire_phase2`: `IngressEvent` (in P2-A-frozen `crates/ingress`) does NOT derive `rkyv::Archive`; Phase 3 must add the derives via a one-shot additive `crates/ingress` edit OR split the bus payload type.
 
 ## Resume Instructions
 
 1. Read `.coordination/task_state.md`, `.coordination/claude_outbox.md`, and `.coordination/codex_review.md` first; they describe the current gate and live handoff state.
-2. Phase 1 is closed at `phase-1-complete`; do not re-open frozen Phase 1 crates without an ADR/spec change.
-3. To begin Phase 2 work: draft a Phase 2 plan/design under `docs/superpowers/specs/` and `docs/superpowers/plans/` mirroring the Phase 1 lean-batching pattern (ADR-001 vertical-slice ordering: mempool ingestion, replay hooks, simulation).
-4. Use `superpowers:subagent-driven-development` for Phase 2 implementation work once a plan is user-approved.
+2. Phase 1 is closed at `phase-1-complete`; Phase 2 is closed at `phase-2-complete`. Do not re-open frozen Phase 1 / P2-A / P2-B / P2-C crates without an ADR/spec change.
+3. To begin Phase 3 work: draft a Phase 3 plan under `docs/superpowers/plans/` mirroring the Phase 2 lean-batching pattern (ADR-001 6-stage pipeline + revm simulation), explicitly addressing the `IngressEvent` rkyv-derive gap noted above before any `FileJournal<IngressEvent>` consumer wiring.
+4. Use `superpowers:subagent-driven-development` for Phase 3 implementation work once a plan is user-approved.
 
 ## Key Decisions (frozen in ADRs)
 
@@ -35,6 +48,13 @@ Rust LMAX Disruptor-style MEV detection and execution engine for Ethereum mainne
 - **EventBus:** Single-consumer bounded queue (Phase 1), multi-consumer deferred to Phase 2+
 - **Pipeline (Phase 3):** 6-stage with PipelineOutcome<T> generic immutable pattern
 - **Config:** TOML, primary node Geth, fallback RPC 1+
+
+## Task Checklist (Phase 2 — all CLOSED)
+
+- [x] P2-A: `crates/node` + `crates/ingress` (NodeProvider WS+HTTP+fallback per ADR-007; MempoolSource trait + GethWsMempool per ADR-003).
+- [x] P2-B: `crates/state` (UniV2 + UniV3 0.05% reserves snapshot, block-hash-pinned `eth_call_at_block`, persisted to `RocksDbSnapshot`).
+- [x] P2-C: `crates/replay` (Replayer trait + StateReplayer + RecordedEthCaller; G-Replay + G-State + G-Pin EXIT gate tests + ignored live smoke).
+- [x] P2-D: `crates/app` producer-side wiring (`wire_phase2` + `AppHandle2` + `AppError::Node|State`), final DoD audit, `phase-2-complete` annotated tag at `b5ed4cd`.
 
 ## Task Checklist (Phase 1)
 
