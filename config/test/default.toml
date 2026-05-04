@@ -1,5 +1,39 @@
-[bus]
-capacity = 1024
+# Test sample config for the Phase 2 LMAX MEV engine.
+# All paths and ports are placeholders; integration tests build their
+# Config in-memory via crates/app/tests/common::make_config rather than
+# loading this file. Kept as a checked-in example of the test-tier
+# preset so a future cargo run --bin rust-lmax-mev-app config/test/
+# default.toml does not bomb out on Config::load.
 
-[logging]
-level = "warn"
+[node]
+geth_ws_url = "ws://127.0.0.1:8546"
+geth_http_url = "http://127.0.0.1:8545"
+
+[[node.fallback_rpc]]
+url = "http://127.0.0.1:8545"
+label = "test-loopback"
+
+[observability]
+prometheus_listen = "127.0.0.1:0"
+log_filter = "warn"
+log_format = "pretty"
+
+[journal]
+file_journal_path = "./.test/journal.log"
+rocksdb_snapshot_path = "./.test/snapshot"
+
+[bus]
+capacity = 16
+
+[ingress.tokens]
+weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+
+[ingress]
+watched_addresses = [
+    "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc",
+]
+
+[[state.pools]]
+kind = "uniswap_v2"
+address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"

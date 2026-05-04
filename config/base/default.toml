@@ -1,12 +1,45 @@
+# Base / production sample config for the Phase 2 LMAX MEV engine.
+# All fields per crates/config schema as of Phase 2 P2-B.
+#
+# Operator MUST replace the Geth URLs (and ideally the fallback RPC URL)
+# with real endpoints before running against mainnet. Pool addresses are
+# the canonical Uniswap V2 and Uniswap V3 0.05% USDC/WETH pools on
+# Ethereum mainnet.
+
+[node]
+geth_ws_url = "ws://127.0.0.1:8546"
+geth_http_url = "http://127.0.0.1:8545"
+
+[[node.fallback_rpc]]
+url = "https://eth-mainnet.g.alchemy.com/v2/REPLACE_ME"
+label = "alchemy"
+
+[observability]
+prometheus_listen = "0.0.0.0:9090"
+log_filter = "info"
+log_format = "json"
+
+[journal]
+file_journal_path = "/var/lib/rust-lmax-mev/journal.log"
+rocksdb_snapshot_path = "/var/lib/rust-lmax-mev/snapshot"
+
 [bus]
 capacity = 65536
 
-[journal]
-fsync_interval_ms = 100
+[ingress.tokens]
+weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 
-[metrics]
-port = 9090
+[ingress]
+watched_addresses = [
+    "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc",
+    "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
+]
 
-[logging]
-level = "info"
-format = "json"
+[[state.pools]]
+kind = "uniswap_v2"
+address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
+
+[[state.pools]]
+kind = "uniswap_v3_fee_005"
+address = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
