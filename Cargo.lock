@@ -3485,6 +3485,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-lmax-mev-risk"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "parking_lot",
+ "rkyv",
+ "rust-lmax-mev-opportunity",
+ "rust-lmax-mev-state",
+ "rust-lmax-mev-types",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rust-lmax-mev-smoke-tests"
 version = "0.1.0"
 dependencies = [
