@@ -31,14 +31,30 @@ Rust LMAX Disruptor-style MEV detection and execution engine for Ethereum mainne
   - **State Correctness Gate** — `crates/replay/tests/g_state.rs` + `g_pin.rs` (3 cases: non-Hash BlockId, unknown-hash, missing-fixture-no-witness).
 - `master` and `phase-2-complete` tag pushed to `origin`.
 
-**Phase 3: NOT STARTED** — 6-stage pipeline + revm simulation per ADR-001. Wait for explicit user prompt to begin. Known follow-up before Phase 3 can wire a `FileJournal<IngressEvent>`-draining consumer downstream of `wire_phase2`: `IngressEvent` (in P2-A-frozen `crates/ingress`) does NOT derive `rkyv::Archive`; Phase 3 must add the derives via a one-shot additive `crates/ingress` edit OR split the bus payload type.
+**Phase 3: COMPLETE** (git tag: `phase-3-complete` at `e2a9c19`, pushed to `origin`)
+- All six batches CLOSED via the lean-batching policy:
+  - Phase 3 overview (`c755ccb`)
+  - P3-A spec-compliance repair — additive `rkyv + serde` derives on `IngressEvent`/`MempoolEvent`/`BlockEvent`/`PoolState`/`StateUpdateEvent`/`PoolKind` via per-crate `rkyv_compat` adapters (`6e5de50..ae2fc59`)
+  - P3-B `wire_phase3` + dual journal-drain consumer threads (`0933c2c..8dee524`)
+  - P3-C `crates/opportunity` UniV2 vs UniV3 0.05% Q64 arb math (`4b6f798..a70b8a2`)
+  - P3-D `crates/risk` sizing + budget gate per `docs/specs/risk-budget.md` + topology Option A design doc (`abc5bbc..33370ed`)
+  - P3-E `crates/simulator` revm LOCAL pre-sim shim per DP-S1 (`65da50e..f9560c0`)
+  - P3-F `crates/execution` bundle construction + `wire_phase4` final wiring (`38d14da..e2a9c19`)
+- 15 workspace crates: Phase 2 11 + new `opportunity`, `risk`, `simulator`, `execution`. Existing Phase 1/2 crates touched only via the spec-compliance carve-out (P3-A additive rkyv derives) and `crates/app` `wire_phase4` additive constructor; `wire`/`wire_phase2`/`wire_phase3` stay byte-identical.
+- 107 workspace tests passing in CI (52 P1 baseline + 6 P2-A + 6 P2-B + 5 P2-C + 2 P2-D + 6 P3-A + 2 P3-B runtime + 7 P3-C + 9 P3-D + 5 P3-E + 7 P3-F), plus 1 ignored live-smoke env-contract stub.
+- ADR-001 line 43 revisit-trigger conditions ALL satisfied: captured event journaled (P2-A + P3-A + P3-B + P3-F broadcast tee) → simulated profit signal (P3-C heuristic + P3-E revm shim) → bundle construction (P3-F).
+- **ADR-006 deferral on permanent record**: P3-E ships a deterministic revm pipeline shim (in-tree STOP test bytecode + in-memory `CacheDB`) with `simulated_profit_wei` heuristic-passthrough from upstream, stamped `ProfitSource::HeuristicPassthrough`. Phase 4 lands ADR-007 archive node + real Uniswap V2/V3 bytecode + state-fetcher and flips `ProfitSource` → `RevmComputed`; `MismatchCategory` + relay sim comparator land alongside `BundleRelay`. User-approved deferral 2026-05-04.
+- Topology Option A (`tokio::sync::broadcast` rebroadcast) implemented in P3-F `wire_phase4` with the v0.2 fail-closed `RecvError::Lagged` policy from P3-D documented design (W-2 test asserts the consumer task exits within 2s on `Lagged`).
+- `master` and `phase-3-complete` tag pushed to `origin` (tag object `7298660`).
+
+**Phase 4: NOT STARTED** — relay submission + `BundleRelay` + funded-key + ADR-006 strict revm against current state snapshot + ADR-007 archive node integration + dynamic gas bidding (Phase 5+ per ADR-006). Wait for explicit user prompt to begin.
 
 ## Resume Instructions
 
 1. Read `.coordination/task_state.md`, `.coordination/claude_outbox.md`, and `.coordination/codex_review.md` first; they describe the current gate and live handoff state.
-2. Phase 1 is closed at `phase-1-complete`; Phase 2 is closed at `phase-2-complete`. Do not re-open frozen Phase 1 / P2-A / P2-B / P2-C crates without an ADR/spec change.
-3. To begin Phase 3 work: draft a Phase 3 plan under `docs/superpowers/plans/` mirroring the Phase 2 lean-batching pattern (ADR-001 6-stage pipeline + revm simulation), explicitly addressing the `IngressEvent` rkyv-derive gap noted above before any `FileJournal<IngressEvent>` consumer wiring.
-4. Use `superpowers:subagent-driven-development` for Phase 3 implementation work once a plan is user-approved.
+2. Phase 1/2/3 closed at `phase-1-complete`/`phase-2-complete`/`phase-3-complete`. Do not re-open frozen Phase 1 / P2-A / P2-B / P2-C / P3 crates without an ADR/spec change. The P3-E ADR-006 deferral is documented in the `phase-3-complete` tag annotation; Phase 4 plan must reference that deferral and explicitly land the strict-revm requirement.
+3. To begin Phase 4 work: draft a Phase 4 plan under `docs/superpowers/plans/` mirroring the Phase 3 lean-batching pattern. Phase 4 owns ADR-007 archive node integration, real Uniswap V2/V3 bytecode + state-fetcher (flipping `ProfitSource::HeuristicPassthrough` → `RevmComputed`), `MismatchCategory` enum + relay sim comparator alongside `BundleRelay`, funded-key + signing infrastructure (gated by Safety Gate per ADR-001), and Sushiswap WETH/USDC inclusion per ADR-002 Phase 4 unlock.
+4. Use `superpowers:subagent-driven-development` for Phase 4 implementation work once a plan is user-approved.
 
 ## Key Decisions (frozen in ADRs)
 
@@ -48,6 +64,15 @@ Rust LMAX Disruptor-style MEV detection and execution engine for Ethereum mainne
 - **EventBus:** Single-consumer bounded queue (Phase 1), multi-consumer deferred to Phase 2+
 - **Pipeline (Phase 3):** 6-stage with PipelineOutcome<T> generic immutable pattern
 - **Config:** TOML, primary node Geth, fallback RPC 1+
+
+## Task Checklist (Phase 3 — all CLOSED)
+
+- [x] P3-A: spec-compliance repair — additive `rkyv + serde` derives on `IngressEvent`/`MempoolEvent`/`BlockEvent`/`PoolState`/`StateUpdateEvent`/`PoolKind` per `docs/specs/event-model.md` mandate; per-crate `rkyv_compat` adapters for alloy-primitives types.
+- [x] P3-B: `wire_phase3` + dual journal-drain consumer threads (`FileJournal<IngressEvent>` + `FileJournal<StateUpdateEvent>`); async `AppHandle3::shutdown` with `producer_task.abort(); .await` BEFORE bus drop / consumer join.
+- [x] P3-C: `crates/opportunity` UniV2 vs UniV3 0.05% Q64 cross-venue arb math; `OpportunityEngine::check` pure function emits `OpportunityEvent` iff price delta exceeds gas-floor threshold.
+- [x] P3-D: `crates/risk` sizing + budget gate per `docs/specs/risk-budget.md`; 6-variant `AbortCategory`; topology Option A (`tokio::sync::broadcast` with v0.2 fail-closed `RecvError::Lagged`) documented for P3-F implementation.
+- [x] P3-E: `crates/simulator` revm LOCAL pre-sim shim (DP-S1) per user-approved ADR-006 deferral; `LocalSimulator` deterministic pipeline + `ProfitSource::HeuristicPassthrough` provenance.
+- [x] P3-F: `crates/execution` pure-function `BundleConstructor` (intent-only; no signing/submission) + `wire_phase4` final wiring with topology Option A broadcast tee + the full opportunity → risk → simulator → execution driver chain + Phase 3 DoD audit + `phase-3-complete` annotated tag.
 
 ## Task Checklist (Phase 2 — all CLOSED)
 
@@ -100,7 +125,6 @@ The `.coordination/` directory is the file-based handoff channel between Claude 
 - The API reviewer watcher is a coordination/gate reviewer, not a full code reviewer. It may approve routine in-flight gates when its context includes sufficient repo evidence; high-risk implementation review may still need manual Codex review.
 - Start or restart the API reviewer watcher with `.coordination/scripts/start_codex_api_reviewer.ps1` (use `-Restart` to replace an existing watcher). Defaults: 180s poll, 600s reviewer timeout, `gpt-5.5`, reasoning `medium`.
 - `AGENTS.md` and `.claude/` are never staged.
-- No `git push` and no tag creation without explicit user approval.
-- User explicit approval is still required for fundamental scope changes, backend swaps, `CLAUDE.md` commits, `AGENTS.md` staging, pushes, and tags.
-- Codex approval is sufficient for routine in-flight gates already covered by the approved spec/plan: spec/ADR doc commits, workspace/scaffold commits, plan commits, and implementation commits per the approved plan.
+- Per the 2026-05-04 routine-closeout policy update, Codex APPROVED + an execution-note-documented target/scope is sufficient authorization for routine docs/plan/implementation commits, `git push origin master`, `phase-complete` annotated tag creation + push, `CLAUDE.md` phase wrap-up commits, and coordination-file updates. No user re-confirmation needed for those routine actions.
+- User explicit approval IS still required for: destructive git operations (force push / reset / rebase), branch or remote changes, ADR/scope/frozen-decision changes, live trading / relay submission / funded key / `live_send = true`, `.claude/` or `AGENTS.md` staging, Codex `REVISION REQUIRED` or `LOW` confidence outcomes, and the scope-defining first start of any new phase.
 - Normal workflow: Claude writes the current bounded report/request to `.coordination/claude_outbox.md`; Codex/API reviewer writes a verdict to `.coordination/codex_review.md`; Claude follows that verdict. Keep both files compact and live-state oriented.
