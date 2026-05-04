@@ -1,0 +1,22 @@
+[package]
+name = "rust-lmax-mev-execution"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Phase 3 P3-F bundle construction — pure-function BundleConstructor consuming SimulationOutcome (P3-E), emitting BundleCandidate (intent-to-submit only; Phase 4 lands BundleRelay)"
+
+[dependencies]
+rust-lmax-mev-types = { path = "../types" }
+rust-lmax-mev-state = { path = "../state" }
+rust-lmax-mev-opportunity = { path = "../opportunity" }
+rust-lmax-mev-risk = { path = "../risk" }
+rust-lmax-mev-simulator = { path = "../simulator" }
+alloy-primitives = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+rkyv = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
