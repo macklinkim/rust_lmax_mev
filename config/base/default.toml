@@ -22,6 +22,8 @@ log_format = "json"
 [journal]
 file_journal_path = "/var/lib/rust-lmax-mev/journal.log"
 rocksdb_snapshot_path = "/var/lib/rust-lmax-mev/snapshot"
+ingress_journal_path = "/var/lib/rust-lmax-mev/ingress.log"
+state_journal_path = "/var/lib/rust-lmax-mev/state.log"
 
 [bus]
 capacity = 65536

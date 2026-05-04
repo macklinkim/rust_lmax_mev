@@ -84,15 +84,29 @@ pub enum LogFormat {
     Pretty,
 }
 
-/// Journal section per ADR-003. Both paths are filesystem-bound; the
+/// Journal section per ADR-003. All paths are filesystem-bound; the
 /// crate does NOT validate existence at load time (that's the job of
 /// `crates/journal::FileJournal::open` and `RocksDbSnapshot::open`,
 /// which create or validate on first use).
+///
+/// Phase 3 P3-B additive: `ingress_journal_path` + `state_journal_path`
+/// store the per-payload journal files for `wire_phase3`'s journal-drain
+/// consumer threads (`FileJournal<IngressEvent>` and
+/// `FileJournal<StateUpdateEvent>`). The legacy `file_journal_path`
+/// remains the Phase 1 `wire()` `FileJournal<SmokeTestPayload>` path so
+/// the existing P1 app tests keep working unchanged.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JournalConfig {
     pub file_journal_path: PathBuf,
     pub rocksdb_snapshot_path: PathBuf,
+    /// Phase 3 P3-B: target file for `FileJournal<IngressEvent>`.
+    /// `Config::validate` rejects empty paths and exact equality with
+    /// the other journal paths (collisions would interleave records of
+    /// different payload types in the same file, breaking replay).
+    pub ingress_journal_path: PathBuf,
+    /// Phase 3 P3-B: target file for `FileJournal<StateUpdateEvent>`.
+    pub state_journal_path: PathBuf,
 }
 
 /// Event bus section per ADR-005. Capacity is a required tuning parameter
@@ -231,6 +245,16 @@ pub enum ConfigError {
     /// must be unique so per-pool snapshot keys do not collide.
     #[error("state.pools contains duplicate pool address {0}")]
     DuplicatePoolAddress(Address),
+
+    /// Phase 3 P3-B: a `journal.*_path` field is empty.
+    #[error("journal.{field} must be a non-empty path")]
+    EmptyJournalPath { field: &'static str },
+
+    /// Phase 3 P3-B: two `journal.*_path` fields point at the same file.
+    /// Mixing payload types in one journal file would interleave records
+    /// of different `T`s in `FileJournal<T>` and break replay.
+    #[error("journal paths must be distinct: {a} and {b} both point at the same file")]
+    DuplicateJournalPath { a: &'static str, b: &'static str },
 }
 
 impl Config {
@@ -299,6 +323,32 @@ impl Config {
                 }
             }
         }
+
+        // Phase 3 P3-B journal-path checks: each path must be non-empty
+        // and the three paths must point at distinct files (mixing
+        // payload types in one journal would interleave records of
+        // different `T` in `FileJournal<T>` and break replay).
+        let journal_paths: [(&'static str, &PathBuf); 3] = [
+            ("file_journal_path", &self.journal.file_journal_path),
+            ("ingress_journal_path", &self.journal.ingress_journal_path),
+            ("state_journal_path", &self.journal.state_journal_path),
+        ];
+        for (field, path) in &journal_paths {
+            if path.as_os_str().is_empty() {
+                return Err(ConfigError::EmptyJournalPath { field });
+            }
+        }
+        for (i, (field_a, path_a)) in journal_paths.iter().enumerate() {
+            for (field_b, path_b) in &journal_paths[i + 1..] {
+                if path_a == path_b {
+                    return Err(ConfigError::DuplicateJournalPath {
+                        a: field_a,
+                        b: field_b,
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -326,6 +376,8 @@ log_format = "json"
 [journal]
 file_journal_path = "/var/lib/lmax/journal.log"
 rocksdb_snapshot_path = "/var/lib/lmax/snapshot"
+ingress_journal_path = "/var/lib/lmax/ingress.log"
+state_journal_path = "/var/lib/lmax/state.log"
 
 [bus]
 capacity = 1024
@@ -395,6 +447,8 @@ log_format = "json"
 [journal]
 file_journal_path = "/tmp/journal.log"
 rocksdb_snapshot_path = "/tmp/snapshot"
+ingress_journal_path = "/tmp/ingress.log"
+state_journal_path = "/tmp/state.log"
 
 [bus]
 capacity = 64
@@ -439,6 +493,8 @@ log_format = "json"
 [journal]
 file_journal_path = "/tmp/journal.log"
 rocksdb_snapshot_path = "/tmp/snapshot"
+ingress_journal_path = "/tmp/ingress.log"
+state_journal_path = "/tmp/state.log"
 
 [bus]
 capacity = 0

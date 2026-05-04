@@ -19,6 +19,8 @@ log_format = "pretty"
 [journal]
 file_journal_path = "./.dev/journal.log"
 rocksdb_snapshot_path = "./.dev/snapshot"
+ingress_journal_path = "./.dev/ingress.log"
+state_journal_path = "./.dev/state.log"
 
 [bus]
 capacity = 1024

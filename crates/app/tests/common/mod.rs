@@ -43,6 +43,8 @@ pub fn make_config(tempdir: &std::path::Path) -> Config {
         journal: JournalConfig {
             file_journal_path: tempdir.join("journal.log"),
             rocksdb_snapshot_path: tempdir.join("snapshot"),
+            ingress_journal_path: tempdir.join("ingress.log"),
+            state_journal_path: tempdir.join("state.log"),
         },
         bus: BusConfig { capacity: 8 },
         ingress: IngressConfig {
