@@ -14,6 +14,7 @@ members = [
     "crates/replay",
     "crates/opportunity",
     "crates/risk",
+    "crates/simulator",
 ]
 
 [workspace.package]
@@ -75,3 +76,7 @@ alloy = { version = "0.8", default-features = false, features = [
 
 # Async streams (Phase 2 P2-A)
 futures = "0.3"
+
+# revm local pre-sim (Phase 3 P3-E; ADR-006 deferred-strict per
+# user-approved DP-S1; v0.2 plan pin). Default-features off; std-only.
+revm = { version = "14", default-features = false, features = ["std"] }

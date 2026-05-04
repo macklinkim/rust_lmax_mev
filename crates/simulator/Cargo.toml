@@ -1,0 +1,22 @@
+[package]
+name = "rust-lmax-mev-simulator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Phase 3 P3-E LOCAL revm pre-sim shim — DP-S1 deterministic pipeline proof per user-approved ADR-006 deferral; ProfitSource::HeuristicPassthrough until P4 swaps in real Uniswap bytecode + state"
+
+[dependencies]
+rust-lmax-mev-types = { path = "../types" }
+rust-lmax-mev-state = { path = "../state" }
+rust-lmax-mev-opportunity = { path = "../opportunity" }
+rust-lmax-mev-risk = { path = "../risk" }
+alloy-primitives = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+rkyv = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+revm = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
