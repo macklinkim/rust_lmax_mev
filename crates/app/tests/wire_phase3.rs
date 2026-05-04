@@ -129,6 +129,8 @@ fn journal_drain_consumer_joins_after_bus_drop() {
 /// refactors that demote shutdown back to a sync method (which would
 /// re-introduce the Codex 16:00:13 hang risk).
 #[allow(dead_code)]
-fn _assert_async_shutdown(h: AppHandle3) -> impl std::future::Future<Output = Result<(), AppError>> {
+fn _assert_async_shutdown(
+    h: AppHandle3,
+) -> impl std::future::Future<Output = Result<(), AppError>> {
     h.shutdown()
 }
