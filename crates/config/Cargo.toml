@@ -11,6 +11,7 @@ config = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 alloy-primitives = { workspace = true, features = ["serde"] }
+rkyv = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

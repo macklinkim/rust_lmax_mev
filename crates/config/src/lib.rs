@@ -150,7 +150,18 @@ pub struct PoolConfig {
     pub address: Address,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Deserialize,
+    Serialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum PoolKind {
     #[serde(rename = "uniswap_v2")]
     UniswapV2,

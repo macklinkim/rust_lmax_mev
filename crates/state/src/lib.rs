@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 pub use rust_lmax_mev_config::{PoolConfig, PoolKind};
 
 mod decode;
+pub mod rkyv_compat;
 
 // --- selectors (keccak256 of canonical signature, first 4 bytes) ---------
 pub const SELECTOR_GET_RESERVES: [u8; 4] = [0x09, 0x02, 0xf1, 0xac];
@@ -58,9 +59,20 @@ impl EthCaller for NodeEthCaller {
 
 /// Pool identity carried inside `StateUpdateEvent` and used as the
 /// per-pool key axis in `RocksDbSnapshot`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct PoolId {
     pub kind: PoolKind,
+    #[rkyv(with = crate::rkyv_compat::AddressAsBytes)]
     pub address: Address,
 }
 
@@ -75,14 +87,27 @@ impl From<&PoolConfig> for PoolId {
 
 /// Pool reserves snapshot. Persisted to RocksDB via bincode; emitted
 /// in `StateUpdateEvent`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum PoolState {
     UniV2 {
+        #[rkyv(with = crate::rkyv_compat::U256AsBytes)]
         reserve0: U256,
+        #[rkyv(with = crate::rkyv_compat::U256AsBytes)]
         reserve1: U256,
         block_timestamp_last: u32,
     },
     UniV3 {
+        #[rkyv(with = crate::rkyv_compat::U256AsBytes)]
         sqrt_price_x96: U256,
         tick: i32,
         liquidity: u128,
@@ -91,9 +116,20 @@ pub enum PoolState {
 
 /// Event emitted on the state→opportunity bus per ADR-005 (Phase 2
 /// has no consumer past P2-D wiring).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct StateUpdateEvent {
     pub block_number: u64,
+    #[rkyv(with = crate::rkyv_compat::B256AsBytes)]
     pub block_hash: B256,
     pub pool: PoolId,
     pub state: PoolState,
