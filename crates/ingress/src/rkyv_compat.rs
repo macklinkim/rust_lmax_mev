@@ -26,7 +26,7 @@ impl ArchiveWith<B256> for B256AsBytes {
     type Resolver = <[u8; 32] as Archive>::Resolver;
 
     fn resolve_with(field: &B256, resolver: Self::Resolver, out: Place<Self::Archived>) {
-        let bytes: [u8; 32] = field.0.into();
+        let bytes: [u8; 32] = field.0;
         bytes.resolve(resolver, out);
     }
 }
@@ -36,7 +36,7 @@ where
     [u8; 32]: Serialize<S>,
 {
     fn serialize_with(field: &B256, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
-        let bytes: [u8; 32] = field.0.into();
+        let bytes: [u8; 32] = field.0;
         bytes.serialize(serializer)
     }
 }
@@ -48,7 +48,7 @@ impl<D: Fallible + ?Sized> DeserializeWith<<[u8; 32] as Archive>::Archived, B256
         field: &<[u8; 32] as Archive>::Archived,
         _deserializer: &mut D,
     ) -> Result<B256, D::Error> {
-        let bytes: [u8; 32] = (*field).into();
+        let bytes: [u8; 32] = *field;
         Ok(B256::from(bytes))
     }
 }
@@ -83,7 +83,7 @@ impl<D: Fallible + ?Sized> DeserializeWith<<[u8; 20] as Archive>::Archived, Addr
         field: &<[u8; 20] as Archive>::Archived,
         _deserializer: &mut D,
     ) -> Result<Address, D::Error> {
-        let bytes: [u8; 20] = (*field).into();
+        let bytes: [u8; 20] = *field;
         Ok(Address::from(bytes))
     }
 }
@@ -118,7 +118,7 @@ impl<D: Fallible + ?Sized> DeserializeWith<<[u8; 32] as Archive>::Archived, U256
         field: &<[u8; 32] as Archive>::Archived,
         _deserializer: &mut D,
     ) -> Result<U256, D::Error> {
-        let bytes: [u8; 32] = (*field).into();
+        let bytes: [u8; 32] = *field;
         Ok(U256::from_be_bytes(bytes))
     }
 }

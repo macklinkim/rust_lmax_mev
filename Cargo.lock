@@ -3369,6 +3369,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "config",
+ "rkyv",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
@@ -3487,6 +3488,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "parking_lot",
+ "rkyv",
  "rust-lmax-mev-config",
  "rust-lmax-mev-journal",
  "rust-lmax-mev-node",

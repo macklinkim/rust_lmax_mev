@@ -41,11 +41,11 @@ fn file_journal_round_trips_ingress_envelope() {
     journal.append(&envelope).expect("append");
     journal.flush().expect("flush");
 
-    let read: Vec<EventEnvelope<IngressEvent>> = journal
-        .iter_all()
-        .map(|r| r.expect("iter ok"))
-        .collect();
+    let read: Vec<EventEnvelope<IngressEvent>> =
+        journal.iter_all().map(|r| r.expect("iter ok")).collect();
     assert_eq!(read.len(), 1);
     assert_eq!(read[0], envelope);
-    read[0].validate().expect("envelope passes Phase 1 invariants after round-trip");
+    read[0]
+        .validate()
+        .expect("envelope passes Phase 1 invariants after round-trip");
 }
