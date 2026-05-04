@@ -18,6 +18,10 @@ rust-lmax-mev-observability = { path = "../observability" }
 rust-lmax-mev-node = { path = "../node" }
 rust-lmax-mev-ingress = { path = "../ingress" }
 rust-lmax-mev-state = { path = "../state" }
+rust-lmax-mev-opportunity = { path = "../opportunity" }
+rust-lmax-mev-risk = { path = "../risk" }
+rust-lmax-mev-simulator = { path = "../simulator" }
+rust-lmax-mev-execution = { path = "../execution" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
