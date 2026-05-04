@@ -24,9 +24,9 @@ use std::time::Duration;
 use alloy::eips::BlockId;
 use alloy::network::Ethereum;
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+use alloy::rpc::types::eth::EIP1186AccountProofResponse;
 use alloy::rpc::types::eth::{Filter, Header, Log, Transaction, TransactionRequest};
 use alloy::transports::http::{Client as ReqwestClient, Http};
-use alloy::rpc::types::eth::EIP1186AccountProofResponse;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use async_trait::async_trait;
 use futures::Stream;
@@ -143,11 +143,7 @@ impl HttpRpc for AlloyHttp {
             .map_err(classify)
     }
 
-    async fn eth_get_code(
-        &self,
-        address: Address,
-        block_id: BlockId,
-    ) -> Result<Bytes, NodeError> {
+    async fn eth_get_code(&self, address: Address, block_id: BlockId) -> Result<Bytes, NodeError> {
         self.0
             .get_code_at(address)
             .block_id(block_id)
@@ -800,7 +796,8 @@ mod tests {
     /// the get_code happy path AND inject `Transport` errors for the
     /// no-fallback assertion (N4A-3).
     struct MockArchiveProofCode {
-        proof_outcome: Box<dyn Fn(usize) -> Result<EIP1186AccountProofResponse, NodeError> + Send + Sync>,
+        proof_outcome:
+            Box<dyn Fn(usize) -> Result<EIP1186AccountProofResponse, NodeError> + Send + Sync>,
         code_outcome: Box<dyn Fn(usize) -> Result<Bytes, NodeError> + Send + Sync>,
         proof_calls: Arc<AtomicUsize>,
         code_calls: Arc<AtomicUsize>,
@@ -936,9 +933,7 @@ mod tests {
     #[tokio::test]
     async fn eth_get_code_round_trips_empty_bytes() {
         let (archive, _, code_calls) = MockArchiveProofCode::new(
-            |_| {
-                Err(NodeError::Rpc("proof not exercised in this test".into()))
-            },
+            |_| Err(NodeError::Rpc("proof not exercised in this test".into())),
             |_| Ok(Bytes::new()),
         );
         let (primary, _) = MockHttp::new(|_| Ok(Bytes::from_static(b"NEVER")));
