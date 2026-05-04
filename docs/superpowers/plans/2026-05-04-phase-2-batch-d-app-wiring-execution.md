@@ -1,7 +1,7 @@
 # Phase 2 Batch D — App Wiring + Final DoD Audit + `phase-2-complete` Tag Draft
 
 **Date:** 2026-05-04
-**Status:** Draft v0.2 (revised after user 2026-05-04 KST self-check directive: split `wire` / `wire_phase2` to dodge the runtime-lifetime trap; added §Risks naming runtime-lifetime + config-TOML-schema mismatch.)
+**Status:** Draft v0.3 (post-impl amendment: Risks gains an `IngressEvent` rkyv-gap entry; §Wiring delta drops the journal-draining consumer thread that v0.2 promised. Discovered during commit-2 implementation.) — v0.2 (revised after user 2026-05-04 KST self-check directive: split `wire` / `wire_phase2` to dodge the runtime-lifetime trap; added §Risks naming runtime-lifetime + config-TOML-schema mismatch.)
 **Predecessor:** P2-C closed at `239ea86` (Codex APPROVED MEDIUM 2026-05-02 22:06:29 +09:00).
 **Authoritative sources:** ADR-001 (Phase 2 EXIT gates), ADR-003 / 005 / 007, frozen `docs/specs/`, Phase 2 overview note.
 
@@ -29,17 +29,19 @@ pub async fn wire_phase2(
 Inside `wire_phase2`:
 
 - `observability::init` (gated by `WireOptions.init_observability` as P1).
-- `FileJournal::open(&config.journal.file_journal_path)`.
-- `RocksDbSnapshot::open(&config.journal.rocksdb_snapshot_path)`.
 - `NodeProvider::connect(&config.node).await`.
+- `RocksDbSnapshot::open(&config.journal.rocksdb_snapshot_path)`.
 - `pools = config.state.pools.iter().map(PoolId::from).collect()`.
 - `StateEngine::new(Arc::new(provider_handle), Arc::new(snapshot), pools)`.
 - `CrossbeamBoundedBus::<IngressEvent>::new(config.bus.capacity)?`.
-- Spawn the same blocking journal-drain consumer thread but typed on
-  `IngressEvent` (P1's loop is reused with the new payload).
 
-`AppHandle2` holds `bus`, `consumer_thread`, `provider`, `engine`. No
-producer-side spawn (DP-2 default — Phase 3 owns the pipeline).
+v0.3 amendment: NO `FileJournal<IngressEvent>::open` and NO
+journal-drain consumer thread are constructed (see §Risks
+"`IngressEvent` is not `rkyv::Archive`").
+
+`AppHandle2` holds `bus`, held `_consumer`, `provider`, `engine`. No
+producer-side spawn (DP-2 default — Phase 3 owns the pipeline). No
+consumer thread either.
 
 `pub fn run(config_path)` builds a `multi_thread` tokio runtime,
 `block_on`s `wire_phase2`, `block_on`s `ctrl_c`, then `handle.shutdown()`,
@@ -69,6 +71,17 @@ path-deps `rust-lmax-mev-node`, `rust-lmax-mev-ingress`,
   default.toml` fails immediately. **Mitigation:** DP-3 (commit 4)
   rewrites all three to a valid Phase 2 schema with placeholder Geth
   URLs + real Uniswap V2 USDC/WETH + V3 0.05% pool addresses.
+- **`IngressEvent` is not `rkyv::Archive`** (v0.3, post-impl). A
+  `FileJournal<IngressEvent>::append` would not type-check: the
+  journal's `append` requires `T: rkyv::Archive + Serialize<...>` and
+  `IngressEvent` (in P2-A-frozen `crates/ingress`) carries no such
+  derives. **Mitigation:** P2-D's `wire_phase2` builds NEITHER a
+  `FileJournal<IngressEvent>` NOR a journal-drain consumer thread —
+  symmetric with DP-2 (no producer spawn). The bus producer + held
+  consumer handle live inside `AppHandle2` so Phase 3 can swap in both
+  ends without changing the `wire_phase2` surface. Phase 3 will need to
+  add rkyv derives to `IngressEvent` (one-shot additive edit to the
+  P2-A-frozen crate) or split the bus payload type.
 
 ## Test matrix (lean)
 
@@ -83,12 +96,13 @@ path-deps `rust-lmax-mev-node`, `rust-lmax-mev-ingress`,
 
 Workspace cumulative: 69 → **71** in CI (+1 ignored unchanged).
 
-## Commit grouping (4 commits)
+## Commit grouping (5 commits — v0.3)
 
-1. `docs: add Phase 2 Batch D app wiring + DoD audit + phase-2-complete tag draft`
-2. `feat(app): add wire_phase2 + AppError Node/State variants + runtime in run`
-3. `test(app): D-1 + D-2 P2-D wiring tests`
-4. `chore(config): refresh sample TOMLs to current Phase 2 schema`
+1. `docs: add Phase 2 Batch D app wiring + DoD audit + phase-2-complete tag draft` (v0.2 of this note).
+2. `feat(app): add wire_phase2 + AppError Node/State variants + runtime in run`.
+3. `test(app): D-1 + D-2 P2-D wire_phase2 tests`.
+4. `chore(config): refresh sample TOMLs to current Phase 2 schema`.
+5. `docs: amend Batch D note for IngressEvent rkyv-gap discovery (v0.3)` — this amendment.
 
 Targeted `cargo test -p rust-lmax-mev-app` per code commit; full
 workspace gates (target 71 tests + fmt + clippy + doc + cargo deny)

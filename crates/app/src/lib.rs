@@ -239,10 +239,7 @@ impl AppHandle2 {
 /// is not `rkyv::Archive` today). The bus producer + held consumer
 /// handle are returned in `AppHandle2` so Phase 3 can swap in both ends
 /// without the wire surface changing.
-pub async fn wire_phase2(
-    config: &Config,
-    opts: WireOptions,
-) -> Result<AppHandle2, AppError> {
+pub async fn wire_phase2(config: &Config, opts: WireOptions) -> Result<AppHandle2, AppError> {
     if opts.init_observability {
         let _obs = rust_lmax_mev_observability::init(&config.observability)?;
     }
@@ -252,11 +249,7 @@ pub async fn wire_phase2(
         &config.journal.rocksdb_snapshot_path,
     )?);
     let pools: Vec<PoolId> = config.state.pools.iter().map(PoolId::from).collect();
-    let engine = Arc::new(StateEngine::new(
-        Arc::clone(&provider),
-        snapshot,
-        pools,
-    ));
+    let engine = Arc::new(StateEngine::new(Arc::clone(&provider), snapshot, pools));
 
     let (bus, consumer) = CrossbeamBoundedBus::<IngressEvent>::new(config.bus.capacity)?;
 

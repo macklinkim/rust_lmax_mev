@@ -3348,6 +3348,7 @@ dependencies = [
 name = "rust-lmax-mev-app"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "rust-lmax-mev-config",
  "rust-lmax-mev-event-bus",
  "rust-lmax-mev-ingress",
