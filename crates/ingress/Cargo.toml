@@ -23,3 +23,5 @@ parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+rust-lmax-mev-journal = { path = "../journal" }
+tempfile = "3"

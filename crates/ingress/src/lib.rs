@@ -29,6 +29,8 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use rust_lmax_mev_node::{NodeError, NodeProvider};
 
+pub mod rkyv_compat;
+
 const DEDUP_CAPACITY: usize = 4096;
 
 /// Object-safe mempool stream contract. Production impl is
@@ -168,19 +170,49 @@ impl Normalizer {
 
 /// Phase 2 ingress→state payload sum type per ADR-005 (single bus per
 /// pipeline-stage boundary).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum IngressEvent {
     Mempool(MempoolEvent),
     Block(BlockEvent),
 }
 
 /// Normalized mempool transaction event. Field shape per P2-A v0.4.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Phase 3 P3-A spec compliance: alloy-bound fields use the per-crate
+/// [`rkyv_compat`] adapters so the public API surface (alloy newtypes)
+/// stays unchanged while the rkyv-archived form uses canonical byte
+/// arrays / `Vec<u8>`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct MempoolEvent {
+    #[rkyv(with = crate::rkyv_compat::B256AsBytes)]
     pub tx_hash: B256,
+    #[rkyv(with = crate::rkyv_compat::AddressAsBytes)]
     pub from: Address,
+    #[rkyv(with = rkyv::with::Map<crate::rkyv_compat::AddressAsBytes>)]
     pub to: Option<Address>,
+    #[rkyv(with = crate::rkyv_compat::U256AsBytes)]
     pub value: U256,
+    #[rkyv(with = crate::rkyv_compat::BytesAsVec)]
     pub input: Bytes,
     pub gas_limit: u64,
     pub max_fee: u128,
@@ -188,10 +220,22 @@ pub struct MempoolEvent {
 }
 
 /// New-block header event. Field shape per P2-A v0.4.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct BlockEvent {
     pub block_number: u64,
+    #[rkyv(with = crate::rkyv_compat::B256AsBytes)]
     pub block_hash: B256,
+    #[rkyv(with = crate::rkyv_compat::B256AsBytes)]
     pub parent_hash: B256,
     pub timestamp_ns: u64,
 }
