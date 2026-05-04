@@ -18,7 +18,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 rkyv = { workspace = true }
-lru = "0.12"
+lru = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]

@@ -3729,6 +3729,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-lmax-mev-state-fetcher"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "async-trait",
+ "lru",
+ "metrics",
+ "parking_lot",
+ "rust-lmax-mev-node",
+ "rust-lmax-mev-state",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "rust-lmax-mev-types"
 version = "0.1.0"
 dependencies = [

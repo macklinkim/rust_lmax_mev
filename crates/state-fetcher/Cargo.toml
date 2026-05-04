@@ -1,0 +1,21 @@
+[package]
+name = "rust-lmax-mev-state-fetcher"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Phase 4 P4-B archive-state loader feeding real revm — StateFetcher trait + ArchiveStateFetcher + LRU caches + storage-key helpers"
+
+[dependencies]
+rust-lmax-mev-state = { path = "../state" }
+rust-lmax-mev-node = { path = "../node" }
+alloy = { workspace = true }
+alloy-primitives = { workspace = true }
+async-trait = "0.1"
+lru = { workspace = true }
+parking_lot = { workspace = true }
+metrics = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
