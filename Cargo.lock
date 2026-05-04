@@ -3453,6 +3453,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-lmax-mev-opportunity"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "rkyv",
+ "rust-lmax-mev-config",
+ "rust-lmax-mev-state",
+ "rust-lmax-mev-types",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "rust-lmax-mev-replay"
 version = "0.1.0"
 dependencies = [

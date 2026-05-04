@@ -12,6 +12,7 @@ members = [
     "crates/ingress",
     "crates/state",
     "crates/replay",
+    "crates/opportunity",
 ]
 
 [workspace.package]
