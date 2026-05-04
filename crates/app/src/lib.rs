@@ -869,13 +869,9 @@ async fn opportunity_driver(
                             let pa = &a.payload().pool;
                             let pb = &b.payload().pool;
                             let cc = a.chain_context();
-                            if let Some(opp_event) = opp_engine.check(
-                                cc,
-                                pa,
-                                &a.payload().state,
-                                pb,
-                                &b.payload().state,
-                            ) {
+                            if let Some(opp_event) =
+                                opp_engine.check(cc, pa, &a.payload().state, pb, &b.payload().state)
+                            {
                                 if let Some(env) = seal_envelope(
                                     EventSource::OpportunityEngine,
                                     opp_event,
@@ -925,7 +921,11 @@ async fn risk_driver(
                 }
             },
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::error!(consumer = "risk-driver", skipped = n, "broadcast lagged; aborting");
+                tracing::error!(
+                    consumer = "risk-driver",
+                    skipped = n,
+                    "broadcast lagged; aborting"
+                );
                 break;
             }
             Err(broadcast::error::RecvError::Closed) => break,
@@ -952,7 +952,11 @@ async fn simulator_driver(
                 }
             },
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::error!(consumer = "simulator-driver", skipped = n, "broadcast lagged; aborting");
+                tracing::error!(
+                    consumer = "simulator-driver",
+                    skipped = n,
+                    "broadcast lagged; aborting"
+                );
                 break;
             }
             Err(broadcast::error::RecvError::Closed) => break,
@@ -979,7 +983,11 @@ async fn execution_driver(
                 }
             },
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::error!(consumer = "execution-driver", skipped = n, "broadcast lagged; aborting");
+                tracing::error!(
+                    consumer = "execution-driver",
+                    skipped = n,
+                    "broadcast lagged; aborting"
+                );
                 break;
             }
             Err(broadcast::error::RecvError::Closed) => break,

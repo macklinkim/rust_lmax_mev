@@ -154,8 +154,7 @@ impl BundleConstructor {
 
         // gas_bid = profit * fraction_bps / 10_000. U256-safe; both
         // operands fit U256, multiplication is U256-multiplication.
-        let bid = outcome.simulated_profit_wei
-            * U256::from(self.cfg.fixed_bid_fraction_bps)
+        let bid = outcome.simulated_profit_wei * U256::from(self.cfg.fixed_bid_fraction_bps)
             / U256::from(10_000u32);
         if bid.is_zero() {
             return Err(aborted(AbortReason::BidRoundsToZero));
