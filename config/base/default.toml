@@ -14,6 +14,18 @@ geth_http_url = "http://127.0.0.1:8545"
 url = "https://eth-mainnet.g.alchemy.com/v2/REPLACE_ME"
 label = "alchemy"
 
+# Phase 4 P4-A archive node RPC (ADR-007). OPTIONAL — defaults to None
+# (fail-closed). Operator must uncomment + supply a real archive endpoint
+# (Alchemy/Infura archive plan, or local archive-mode Geth) before any
+# Phase 4 archive-mode read (eth_get_proof / eth_get_storage_at /
+# eth_get_code) can succeed. Without this, those calls return
+# Err(NodeError::ArchiveNotConfigured); they NEVER fall back to the
+# primary HTTP endpoint above (silent fallback to a non-archive node
+# would produce wrong historical answers).
+# [node.archive_rpc]
+# url = "https://eth-archive.g.alchemy.com/v2/REPLACE_ME"
+# label = "alchemy-archive"
+
 [observability]
 prometheus_listen = "0.0.0.0:9090"
 log_filter = "info"

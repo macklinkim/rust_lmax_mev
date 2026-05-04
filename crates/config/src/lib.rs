@@ -43,6 +43,13 @@ pub struct Config {
 
 /// Node topology section per ADR-007. Primary Geth WS + HTTP plus at least
 /// one fallback HTTP provider URL.
+///
+/// Phase 4 P4-A additive: `archive_rpc` defaults `None` (fail-closed per
+/// the Q8 hardening invariant). When unset, every `NodeProvider`
+/// archive method (`eth_get_proof` / `eth_get_storage_at` /
+/// `eth_get_code`) returns `Err(NodeError::ArchiveNotConfigured)` —
+/// never falls back to `geth_http_url` because a non-archive node
+/// would silently produce wrong historical answers.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
@@ -52,6 +59,11 @@ pub struct NodeConfig {
     /// `Config::validate` (called from `load` and `from_toml_str`) rejects
     /// an empty list with `ConfigError::MissingFallbackRpc`.
     pub fallback_rpc: Vec<FallbackRpcConfig>,
+    /// Phase 4 P4-A archive RPC endpoint per ADR-007 §"Archive access"
+    /// ("required" at Phase 4). Defaults `None` (fail-closed); operator
+    /// must explicitly configure to enable archive-mode reads.
+    #[serde(default)]
+    pub archive_rpc: Option<FallbackRpcConfig>,
 }
 
 /// One fallback HTTP RPC provider entry per ADR-007.
@@ -554,5 +566,71 @@ address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
         // Other fields unaffected by the overlay.
         assert_eq!(cfg.node.fallback_rpc.len(), 1);
         assert_eq!(cfg.observability.log_format, LogFormat::Json);
+    }
+
+    /// C4A-1 (Phase 4 P4-A): `archive_rpc` is OPTIONAL — the existing
+    /// minimum-valid TOML (no `[node.archive_rpc]` block) parses
+    /// successfully and sets `archive_rpc = None`. Confirms the
+    /// fail-closed default per Q8 hardening invariant.
+    #[test]
+    fn archive_rpc_optional_in_minimum_toml() {
+        let cfg = Config::from_toml_str(valid_minimum_toml())
+            .expect("minimum valid TOML must parse without [node.archive_rpc]");
+        assert!(
+            cfg.node.archive_rpc.is_none(),
+            "archive_rpc must default to None per fail-closed Q8 invariant"
+        );
+    }
+
+    /// C4A-1 (positive): when an operator DOES configure
+    /// `[node.archive_rpc]`, the URL + label are parsed correctly.
+    #[test]
+    fn archive_rpc_parses_when_configured() {
+        let toml = r#"
+[node]
+geth_ws_url = "ws://localhost:8546"
+geth_http_url = "http://localhost:8545"
+
+[[node.fallback_rpc]]
+url = "https://eth-mainnet.g.alchemy.com/v2/demo"
+label = "alchemy"
+
+[node.archive_rpc]
+url = "https://eth-archive.example/v2/demo"
+label = "alchemy-archive"
+
+[observability]
+prometheus_listen = "0.0.0.0:9090"
+log_filter = "info"
+log_format = "json"
+
+[journal]
+file_journal_path = "/tmp/journal.log"
+rocksdb_snapshot_path = "/tmp/snapshot"
+ingress_journal_path = "/tmp/ingress.log"
+state_journal_path = "/tmp/state.log"
+
+[bus]
+capacity = 64
+
+[ingress.tokens]
+weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+
+[ingress]
+watched_addresses = ["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"]
+
+[[state.pools]]
+kind = "uniswap_v2"
+address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
+"#;
+        let cfg = Config::from_toml_str(toml).expect("TOML with archive_rpc must parse");
+        let archive = cfg
+            .node
+            .archive_rpc
+            .as_ref()
+            .expect("archive_rpc must be Some when configured");
+        assert_eq!(archive.url, "https://eth-archive.example/v2/demo");
+        assert_eq!(archive.label, "alchemy-archive");
     }
 }

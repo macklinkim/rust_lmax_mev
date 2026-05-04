@@ -34,6 +34,7 @@ pub fn make_config(tempdir: &std::path::Path) -> Config {
                 url: "http://localhost:8545".to_string(),
                 label: "local".to_string(),
             }],
+            archive_rpc: None,
         },
         observability: ObservabilityConfig {
             prometheus_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
