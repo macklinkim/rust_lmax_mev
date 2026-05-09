@@ -64,6 +64,10 @@ const WETH9: Address = address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
 const USDC_PROXY: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
 const V2_WETH_USDC: Address = address!("b4e16d0168e52d35cacd2c6185b44281ec28c9dc");
 const V3_005_WETH_USDC: Address = address!("88e6a0c2ddd26feeb64f039a2c41296fcb3f5640");
+/// UniswapV2Factory at the canonical mainnet address. `_mintFee` in
+/// every V2 swap calls `IUniswapV2Factory(factory).feeTo()` which
+/// reads the factory's slot 0 (the `feeTo` address).
+const V2_FACTORY: Address = address!("5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f");
 
 /// `MOCK_ROUTER_ADDRESS` placeholder used by P4-C2 LocalSimulator real-revm
 /// path. Public test marker (not derived from a key); duplicated here so
@@ -176,8 +180,18 @@ async fn main() -> ExitCode {
     println!("// MissingStorage error for an unrecorded slot.");
     println!();
 
-    // 5. V2 pool.
-    let v2 = match fetcher
+    // 5. V2 pool. UniswapV2Layout returns slots {0,6,7,8}; we
+    //    additionally fetch slots {9,10,11,12} which UniswapV2Pair.swap
+    //    reads via _update / _mintFee / lock modifier:
+    //    - slot 9 price0CumulativeLast (read in _update if timeElapsed > 0)
+    //    - slot 10 price1CumulativeLast (same)
+    //    - slot 11 kLast (read by _mintFee)
+    //    - slot 12 unlocked (read by lock modifier)
+    //    LocalSimulator can avoid slot 9/10 reads by setting
+    //    block.timestamp to the fixture's blockTimestampLast, but
+    //    we record them anyway so the StrictMissingDb has the
+    //    populated slot regardless of the timestamp choice.
+    let mut v2 = match fetcher
         .fetch_pool(&pool_id_v2(), block_hash, &UniswapV2Layout)
         .await
     {
@@ -187,6 +201,22 @@ async fn main() -> ExitCode {
             return ExitCode::from(4);
         }
     };
+    let v2_extra_slots: Vec<U256> = (9u64..=12).map(U256::from).collect();
+    let v2_extra = match fetcher
+        .fetch_account(V2_WETH_USDC, &v2_extra_slots, block_hash)
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: V2 extra-slot fetch failed: {e}");
+            return ExitCode::from(4);
+        }
+    };
+    // Merge v2_extra.storage into v2.pool_storage and re-sort.
+    for (slot, value) in v2_extra.storage {
+        v2.pool_storage.push((slot, value));
+    }
+    v2.pool_storage.sort_by_key(|(s, _)| *s);
     print_pool_const("V2_WETH_USDC", &v2);
 
     // 6. V3 0.05% pool.
@@ -297,7 +327,23 @@ async fn main() -> ExitCode {
     };
     print_account_const("USDC_IMPL", &usdc_impl);
 
-    // 10. Footer (stderr; doesn't go into fixtures).
+    // 10. UniswapV2Factory. Slot 0 = `feeTo` address (zero on
+    //     mainnet). Loaded so V2 swap's `_mintFee` external CALL to
+    //     `IUniswapV2Factory(factory).feeTo()` resolves cleanly under
+    //     StrictMissingDb.
+    let v2_factory = match fetcher
+        .fetch_account(V2_FACTORY, &[U256::from(0u64)], block_hash)
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: V2 factory fetch failed: {e}");
+            return ExitCode::from(4);
+        }
+    };
+    print_account_const("V2_FACTORY", &v2_factory);
+
+    // 11. Footer (stderr; doesn't go into fixtures).
     eprintln!();
     eprintln!("done. Pasted constants live at crates/simulator/src/fixtures.rs.");
     eprintln!("If P4-C2 T-USDC-1 reports a MissingStorage error for an unrecorded");
