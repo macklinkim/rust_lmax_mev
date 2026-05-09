@@ -9,6 +9,7 @@ description = "Phase 3 P3-E LOCAL revm pre-sim shim — DP-S1 deterministic pipe
 [dependencies]
 rust-lmax-mev-types = { path = "../types" }
 rust-lmax-mev-state = { path = "../state" }
+rust-lmax-mev-state-fetcher = { path = "../state-fetcher" }
 rust-lmax-mev-opportunity = { path = "../opportunity" }
 rust-lmax-mev-risk = { path = "../risk" }
 alloy-primitives = { workspace = true, features = ["serde"] }

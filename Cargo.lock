@@ -3688,6 +3688,7 @@ dependencies = [
  "rust-lmax-mev-opportunity",
  "rust-lmax-mev-risk",
  "rust-lmax-mev-state",
+ "rust-lmax-mev-state-fetcher",
  "rust-lmax-mev-types",
  "serde",
  "tempfile",

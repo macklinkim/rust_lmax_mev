@@ -19,7 +19,10 @@
 //! No relay sim, no submission, no live mainnet, no funded key. Phase 4
 //! adds those alongside `BundleRelay` per ADR-002 + ADR-006.
 
+pub mod cache_db_builder;
 pub mod rkyv_compat;
+pub mod strict_db;
+pub mod swap_calldata;
 
 use alloy_primitives::U256;
 use revm::db::{CacheDB, EmptyDB};
