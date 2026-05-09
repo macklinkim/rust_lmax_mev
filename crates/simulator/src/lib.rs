@@ -20,6 +20,8 @@
 //! adds those alongside `BundleRelay` per ADR-002 + ADR-006.
 
 pub mod cache_db_builder;
+pub mod fixtures;
+pub mod mock_router;
 pub mod rkyv_compat;
 pub mod strict_db;
 pub mod swap_calldata;
