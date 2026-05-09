@@ -85,6 +85,14 @@ pub const V2_RESERVES_SLOT: u64 = 8;
 /// router's bytecode).
 pub const TEST_EOA_CALLER: Address = Address::new([0xee; 20]);
 
+/// Canonical mainnet UniswapV2Factory address. Used by `prefetch_for`
+/// to fetch the factory account fixture; mirrored in
+/// `dump_fixture.rs`.
+pub const V2_FACTORY_ADDRESS: Address = Address::new([
+    0x5c, 0x69, 0xbe, 0xe7, 0x01, 0xef, 0x81, 0x4a, 0x2b, 0x6a, 0x3e, 0xdd, 0x4b, 0x16, 0x52, 0xcb,
+    0x9c, 0xc5, 0xaa, 0x6f,
+]);
+
 /// Deterministic LOCAL simulation configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimConfig {
@@ -199,6 +207,13 @@ pub struct FixtureSet {
     pub weth: FetchedAccount,
     pub usdc_proxy: FetchedAccount,
     pub usdc_impl: FetchedAccount,
+    /// UniswapV2Factory account. Required so V2 swap's `_mintFee`
+    /// external CALL `IUniswapV2Factory(factory).feeTo()` resolves
+    /// cleanly under StrictMissingDb. Carries factory code + slot 0
+    /// (`feeTo` address). Always required even if neither pool is V2
+    /// — the cost of always-loading is one extra account; the cost
+    /// of conditionally loading is significant complexity.
+    pub v2_factory: FetchedAccount,
 }
 
 /// LOCAL real-revm pre-sim engine.
@@ -261,6 +276,7 @@ impl LocalSimulator {
         weth: FetchedAccount,
         usdc_proxy: FetchedAccount,
         usdc_impl: FetchedAccount,
+        v2_factory: FetchedAccount,
     ) -> Result<(), SimulationError> {
         let bh = source.block_hash;
         for (name, hash) in [
@@ -268,6 +284,7 @@ impl LocalSimulator {
             ("weth", weth.block_hash),
             ("usdc_proxy", usdc_proxy.block_hash),
             ("usdc_impl", usdc_impl.block_hash),
+            ("v2_factory", v2_factory.block_hash),
         ] {
             if hash != bh {
                 return Err(SimulationError::Setup(format!(
@@ -282,6 +299,7 @@ impl LocalSimulator {
             weth,
             usdc_proxy,
             usdc_impl,
+            v2_factory,
         });
         Ok(())
     }
@@ -332,7 +350,10 @@ impl LocalSimulator {
         let usdc_impl = fetcher
             .fetch_account(impl_addr, &[], opp.block_hash)
             .await?;
-        self.load_fixture(source, sink, weth, usdc_proxy, usdc_impl)
+        let v2_factory = fetcher
+            .fetch_account(V2_FACTORY_ADDRESS, &[U256::from(0u64)], opp.block_hash)
+            .await?;
+        self.load_fixture(source, sink, weth, usdc_proxy, usdc_impl, v2_factory)
     }
 
     /// Runs the real-revm pipeline for the given checked opportunity.
@@ -397,6 +418,7 @@ impl LocalSimulator {
             weth_fixture,
             fixtures.usdc_proxy.clone(),
             fixtures.usdc_impl.clone(),
+            fixtures.v2_factory.clone(),
         ];
 
         let aux = AuxiliaryAccounts {
@@ -434,7 +456,15 @@ impl LocalSimulator {
         )?;
 
         // ---- Execute swap-1 ----
-        let mut evm = build_evm(db, &self.cfg, opp.block_number);
+        // block.timestamp = V2 pair's blockTimestampLast so
+        // UniswapV2Pair._update's `if (timeElapsed > 0)` branch is
+        // skipped (slots 9 + 10 are not read in that case). The V2
+        // fixture is one of source/sink — pick whichever is V2; if
+        // both are V3, fall back to opp.block_number for timestamp
+        // (V3 swap doesn't read blockTimestampLast in the same way).
+        let block_timestamp = v2_block_timestamp_last(&fixtures.source)
+            .or_else(|| v2_block_timestamp_last(&fixtures.sink));
+        let mut evm = build_evm(db, &self.cfg, opp.block_number, block_timestamp);
         let (swap1_status, swap1_gas) = exec_router_call(&mut evm, swap1_calldata, 0)?;
         if !matches!(swap1_status, SimStatus::Success) {
             return Ok(SimulationOutcome {
@@ -557,10 +587,18 @@ fn code_less_account(balance: U256) -> AccountInfo {
     }
 }
 
-fn build_evm<'a, DB: Database>(db: DB, cfg: &SimConfig, block_number: u64) -> Evm<'a, (), DB> {
+fn build_evm<'a, DB: Database>(
+    db: DB,
+    cfg: &SimConfig,
+    block_number: u64,
+    block_timestamp: Option<u32>,
+) -> Evm<'a, (), DB> {
     let chain_id = cfg.chain_id;
     let gas_limit = cfg.gas_limit_per_sim;
     let base_fee = RevmU256::from_be_bytes(cfg.base_fee_wei.to_be_bytes::<32>());
+    let timestamp = block_timestamp
+        .map(|t| RevmU256::from(t as u64))
+        .unwrap_or_else(|| RevmU256::from(block_number));
     Evm::builder()
         .with_db(db)
         .modify_cfg_env(|c| {
@@ -570,6 +608,7 @@ fn build_evm<'a, DB: Database>(db: DB, cfg: &SimConfig, block_number: u64) -> Ev
             b.basefee = base_fee;
             b.gas_limit = RevmU256::from(gas_limit);
             b.number = RevmU256::from(block_number);
+            b.timestamp = timestamp;
         })
         .modify_tx_env(|tx| {
             tx.caller = TEST_EOA_CALLER;
@@ -756,6 +795,22 @@ fn extend_address_padded(buf: &mut Vec<u8>, a: Address) {
 
 fn extend_u256_be(buf: &mut Vec<u8>, v: U256) {
     buf.extend_from_slice(&v.to_be_bytes::<32>());
+}
+
+/// Parse `blockTimestampLast` (uint32) from V2's packed slot 8. Returns
+/// `None` if the pool is not V2 or slot 8 isn't in the fixture.
+fn v2_block_timestamp_last(state: &FetchedPoolState) -> Option<u32> {
+    if !matches!(state.pool.kind, PoolKind::UniswapV2) {
+        return None;
+    }
+    let value = state
+        .pool_storage
+        .iter()
+        .find(|(s, _)| *s == U256::from(V2_RESERVES_SLOT))
+        .map(|(_, v)| v)?;
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&value.0[0..4]);
+    Some(u32::from_be_bytes(buf))
 }
 
 /// Decode V2 packed reserves slot (`slot 8`):

@@ -20,7 +20,9 @@
 use alloy_primitives::{Address, B256, U256};
 use rust_lmax_mev_opportunity::{OpportunityEvent, GAS_ESTIMATE_TWO_HOP_ARB};
 use rust_lmax_mev_risk::RiskCheckedOpportunity;
-use rust_lmax_mev_simulator::{LocalSimulator, ProfitSource, SimConfig, SimulationError};
+use rust_lmax_mev_simulator::{
+    LocalSimulator, ProfitSource, SimConfig, SimStatus, SimulationError,
+};
 use rust_lmax_mev_state::{PoolId, PoolKind};
 use rust_lmax_mev_state_fetcher::{FetchedAccount, FetchedPoolState};
 
@@ -103,31 +105,44 @@ fn sr_1_real_fixture_e2e_arb_emits_revm_computed() {
         weth_fixture(),
         usdc_proxy_fixture(),
         usdc_impl_fixture(),
+        v2_factory_fixture(),
     )
     .expect("load_fixture ok");
 
-    // SR-1 asserts the load-bearing P4-C2 claims:
-    // - The simulator runs the real-revm pipeline without a typed
-    //   SimulationError (StrictMissingError surfaces as Reverted with a
-    //   "missing fixture state" reason per plan v0.3 §DP-C8).
-    // - ProfitSource::RevmComputed is stamped on every outcome.
-    // - The opportunity block_number passes through.
+    // SR-1 asserts the full P4-C2 closure invariants:
+    // - SimStatus::Success — the real-revm 2-hop arb executes cleanly
+    //   against the recorded mainnet fixtures (V2 + V3 0.05% pools,
+    //   WETH9, USDC ZeppelinOS proxy + impl, UniswapV2Factory).
+    // - ProfitSource::RevmComputed — every outcome is stamped
+    //   regardless of profit sign (P4-C2 ProfitSource flip).
+    // - gas_used > 50_000 — non-trivial revm execution (real swap
+    //   bytecode, not a STOP shim).
+    // - block_number passthrough.
     // - Determinism: same inputs → byte-identical SimulationOutcome.
     //
-    // SR-1 does NOT assert SimStatus::Success because reaching it
-    // requires fixture extensions beyond what dump_fixture currently
-    // records (e.g., V2 reentrancy-guard slot 12, V2 factory bytecode
-    // for `_mintFee`'s factory.feeTo CALL, V3 observation slots, etc.).
-    // Each such missing slot surfaces in `outcome.status` as
-    // `Reverted { reason_hex: "missing fixture state: ..." }`, which
-    // the operator can use to extend dump_fixture and re-record
-    // iteratively. Once all needed slots are present, SR-1's status
-    // would flip to Success and the assertion can be tightened.
+    // If a future fixture re-record (different block hash) breaks any
+    // of these, surface the new outcome via the eprintln! at end and
+    // iterate via dump_fixture extension.
     let outcome_a = sim.simulate(&risk_checked).expect("simulate ok");
+    eprintln!(
+        "SR-1 outcome.status = {:?}; outcome.gas_used = {}; outcome.simulated_profit_wei = {}",
+        outcome_a.status, outcome_a.gas_used, outcome_a.simulated_profit_wei
+    );
+
+    assert!(
+        matches!(outcome_a.status, SimStatus::Success),
+        "SR-1 must reach SimStatus::Success against the recorded fixtures; got {:?}",
+        outcome_a.status,
+    );
     assert_eq!(
         outcome_a.profit_source,
         ProfitSource::RevmComputed,
         "P4-C2 must stamp RevmComputed on every outcome"
+    );
+    assert!(
+        outcome_a.gas_used > 50_000,
+        "SR-1 e2e arb must consume > 50k gas (real swap bytecode); got {}",
+        outcome_a.gas_used,
     );
     assert_eq!(
         outcome_a.opportunity_block_number, opp.block_number,
@@ -140,14 +155,6 @@ fn sr_1_real_fixture_e2e_arb_emits_revm_computed() {
     assert_eq!(
         outcome_a, outcome_b,
         "SR-1 determinism: same inputs → byte-identical SimulationOutcome"
-    );
-
-    // Surface the actual status to the test log so iterative fixture
-    // extension is visible to the operator. (Not an assert — the test
-    // passes regardless of which fixture extension is needed next.)
-    eprintln!(
-        "SR-1 outcome.status = {:?}; outcome.gas_used = {}; outcome.simulated_profit_wei = {}",
-        outcome_a.status, outcome_a.gas_used, outcome_a.simulated_profit_wei
     );
 }
 
@@ -228,6 +235,16 @@ fn usdc_impl_fixture() -> FetchedAccount {
         block_hash: B256::from(fixtures::USDC_IMPL_BLOCK_HASH),
         code: alloy_primitives::Bytes::copy_from_slice(fixtures::USDC_IMPL_CODE),
         storage: storage_from_account(fixtures::USDC_IMPL_STORAGE),
+    }
+}
+
+fn v2_factory_fixture() -> FetchedAccount {
+    use rust_lmax_mev_simulator::fixtures;
+    FetchedAccount {
+        address: Address::from(fixtures::V2_FACTORY_ADDRESS),
+        block_hash: B256::from(fixtures::V2_FACTORY_BLOCK_HASH),
+        code: alloy_primitives::Bytes::copy_from_slice(fixtures::V2_FACTORY_CODE),
+        storage: storage_from_account(fixtures::V2_FACTORY_STORAGE),
     }
 }
 
