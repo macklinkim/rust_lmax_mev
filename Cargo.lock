@@ -3685,6 +3685,8 @@ dependencies = [
  "alloy-primitives",
  "revm",
  "rkyv",
+ "rust-lmax-mev-config",
+ "rust-lmax-mev-node",
  "rust-lmax-mev-opportunity",
  "rust-lmax-mev-risk",
  "rust-lmax-mev-state",
@@ -3693,6 +3695,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
