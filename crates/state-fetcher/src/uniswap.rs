@@ -121,7 +121,13 @@ impl PoolSlotLayout for UniswapV3Fee005Layout {
     fn derived_slots(&self, _pool: &PoolId, already: &[(U256, B256)]) -> Vec<U256> {
         // Phase 2: emitted iff slot0 is present and no tickBitmap slots
         // have been fetched yet. Phase 3: emitted iff at least one
-        // tickBitmap slot is already present.
+        // tickBitmap slot is already present. After Phase 3 fetches
+        // complete, derived_slots MUST return an empty Vec to terminate
+        // the fetch loop — otherwise the bounded-depth safety in
+        // ArchiveStateFetcher::fetch_pool fires
+        // `FetchError::DerivedSlotsTooDeep(3)` even though no new work
+        // is needed. We achieve this by filtering out any slot already
+        // in `already_fetched` from BOTH phases' candidate lists.
         let slot0_value = already
             .iter()
             .find(|(s, _)| *s == U256::from(UNIV3_SLOT0_SLOT))
@@ -137,13 +143,21 @@ impl PoolSlotLayout for UniswapV3Fee005Layout {
             .iter()
             .any(|s| already.iter().any(|(prev, _)| prev == s));
 
-        if !phase2_done {
-            return bitmap_word_slots;
-        }
+        let candidate: Vec<U256> = if !phase2_done {
+            bitmap_word_slots
+        } else {
+            // Phase 3: scan each fetched bitmap word; for every set
+            // bit, emit the 4 sequential Tick.Info slots.
+            phase3_tick_info_slots(&bitmap_word_slots, already)
+        };
 
-        // Phase 3: scan each fetched bitmap word; for every set bit,
-        // emit the 4 sequential Tick.Info slots.
-        phase3_tick_info_slots(&bitmap_word_slots, already)
+        // Filter out anything already fetched. Returning empty
+        // terminates the fetch loop cleanly without tripping the
+        // bounded-depth safety even when both phases have completed.
+        candidate
+            .into_iter()
+            .filter(|s| !already.iter().any(|(prev, _)| prev == s))
+            .collect()
     }
 }
 
@@ -375,5 +389,24 @@ mod tests {
         assert_eq!(phase3[1], expected_tick_info_base + U256::from(1u64));
         assert_eq!(phase3[2], expected_tick_info_base + U256::from(2u64));
         assert_eq!(phase3[3], expected_tick_info_base + U256::from(3u64));
+
+        // L-V3-3 (regression for the dump_fixture DerivedSlotsTooDeep(3)
+        // bug, 2026-05-09): once Phase-3 Tick.Info slots ARE in
+        // already_fetched, derived_slots MUST return Vec::new() so the
+        // ArchiveStateFetcher::fetch_pool loop terminates cleanly
+        // without tripping the bounded-depth safety. Before the fix,
+        // derived_slots re-emitted the same Tick.Info slots on every
+        // call, which the loop's depth check caught as
+        // DerivedSlotsTooDeep(3) before the dedup-retain step.
+        let mut after_phase3 = after_phase2.clone();
+        for slot in &phase3 {
+            after_phase3.push((*slot, B256::ZERO));
+        }
+        let phase4 = layout.derived_slots(&pool, &after_phase3);
+        assert!(
+            phase4.is_empty(),
+            "after Phase-3 fetched, derived_slots must be empty to terminate the loop; got {} slots",
+            phase4.len()
+        );
     }
 }

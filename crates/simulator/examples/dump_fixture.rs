@@ -296,6 +296,10 @@ fn pool_id_v3_005() -> PoolId {
 }
 
 fn print_pool_const(name: &str, p: &FetchedPoolState) {
+    // Pool storage uses full `[u8; 32]` slot keys (NOT `u64`) because
+    // V3 Tick.Info / tickBitmap slots are mapping-derived and exceed
+    // u64. Same shape as account storage for consistency + zero
+    // truncation risk.
     println!("// --- {name} ({:?}) ---", p.pool.kind);
     println!(
         "pub const {}_ADDRESS: [u8; 20] = {};",
@@ -312,21 +316,11 @@ fn print_pool_const(name: &str, p: &FetchedPoolState) {
         name,
         bytes_array_literal(&p.pool_code)
     );
-    println!("pub const {}_STORAGE: &[(u64, [u8; 32])] = &[", name);
+    println!("pub const {}_STORAGE: &[([u8; 32], [u8; 32])] = &[", name);
     for (slot, value) in &p.pool_storage {
-        // Slot may exceed u64; format as full hex string in a comment +
-        // emit the low u64 portion for the array literal. The fixture
-        // consumer reads via `U256::from(low_u64)` for slot keys that
-        // fit; mapping-derived slots are full U256 and the consumer
-        // uses the u128/U256 form. Emit the slot as full 32-byte BE
-        // for full fidelity.
         println!(
-            "    // slot 0x{}",
-            hex_encode_lower(&slot.to_be_bytes::<32>())
-        );
-        println!(
-            "    ({}, {}),  // [WARN] slot truncated to u64 if it exceeds u64::MAX — see hex above",
-            slot_low_u64_or_panic_comment(slot),
+            "    ({}, {}),",
+            b256_array_literal_from_u256(slot),
             b256_array_literal(value)
         );
     }
@@ -413,28 +407,4 @@ fn bytes_array_literal(bytes: &[u8]) -> String {
     }
     out.push(']');
     out
-}
-
-fn hex_encode_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
-}
-
-fn slot_low_u64_or_panic_comment(slot: &U256) -> String {
-    // Cheap-cast to u64; mapping-derived slots will overflow this and
-    // print as `0` — that's fine because we already emit the full
-    // 32-byte hex in the comment line above. Fixtures consumers (P4-C2
-    // commits) will switch to the `[u8; 32]` form for slot keys when
-    // they can't be represented as u64.
-    let raw = slot.to_be_bytes::<32>();
-    if raw[..24].iter().all(|b| *b == 0) {
-        let mut low = [0u8; 8];
-        low.copy_from_slice(&raw[24..32]);
-        u64::from_be_bytes(low).to_string()
-    } else {
-        "0 /* slot exceeds u64; use [u8;32] form via comment hex above */".to_string()
-    }
 }
