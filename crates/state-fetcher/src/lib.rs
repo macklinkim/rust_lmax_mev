@@ -29,6 +29,7 @@
 //!   policy).
 
 pub mod storage_key;
+pub mod uniswap;
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -131,6 +132,19 @@ pub struct FetchedPoolState {
     pub auxiliary: Vec<AuxiliaryContract>,
 }
 
+/// Phase 4 P4-C: flat per-account snapshot at a pinned block. Used by
+/// `RevmDbBuilder` to load non-pool contracts (ERC-20 tokens, USDC
+/// proxy + implementation, mock-router code) into the simulated DB
+/// without going through `PoolSlotLayout`. Storage is sorted by slot
+/// ascending for determinism.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedAccount {
+    pub address: Address,
+    pub block_hash: B256,
+    pub code: Bytes,
+    pub storage: Vec<(U256, B256)>,
+}
+
 /// Cache hit/miss counters snapshot for unit-test determinism.
 /// `metrics::counter!` emissions ALSO go to the global `metrics`
 /// registry per ADR-008 — this snapshot is the test-friendly mirror.
@@ -151,6 +165,19 @@ pub trait StateFetcher: Send + Sync {
         block_hash: B256,
         layout: &dyn PoolSlotLayout,
     ) -> Result<FetchedPoolState, FetchError>;
+
+    /// Phase 4 P4-C additive: fetch a non-pool contract account
+    /// (ERC-20 token, USDC proxy / implementation, callback receiver).
+    /// `slots` is the explicit storage-slot list; `RevmDbBuilder`
+    /// computes token slots directly via `mapping_slot_u256` +
+    /// `address_key`. Reuses the same code/storage caches and metrics
+    /// as `fetch_pool`.
+    async fn fetch_account(
+        &self,
+        address: Address,
+        slots: &[U256],
+        block_hash: B256,
+    ) -> Result<FetchedAccount, FetchError>;
 }
 
 /// Private archive transport — abstracts the three P4-A archive
@@ -341,6 +368,34 @@ impl StateFetcher for ArchiveStateFetcher {
             pool_code,
             pool_storage: all_fetched,
             auxiliary: Vec::new(),
+        })
+    }
+
+    async fn fetch_account(
+        &self,
+        address: Address,
+        slots: &[U256],
+        block_hash: B256,
+    ) -> Result<FetchedAccount, FetchError> {
+        if block_hash == B256::ZERO {
+            return Err(FetchError::InvalidBlockHash);
+        }
+        let code = self.get_code_cached(address, block_hash).await?;
+        let mut storage = Vec::with_capacity(slots.len());
+        // Dedup the input slot list so callers don't double-pay archive
+        // calls for repeated slot keys.
+        let mut sorted = slots.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        for slot in sorted {
+            let value = self.get_storage_cached(address, slot, block_hash).await?;
+            storage.push((slot, value));
+        }
+        Ok(FetchedAccount {
+            address,
+            block_hash,
+            code,
+            storage,
         })
     }
 }
@@ -615,6 +670,62 @@ mod tests {
             "zero block hash must reject before any backend call"
         );
         assert_eq!(backend.storage_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// F-A-1 (P4-C): `fetch_account` returns code + storage for a
+    /// non-pool contract; second call hits cache (no new backend
+    /// invocations); deduplicates repeated slot keys.
+    #[tokio::test]
+    async fn archive_state_fetcher_fetch_account_returns_code_and_storage_with_caching() {
+        let backend = Arc::new(MockArchiveBackend::new());
+        let addr = alloy_primitives::address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        let block = b256_from_u8(0xfa);
+        backend.put_code(addr, block, Bytes::from_static(&[0xde, 0xad]));
+        backend.put_storage(addr, block, U256::from(3u64), b256_from_u8(0x01));
+        backend.put_storage(addr, block, U256::from(9u64), b256_from_u8(0x02));
+        let backend_for_fetcher: Arc<dyn ArchiveBackend> = backend.clone();
+        let fetcher =
+            ArchiveStateFetcher::with_backend(backend_for_fetcher, StateFetcherConfig::defaults());
+
+        // Pass slot 9 twice to verify dedup.
+        let acc = fetcher
+            .fetch_account(
+                addr,
+                &[U256::from(9u64), U256::from(3u64), U256::from(9u64)],
+                block,
+            )
+            .await
+            .unwrap();
+        assert_eq!(acc.address, addr);
+        assert_eq!(acc.block_hash, block);
+        assert_eq!(acc.code.as_ref(), &[0xde, 0xad]);
+        assert_eq!(
+            acc.storage,
+            vec![
+                (U256::from(3u64), b256_from_u8(0x01)),
+                (U256::from(9u64), b256_from_u8(0x02)),
+            ],
+            "deduped + sorted by slot ascending"
+        );
+        let storage_calls_after_first = backend.storage_calls.load(Ordering::SeqCst);
+        let code_calls_after_first = backend.code_calls.load(Ordering::SeqCst);
+        assert_eq!(storage_calls_after_first, 2, "deduped to 2 unique slots");
+        assert_eq!(code_calls_after_first, 1);
+
+        // Second call → all cached.
+        let _ = fetcher
+            .fetch_account(addr, &[U256::from(3u64), U256::from(9u64)], block)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.storage_calls.load(Ordering::SeqCst),
+            storage_calls_after_first,
+            "second fetch must hit cache"
+        );
+        assert_eq!(
+            backend.code_calls.load(Ordering::SeqCst),
+            code_calls_after_first
+        );
     }
 
     /// S-F-8 cache eviction: capacity = 2; insert 3 distinct entries;
