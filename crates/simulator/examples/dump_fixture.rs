@@ -79,11 +79,30 @@ const USDC_BALANCES_SLOT: u64 = 9;
 /// EIP-1967 implementation slot:
 /// `bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)
 ///  = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc`.
-/// We read this slot to discover the implementation address rather than
-/// hardcoding it.
+/// First proxy scheme attempted; many modern proxies use this layout.
 const EIP1967_IMPL_SLOT_BE: [u8; 32] = [
     0x36, 0x08, 0x94, 0xa1, 0x3b, 0xa1, 0xa3, 0x21, 0x06, 0x67, 0xc8, 0x28, 0x49, 0x2d, 0xb9, 0x8d,
     0xca, 0x3e, 0x20, 0x76, 0xcc, 0x37, 0x35, 0xa9, 0x20, 0xa3, 0xca, 0x50, 0x5d, 0x38, 0x2b, 0xbc,
+];
+
+/// ZeppelinOS (OpenZeppelin pre-EIP-1967) implementation slot:
+/// `keccak256("org.zeppelinos.proxy.implementation")
+///  = 0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3`.
+/// USDC FiatTokenProxy `0xA0b86991...` is a ZeppelinOS proxy and uses
+/// THIS slot, not EIP-1967. Fallback path when EIP-1967 reads zero.
+const ZEPPELINOS_IMPL_SLOT_BE: [u8; 32] = [
+    0x70, 0x50, 0xc9, 0xe0, 0xf4, 0xca, 0x76, 0x9c, 0x69, 0xbd, 0x3a, 0x8e, 0xf7, 0x40, 0xbc, 0x37,
+    0x93, 0x4f, 0x8e, 0x2c, 0x03, 0x6e, 0x5a, 0x72, 0x3f, 0xd8, 0xee, 0x04, 0x8e, 0xd3, 0xf8, 0xc3,
+];
+
+/// ZeppelinOS admin slot:
+/// `keccak256("org.zeppelinos.proxy.admin")
+///  = 0x10d6a54a4754c8869d6886b5f5d7fbfa5b4522237ea5c60d11bc4e7a1ff9390b`.
+/// Recorded for FiatTokenProxy fallback's admin-bypass branch (some
+/// transfers may read it through the modifier chain).
+const ZEPPELINOS_ADMIN_SLOT_BE: [u8; 32] = [
+    0x10, 0xd6, 0xa5, 0x4a, 0x47, 0x54, 0xc8, 0x86, 0x9d, 0x68, 0x86, 0xb5, 0xf5, 0xd7, 0xfb, 0xfa,
+    0x5b, 0x45, 0x22, 0x23, 0x7e, 0xa5, 0xc6, 0x0d, 0x11, 0xbc, 0x4e, 0x7a, 0x1f, 0xf9, 0x39, 0x0b,
 ];
 
 #[tokio::main]
@@ -205,13 +224,18 @@ async fn main() -> ExitCode {
     //    "USDC slot-list workflow (iterative)" above. T-USDC-1 will
     //    surface any unrecorded slot via StrictMissingError::MissingStorage.
     //
-    // Slots: EIP-1967 implementation address + balanceOf for the three
-    // actors + head slots {0..16} for inheritance-chain modifier
-    // preconditions (Ownable._owner, Pausable._paused, Blacklistable
-    // .blacklister, FiatTokenV2_2 head fields). Not all are read by
-    // transfer() but they're cheap to record and act as a safety net.
+    // Slots: EIP-1967 impl + admin AND ZeppelinOS impl + admin (USDC's
+    // FiatTokenProxy is a ZeppelinOS proxy; EIP-1967 is read first as
+    // a fallback for non-USDC proxies and modern token upgrades).
+    // Plus balanceOf for the three actors and head slots {0..16} for
+    // inheritance-chain modifier preconditions (Ownable._owner,
+    // Pausable._paused, Blacklistable.blacklister, FiatTokenV2_2 head
+    // fields). Not all are read by transfer() but they're cheap to
+    // record and act as a safety net.
     let mut usdc_proxy_slots: Vec<U256> = vec![
         U256::from_be_bytes(EIP1967_IMPL_SLOT_BE),
+        U256::from_be_bytes(ZEPPELINOS_IMPL_SLOT_BE),
+        U256::from_be_bytes(ZEPPELINOS_ADMIN_SLOT_BE),
         mapping_slot_u256(U256::from(USDC_BALANCES_SLOT), address_key(MOCK_ROUTER)),
         mapping_slot_u256(U256::from(USDC_BALANCES_SLOT), address_key(V2_WETH_USDC)),
         mapping_slot_u256(
@@ -232,25 +256,37 @@ async fn main() -> ExitCode {
     };
     print_account_const("USDC_PROXY", &usdc_proxy);
 
-    // 9. USDC implementation. Address is parsed from the proxy fixture's
-    //    EIP-1967 slot value (NOT hardcoded — an upgrade between
-    //    recordings is automatically reflected).
-    let impl_slot_value = match usdc_proxy
-        .storage
-        .iter()
-        .find(|(s, _)| *s == U256::from_be_bytes(EIP1967_IMPL_SLOT_BE))
-    {
-        Some((_, v)) => *v,
-        None => {
-            eprintln!("error: USDC proxy fixture missing EIP-1967 implementation slot");
-            return ExitCode::from(5);
-        }
+    // 9. USDC implementation. Address is parsed from the proxy fixture
+    //    storage (NOT hardcoded). Try EIP-1967 first; if zero, fall
+    //    back to ZeppelinOS (USDC FiatTokenProxy uses this older
+    //    scheme). Error if both are zero.
+    let read_slot = |slot_be: [u8; 32]| -> Option<B256> {
+        usdc_proxy
+            .storage
+            .iter()
+            .find(|(s, _)| *s == U256::from_be_bytes(slot_be))
+            .map(|(_, v)| *v)
     };
-    if impl_slot_value == B256::ZERO {
-        eprintln!("error: USDC proxy EIP-1967 implementation slot is zero (not a proxy?)");
-        return ExitCode::from(5);
-    }
+    let (impl_slot_value, proxy_scheme) = match read_slot(EIP1967_IMPL_SLOT_BE) {
+        Some(v) if v != B256::ZERO => (v, "EIP-1967"),
+        _ => match read_slot(ZEPPELINOS_IMPL_SLOT_BE) {
+            Some(v) if v != B256::ZERO => (v, "ZeppelinOS"),
+            _ => {
+                eprintln!(
+                    "error: USDC proxy implementation slot is zero in BOTH EIP-1967 and ZeppelinOS layouts"
+                );
+                eprintln!("       (the proxy may use yet another scheme; inspect head slots in the proxy fixture)");
+                return ExitCode::from(5);
+            }
+        },
+    };
     let impl_addr = Address::from_slice(&impl_slot_value.0[12..32]);
+    println!("// USDC proxy scheme detected: {proxy_scheme}");
+    println!("//   impl_slot_value (low 20 bytes = address) = 0x{impl_slot_value:x}");
+    println!("//   parsed implementation address: {impl_addr:?}");
+    println!();
+    eprintln!("# USDC proxy scheme detected: {proxy_scheme}");
+    eprintln!("# parsed USDC impl address: {impl_addr:?}");
 
     let usdc_impl = match fetcher.fetch_account(impl_addr, &[], block_hash).await {
         Ok(a) => a,
