@@ -12,7 +12,15 @@
 //! Phase 5+ swaps in dynamic / EIP-1559 / ML strategies; the API
 //! surface in P3-F is shaped to allow that swap without breakage.
 
+pub mod bid_strategy;
 pub mod rkyv_compat;
+
+pub use bid_strategy::{
+    BidContext, BidStrategy, BidStrategyRef, Eip1559BasefeeAwareBidStrategy,
+    FixedFractionBidStrategy,
+};
+
+use std::sync::Arc;
 
 use alloy_primitives::{Address, U256};
 use rust_lmax_mev_simulator::{ProfitSource, SimStatus, SimulationOutcome};
@@ -109,39 +117,88 @@ pub struct BundleCandidate {
 /// Stateless bundle constructor. Construct once per process from the
 /// `BundleConfig`; `construct(...)` is `&self` and allocation-free
 /// beyond the returned struct.
+///
+/// Phase 5 P5-B: holds an `Arc<dyn BidStrategy>` so the gas-bid
+/// math is a pluggable strategy. `BundleConstructor::new(cfg)` keeps
+/// its P3-F signature + behavior byte-identical (default strategy is
+/// `FixedFractionBidStrategy::new(cfg.fixed_bid_fraction_bps)?`).
+/// New `with_strategy(cfg, strategy)` accepts an explicit strategy
+/// (e.g., `Eip1559BasefeeAwareBidStrategy`).
 pub struct BundleConstructor {
     cfg: BundleConfig,
+    strategy: BidStrategyRef,
 }
 
 impl BundleConstructor {
     /// Validates `BundleConfig` and returns a ready-to-construct
-    /// engine. `Err(ExecutionError::Setup)` for obvious bad-config
-    /// (validity_block_window == 0, fixed_bid_fraction_bps > 10_000).
+    /// engine using the default `FixedFractionBidStrategy` per
+    /// `cfg.fixed_bid_fraction_bps`. `Err(ExecutionError::Setup)`
+    /// for `validity_block_window == 0` or
+    /// `fixed_bid_fraction_bps > 10_000`. P3-F byte-identical
+    /// behavior preserved (BS-4 regression-guards this).
     pub fn new(cfg: BundleConfig) -> Result<Self, ExecutionError> {
         if cfg.validity_block_window == 0 {
             return Err(ExecutionError::Setup(
                 "validity_block_window must be non-zero".to_string(),
             ));
         }
-        if cfg.fixed_bid_fraction_bps > 10_000 {
-            return Err(ExecutionError::Setup(format!(
-                "fixed_bid_fraction_bps must be in 0..=10_000, got {}",
-                cfg.fixed_bid_fraction_bps
-            )));
+        // Strategy ctor itself validates `bps ≤ 10_000` (R-B2);
+        // propagate the same Setup wording the previous P3-F new()
+        // returned.
+        let strategy: BidStrategyRef =
+            Arc::new(FixedFractionBidStrategy::new(cfg.fixed_bid_fraction_bps)?);
+        Ok(Self { cfg, strategy })
+    }
+
+    /// Phase 5 P5-B (DP-B5): explicit-strategy constructor. The
+    /// strategy is responsible for its own validation; this ctor
+    /// validates only `cfg.validity_block_window`. Existing tests
+    /// using `BundleConstructor::new(cfg)` are unaffected.
+    pub fn with_strategy(
+        cfg: BundleConfig,
+        strategy: BidStrategyRef,
+    ) -> Result<Self, ExecutionError> {
+        if cfg.validity_block_window == 0 {
+            return Err(ExecutionError::Setup(
+                "validity_block_window must be non-zero".to_string(),
+            ));
         }
-        Ok(Self { cfg })
+        Ok(Self { cfg, strategy })
     }
 
     pub fn cfg(&self) -> &BundleConfig {
         &self.cfg
     }
 
+    pub fn strategy_name(&self) -> &'static str {
+        self.strategy.name()
+    }
+
     /// Pure: returns `Ok(BundleCandidate)` iff the simulation succeeded
-    /// AND profit > 0 AND the bid is non-zero after `fixed_bid_fraction`
-    /// is applied. Otherwise `Err(ExecutionError::Aborted { reason })`.
+    /// AND profit > 0 AND the bid is non-zero after the strategy is
+    /// applied. Otherwise `Err(ExecutionError::Aborted { reason })`.
+    ///
+    /// P5-B (DP-B6): internally constructs `BidContext::for_legacy_outcome`
+    /// (R-B10) and delegates to `construct_with_context`. The legacy
+    /// context sets `block_base_fee_wei = U256::ZERO` so the
+    /// `wire_phase4` execution_driver's existing call site preserves
+    /// P3-F byte-identical behavior with the default
+    /// `FixedFractionBidStrategy`.
     pub fn construct(
         &self,
         outcome: &SimulationOutcome,
+    ) -> Result<BundleCandidate, ExecutionError> {
+        let ctx = BidContext::for_legacy_outcome(outcome);
+        self.construct_with_context(outcome, &ctx)
+    }
+
+    /// Phase 5 P5-B (DP-B6): explicit-context construct API. The
+    /// caller supplies the `BidContext` (e.g., live block base fee
+    /// + gas estimate); the strategy uses it to compute the bid.
+    pub fn construct_with_context(
+        &self,
+        outcome: &SimulationOutcome,
+        ctx: &BidContext,
     ) -> Result<BundleCandidate, ExecutionError> {
         let aborted = |reason| ExecutionError::Aborted { reason };
 
@@ -152,10 +209,7 @@ impl BundleConstructor {
             return Err(aborted(AbortReason::NonPositiveProfit));
         }
 
-        // gas_bid = profit * fraction_bps / 10_000. U256-safe; both
-        // operands fit U256, multiplication is U256-multiplication.
-        let bid = outcome.simulated_profit_wei * U256::from(self.cfg.fixed_bid_fraction_bps)
-            / U256::from(10_000u32);
+        let bid = self.strategy.compute_bid(outcome, ctx);
         if bid.is_zero() {
             return Err(aborted(AbortReason::BidRoundsToZero));
         }
@@ -172,5 +226,70 @@ impl BundleConstructor {
             validity_block_max: validity_max,
             profit_source: outcome.profit_source,
         })
+    }
+}
+
+#[cfg(test)]
+mod construct_tests {
+    use super::*;
+    use rust_lmax_mev_simulator::{ProfitSource, SimStatus};
+
+    fn outcome(profit_wei: U256, gas_used: u64) -> SimulationOutcome {
+        SimulationOutcome {
+            opportunity_block_number: 22_000_000,
+            gas_used,
+            status: SimStatus::Success,
+            simulated_profit_wei: profit_wei,
+            profit_source: ProfitSource::RevmComputed,
+        }
+    }
+
+    /// BS-4: `BundleConstructor::new(BundleConfig::defaults()).construct(&outcome)`
+    /// produces a `BundleCandidate` byte-identical to the P3-F formula
+    /// — the `wire_phase4` execution_driver path is unchanged. This
+    /// is the regression guard: if a future PR accidentally swaps
+    /// the default strategy, this test breaks.
+    #[test]
+    fn bs_4_default_strategy_p3f_byte_identical() {
+        let cfg = BundleConfig::defaults();
+        let ctor = BundleConstructor::new(cfg.clone()).expect("ctor ok");
+        // profit = 1_000_000 wei → bid = 900_000 (bps 9_000).
+        let out = outcome(U256::from(1_000_000u64), 100_000);
+        let cand = ctor.construct(&out).expect("construct ok");
+        assert_eq!(cand.gas_bid_wei, U256::from(900_000u64));
+        assert_eq!(cand.opportunity_block_number, 22_000_000);
+        assert_eq!(cand.gas_used, 100_000);
+        assert_eq!(cand.simulated_profit_wei, U256::from(1_000_000u64));
+        // validity_block_window default = 5 → max = 22_000_000 + 4.
+        assert_eq!(cand.validity_block_min, 22_000_000);
+        assert_eq!(cand.validity_block_max, 22_000_004);
+        assert_eq!(ctor.strategy_name(), "fixed_fraction");
+    }
+
+    /// BS-5 (R-B4): `with_strategy(eip1559).construct_with_context`
+    /// produces a `gas_bid_wei` capped per DP-B4. Uses an explicit
+    /// `BidContext` with NONZERO `block_base_fee_wei` so the EIP-1559
+    /// cap actually binds (legacy `construct(&outcome)` would set
+    /// base fee 0 and the cap would not exercise).
+    #[test]
+    fn bs_5_with_strategy_eip1559_capped_via_construct_with_context() {
+        let cfg = BundleConfig::defaults();
+        let strategy: BidStrategyRef = Arc::new(Eip1559BasefeeAwareBidStrategy::default());
+        let ctor = BundleConstructor::with_strategy(cfg, strategy).expect("ctor ok");
+        // profit = 1e18 wei → fixed-fraction = 9e17.
+        // base_fee = 30 gwei, tip = 1 gwei (default), gas = 100_000.
+        // cap = (3e10 + 1e9) * 1e5 = 3.1e15. 9e17 > 3.1e15 → cap.
+        let out = outcome(U256::from(1_000_000_000_000_000_000u128), 100_000);
+        let ctx = BidContext::new(U256::from(30_000_000_000u64), 100_000);
+        let cand = ctor
+            .construct_with_context(&out, &ctx)
+            .expect("construct_with_context ok");
+        let expected_cap = U256::from(31_000_000_000u64) * U256::from(100_000u64);
+        assert_eq!(cand.gas_bid_wei, expected_cap, "EIP-1559 cap binds");
+        assert!(
+            cand.gas_bid_wei < U256::from(900_000_000_000_000_000u128),
+            "cap < fixed-fraction bid"
+        );
+        assert_eq!(ctor.strategy_name(), "eip1559_basefee_aware");
     }
 }
