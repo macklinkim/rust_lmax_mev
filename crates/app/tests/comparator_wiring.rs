@@ -27,7 +27,8 @@ use std::time::Duration;
 use alloy_primitives::{B256, U256};
 use rust_lmax_mev_app::{
     _cw_5_compile_check_comparator_driver_takes_dyn_relay_simulator, comparator_driver,
-    MismatchAbortRecord, MismatchCheckPassed, SimulationOutcomeWithFingerprint,
+    MismatchAbortRecord, MismatchCheckPassed, MismatchJournalSink,
+    SimulationOutcomeWithFingerprint,
 };
 use rust_lmax_mev_execution::{BundleConfig, BundleConstructor};
 use rust_lmax_mev_journal::FileJournal;
@@ -273,4 +274,79 @@ async fn cw_4_every_relay_outcome_terminates_at_passed_or_journal() {
         // Per DP-E12 there is NO third terminal outcome.
     }
     // The Ok arm is exercised by CW-1.
+}
+
+/// Programmable failing journal for CW-2-fail (R-E21). Implements
+/// `MismatchJournalSink` and returns `Err(JournalError)` from
+/// `append`; the comparator MUST fail-closed (no broadcast) on this
+/// path.
+struct FailingJournal {
+    appends_attempted: Arc<std::sync::Mutex<usize>>,
+}
+
+impl MismatchJournalSink for FailingJournal {
+    fn append(
+        &mut self,
+        _env: &EventEnvelope<MismatchAbort>,
+    ) -> Result<(), rust_lmax_mev_journal::JournalError> {
+        *self.appends_attempted.lock().unwrap() += 1;
+        Err(rust_lmax_mev_journal::JournalError::Io(
+            std::io::Error::other("simulated journal failure"),
+        ))
+    }
+    fn flush(&mut self) -> Result<(), rust_lmax_mev_journal::JournalError> {
+        Ok(())
+    }
+}
+
+/// CW-2-fail (R-E21): if `journal.append` fails, the comparator MUST
+/// NOT emit `MismatchAbortRecord`. Verifies fail-closed broadcast
+/// inhibition end-to-end.
+#[tokio::test(flavor = "multi_thread")]
+async fn cw_2_fail_journal_failure_suppresses_broadcast() {
+    let (sim_tx, sim_rx) = broadcast::channel::<EventEnvelope<SimulationOutcomeWithFingerprint>>(8);
+    let (cmp_tx, _cmp_rx) = broadcast::channel::<MismatchCheckPassed>(8);
+    let (mismatch_tx, mut mismatch_rx) = broadcast::channel::<MismatchAbortRecord>(8);
+
+    // Mock relay returns Err so the comparator enters the abort path.
+    let mock = Arc::new(MockRelaySimulator::default());
+    mock.program(Err(RelaySimError::Transport("simulated".into())));
+    let relay_sim: Arc<dyn RelaySimulator> = mock;
+
+    let bundle = Arc::new(BundleConstructor::new(BundleConfig::defaults()).expect("ctor"));
+    let appends_attempted = Arc::new(std::sync::Mutex::new(0usize));
+    let failing = FailingJournal {
+        appends_attempted: Arc::clone(&appends_attempted),
+    };
+
+    let driver = tokio::spawn(comparator_driver(
+        sim_rx,
+        cmp_tx,
+        mismatch_tx.clone(),
+        Some(relay_sim),
+        bundle,
+        failing,
+        "cw-2-fail-driver",
+    ));
+
+    sim_tx.send(sample_outcome_envelope()).expect("publish ok");
+
+    // Give the driver a generous window to attempt append + (per
+    // R-E21) fail-closed by NOT broadcasting. We expect a Timeout
+    // (no message) on mismatch_rx within that window.
+    let result = tokio::time::timeout(Duration::from_millis(500), mismatch_rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "R-E21: comparator must NOT broadcast MismatchAbortRecord when journal.append fails; got {result:?}"
+    );
+    // Sanity: the driver did attempt the append (otherwise the test
+    // could pass by spuriously not running the abort path at all).
+    assert!(
+        *appends_attempted.lock().unwrap() >= 1,
+        "comparator must have attempted journal append on the abort path"
+    );
+
+    drop(sim_tx);
+    drop(mismatch_tx);
+    let _ = driver.await;
 }

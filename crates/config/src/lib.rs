@@ -350,6 +350,15 @@ pub enum ConfigError {
     /// Phase 4 P4-E: a relay endpoint string is empty.
     #[error("relay.enabled_relays[{index}].endpoint must be a non-empty URL")]
     EmptyRelayEndpoint { index: usize },
+
+    /// Phase 4 P4-E (R-E23): more than one relay configured. P4-E
+    /// supports at most ONE relay; multi-relay fanout (concurrent
+    /// `simulate_bundle` calls + first-success-wins merging) is
+    /// Phase 5+ work. Silently using only the first entry would be
+    /// surprising config truncation for a safety boundary, so we
+    /// fail-closed at validation time.
+    #[error("relay.enabled_relays must contain at most 1 entry in P4-E; got {count}")]
+    TooManyEnabledRelays { count: usize },
 }
 
 impl Config {
@@ -427,6 +436,14 @@ impl Config {
         // adapter is the second.
         if self.relay.live_send {
             return Err(ConfigError::LiveSendForbidden);
+        }
+        // Phase 4 P4-E (R-E23): at most one relay in P4-E. Multi-
+        // relay fanout is Phase 5+ work; silently dropping the rest
+        // would be a surprising config truncation.
+        if self.relay.enabled_relays.len() > 1 {
+            return Err(ConfigError::TooManyEnabledRelays {
+                count: self.relay.enabled_relays.len(),
+            });
         }
         // Phase 4 P4-E: relay endpoints must be non-empty strings.
         for (i, ep) in self.relay.enabled_relays.iter().enumerate() {
@@ -766,13 +783,30 @@ execution_disabled = false
         );
     }
 
-    /// CFG-RELAY-1: relay endpoints parse from TOML with sensible
-    /// defaults; empty endpoint string is rejected.
+    /// CFG-RELAY-1 (R-E23 v0.7): single relay endpoint parses; multi-
+    /// entry list rejected (P4-E supports at most 1 relay; multi-relay
+    /// fanout is Phase 5+); empty endpoint string rejected.
     #[test]
-    fn cfg_relay_1_endpoints_parse_and_empty_endpoint_rejected() {
-        // Happy path: two endpoints (Flashbots + bloXroute).
+    fn cfg_relay_1_single_entry_parses_multi_rejected_empty_rejected() {
+        // Happy path: single entry (Flashbots).
         let mut toml = valid_minimum_toml().to_string();
         toml.push_str(
+            r#"
+
+[[relay.enabled_relays]]
+kind = "flashbots"
+endpoint = "https://relay.flashbots.net"
+"#,
+        );
+        let cfg = Config::from_toml_str(&toml).expect("CFG-RELAY-1 single must parse");
+        assert_eq!(cfg.relay.enabled_relays.len(), 1);
+        assert_eq!(cfg.relay.enabled_relays[0].kind, RelayKind::Flashbots);
+        assert!(!cfg.relay.live_send);
+        assert!(!cfg.relay.execution_disabled);
+
+        // R-E23 reject: 2+ entries → TooManyEnabledRelays.
+        let mut multi = valid_minimum_toml().to_string();
+        multi.push_str(
             r#"
 
 [[relay.enabled_relays]]
@@ -785,16 +819,12 @@ endpoint = "https://api.blxrbdn.com"
 api_key = "test-key"
 "#,
         );
-        let cfg = Config::from_toml_str(&toml).expect("CFG-RELAY-1 happy must parse");
-        assert_eq!(cfg.relay.enabled_relays.len(), 2);
-        assert_eq!(cfg.relay.enabled_relays[0].kind, RelayKind::Flashbots);
-        assert_eq!(cfg.relay.enabled_relays[1].kind, RelayKind::Bloxroute);
-        assert_eq!(
-            cfg.relay.enabled_relays[1].api_key.as_deref(),
-            Some("test-key")
+        let err =
+            Config::from_toml_str(&multi).expect_err("CFG-RELAY-1 (R-E23): len>1 must be rejected");
+        assert!(
+            matches!(err, ConfigError::TooManyEnabledRelays { count: 2 }),
+            "expected TooManyEnabledRelays{{ count: 2 }}, got {err:?}"
         );
-        assert!(!cfg.relay.live_send);
-        assert!(!cfg.relay.execution_disabled);
 
         // Failure path: empty endpoint string.
         let mut bad = valid_minimum_toml().to_string();

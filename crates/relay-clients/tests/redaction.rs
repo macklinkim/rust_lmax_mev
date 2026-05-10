@@ -19,10 +19,12 @@ use std::sync::{Arc, Mutex};
 use alloy_primitives::{B256, U256};
 use rust_lmax_mev_relay_clients::{BloxrouteConfig, BloxrouteRelay};
 use rust_lmax_mev_relay_sim::{
-    compare_result, ComparatorInputs, LocalBundleShape, RelaySimRequest, RelaySimulator,
+    compare_result, ComparatorInputs, LocalBundleShape, RelaySimError, RelaySimRequest,
+    RelaySimulator,
 };
 use rust_lmax_mev_simulator::{LocalStateFingerprint, ProfitSource, SimStatus, SimulationOutcome};
 use rust_lmax_mev_types::{ChainContext, EventEnvelope, EventSource, PublishMeta};
+use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -169,4 +171,61 @@ async fn rc_common_2_secret_redaction_across_five_surfaces() {
         !contains_subslice(&bytes, secret_key_bytes),
         "journal bytes must not contain SECRETKEY"
     );
+}
+
+/// R-E22: a malicious or buggy relay echoes secrets into the JSON-RPC
+/// error message. The adapter MUST NOT propagate the relay-controlled
+/// `error.message` field verbatim into `RelaySimError::Transport`;
+/// only the numeric `error.code` is safe to surface.
+#[tokio::test]
+async fn rc_common_2_extra_jsonrpc_body_secret_redacted() {
+    let server = MockServer::start().await;
+    let body = json!({
+        "id": 1,
+        "jsonrpc": "2.0",
+        "error": {
+            "code": -32000,
+            "message": format!("relay error: token={SECRET_TOKEN} key={SECRET_KEY}")
+        }
+    });
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    let relay = BloxrouteRelay::new(BloxrouteConfig {
+        endpoint: server.uri(),
+        timeout_ms: 1_000,
+        api_key: Some(SECRET_KEY.to_string()),
+    })
+    .expect("ctor ok");
+    let req = RelaySimRequest {
+        block_hash: B256::from([0u8; 32]),
+        state_block_number: 22_000_000,
+        txs: vec![vec![0xAB]],
+    };
+    let err = relay
+        .simulate_bundle(req)
+        .await
+        .expect_err("R-E22: JSON-RPC error must surface as Err");
+    let display = format!("{err}");
+    assert!(
+        !display.contains(SECRET_TOKEN),
+        "R-E22: RelaySimError must not echo SECRETTOKEN from relay JSON-RPC error.message; got {display:?}"
+    );
+    assert!(
+        !display.contains(SECRET_KEY),
+        "R-E22: RelaySimError must not echo SECRETKEY; got {display:?}"
+    );
+    // Should still be a RelaySimError::Transport categorical message
+    // mentioning the JSON-RPC code (numeric, safe).
+    match err {
+        RelaySimError::Transport(s) => {
+            assert!(
+                s.contains("-32000"),
+                "JSON-RPC code must surface; got {s:?}"
+            );
+        }
+        other => panic!("expected Transport, got {other:?}"),
+    }
 }

@@ -1159,15 +1159,38 @@ async fn execution_driver(
 /// grep gate); the held trait object is `Arc<dyn RelaySimulator>` so
 /// `submit_bundle` is not even type-reachable from here (CW-5
 /// type-system guarantee).
+/// R-E21: trait abstraction over the comparator's mismatch journal so
+/// CW-2-fail can inject a programmable failure mode and verify
+/// fail-closed broadcast inhibition.
+pub trait MismatchJournalSink: Send + 'static {
+    fn append(
+        &mut self,
+        env: &EventEnvelope<MismatchAbort>,
+    ) -> Result<(), rust_lmax_mev_journal::JournalError>;
+    fn flush(&mut self) -> Result<(), rust_lmax_mev_journal::JournalError>;
+}
+
+impl MismatchJournalSink for rust_lmax_mev_journal::FileJournal<MismatchAbort> {
+    fn append(
+        &mut self,
+        env: &EventEnvelope<MismatchAbort>,
+    ) -> Result<(), rust_lmax_mev_journal::JournalError> {
+        rust_lmax_mev_journal::FileJournal::append(self, env).map(|_| ())
+    }
+    fn flush(&mut self) -> Result<(), rust_lmax_mev_journal::JournalError> {
+        rust_lmax_mev_journal::FileJournal::flush(self)
+    }
+}
+
 /// Public for CW-1..5 integration tests in `crates/app/tests/`.
 #[allow(clippy::too_many_arguments)]
-pub async fn comparator_driver(
+pub async fn comparator_driver<J: MismatchJournalSink>(
     mut rx: broadcast::Receiver<EventEnvelope<SimulationOutcomeWithFingerprint>>,
     comparator_tx: broadcast::Sender<MismatchCheckPassed>,
     mismatch_tx: broadcast::Sender<MismatchAbortRecord>,
     relay_sim: Option<Arc<dyn RelaySimulator>>,
     constructor: Arc<BundleConstructor>,
-    mut journal: rust_lmax_mev_journal::FileJournal<MismatchAbort>,
+    mut journal: J,
     name: &'static str,
 ) {
     if relay_sim.is_none() {
@@ -1225,32 +1248,44 @@ pub async fn comparator_driver(
                     }
                     Err(abort_box) => {
                         let abort = *abort_box;
-                        // R-E9 + DP-E8 v0.4: SYNCHRONOUS journal
-                        // append+flush BEFORE any downstream emission.
-                        if let Some(env) = seal_envelope_with_context(
+                        // R-E9 + R-E21 + DP-E8 v0.4: SYNCHRONOUS
+                        // journal append+flush BEFORE any downstream
+                        // emission. R-E21 fail-closed: if seal +
+                        // append + flush do NOT all succeed, do NOT
+                        // emit the broadcast (an unjournaled abort
+                        // must never be observable downstream).
+                        let Some(env) = seal_envelope_with_context(
                             EventSource::Relay,
                             abort.clone(),
                             &mut seq,
                             cc,
                             correlation_id,
-                        ) {
-                            if let Err(e) = journal.append(&env) {
-                                tracing::error!(
-                                    consumer = name,
-                                    error = %e,
-                                    "comparator journal append failed"
-                                );
-                            }
-                            if let Err(e) = journal.flush() {
-                                tracing::error!(
-                                    consumer = name,
-                                    error = %e,
-                                    "comparator journal flush failed"
-                                );
-                            }
+                        ) else {
+                            tracing::error!(
+                                consumer = name,
+                                "comparator envelope seal failed; suppressing broadcast"
+                            );
+                            continue;
+                        };
+                        if let Err(e) = journal.append(&env) {
+                            tracing::error!(
+                                consumer = name,
+                                error = %e,
+                                "comparator journal append failed; suppressing broadcast"
+                            );
+                            continue;
                         }
-                        // Observability-only broadcast AFTER journal
-                        // append+flush. No subscriber in P4-E.
+                        if let Err(e) = journal.flush() {
+                            tracing::error!(
+                                consumer = name,
+                                error = %e,
+                                "comparator journal flush failed; suppressing broadcast"
+                            );
+                            continue;
+                        }
+                        // Append + flush both Ok → safe to emit the
+                        // observability broadcast. No subscriber in
+                        // P4-E.
                         let _ = mismatch_tx.send(MismatchAbortRecord { abort });
                     }
                 }
