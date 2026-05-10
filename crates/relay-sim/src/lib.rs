@@ -128,6 +128,14 @@ pub enum RelaySimError {
     Transport(String),
     #[error("relay sim returned unrecognized payload: {0}")]
     UnrecognizedResponse(String),
+    /// P4-E (R-E1): caller has no signed transactions to send (no
+    /// signing infrastructure exists in P4-E). The adapter MUST
+    /// surface this BEFORE issuing any HTTP request. Comparator
+    /// classifies as `MismatchCategory::Unknown` via `compare_result`.
+    /// Payload-free by design (DP-E11) — no string field that could
+    /// leak secrets.
+    #[error("unsigned bundle unavailable (P4-E has no signer)")]
+    UnsignedBundleUnavailable,
 }
 
 /// Async, object-safe relay sim trait. The HTTP impl lands in P4-E
@@ -574,6 +582,35 @@ mod tests {
         relay.coinbase_transfer_wei = U256::from(1u64);
         let err = compare(inputs_for(&local, &shape, &fp), &relay).expect_err("CMP-6b must abort");
         assert_eq!(err.category, MismatchCategory::BundleOutcome);
+    }
+
+    /// RS-N-1 (P4-E R-E1 + R-E11): UnsignedBundleUnavailable variant
+    /// has stable Display message + is classified by compare_result as
+    /// MismatchCategory::Unknown with MismatchAbort.relay = None. NO
+    /// rkyv/serde round-trip — RelaySimError is not a journal payload.
+    #[test]
+    fn rs_n_1_unsigned_bundle_unavailable_classification() {
+        // Display message stable (catches accidental wording changes).
+        let display = format!("{}", RelaySimError::UnsignedBundleUnavailable);
+        assert!(
+            display.contains("unsigned bundle unavailable"),
+            "Display wording must remain stable; got {display:?}"
+        );
+
+        // compare_result classifies as Unknown; MismatchAbort.relay is None.
+        let local = make_local(100_000, SimStatus::Success, 5_000);
+        let shape = make_local_shape();
+        let fp = make_fingerprint();
+        let err_in = RelaySimError::UnsignedBundleUnavailable;
+        let err = compare_result(inputs_for(&local, &shape, &fp), Err(&err_in))
+            .expect_err("RS-N-1: UnsignedBundleUnavailable must classify as Unknown abort");
+        assert_eq!(err.category, MismatchCategory::Unknown);
+        assert!(err.relay.is_none());
+        assert!(
+            err.detail.contains("unsigned bundle unavailable"),
+            "MismatchAbort.detail must surface the relay-sim error wording; got {:?}",
+            err.detail
+        );
     }
 
     /// CMP-7: compare_result with relay Err(Transport(...)) →

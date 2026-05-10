@@ -18,6 +18,8 @@ members = [
     "crates/execution",
     "crates/state-fetcher",
     "crates/relay-sim",
+    "crates/bundle-relay",
+    "crates/relay-clients",
 ]
 
 [workspace.package]
@@ -89,3 +91,13 @@ revm = { version = "14", default-features = false, features = ["std"] }
 
 # Async trait sugar for crates/relay-sim::RelaySimulator (Phase 4 P4-D).
 async-trait = "0.1"
+
+# HTTP client for crates/relay-clients eth_callBundle adapters (Phase 4 P4-E).
+# default-features keeps native-tls; sufficient for the read-only relay-sim
+# path. No wallet/key features pulled.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+url = "2"
+
+# wiremock for relay-clients dev-tests; never pulled by non-test builds.
+wiremock = "0.6"

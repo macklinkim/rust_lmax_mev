@@ -1,0 +1,18 @@
+[package]
+name = "rust-lmax-mev-bundle-relay"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Phase 4 P4-E BundleRelay trait + SignedBundle + SubmissionReceipt + SubmitDisabled. P4-E ships the trait surface only; every adapter submit_bundle returns Err(SubmitDisabled). No funded key, no signing."
+
+[dependencies]
+rust-lmax-mev-relay-sim = { path = "../relay-sim" }
+alloy-primitives = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+rkyv = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+bincode = { workspace = true }
