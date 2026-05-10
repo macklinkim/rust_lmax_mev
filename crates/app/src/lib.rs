@@ -1084,6 +1084,34 @@ async fn risk_driver(
 /// shape as `simulate(...)`) and emits `SimulationOutcomeWithFingerprint`
 /// envelopes so downstream consumers (execution_driver +
 /// comparator_driver) can both access the local state read-set.
+///
+/// **P4-G fail-closed wiring boundary**: `wire_phase4` constructs
+/// `LocalSimulator::new(SimConfig::defaults())` which holds NO fixtures
+/// (`fixtures: None`). `simulate_with_fingerprint` therefore returns
+/// `Err(SimulationError::Setup("no fixtures loaded; call load_fixture
+/// or prefetch_for first"))` for every inbound `RiskCheckedOpportunity`
+/// in production. The driver below logs the error at WARN and
+/// continues; no `SimulationOutcomeWithFingerprint` is emitted →
+/// `execution_driver` produces no `BundleCandidate` → `comparator_driver`
+/// is never invoked → no relay-sim call, no `MismatchAbort`, no journal
+/// entry, no submission attempt (defense-in-depth on top of P4-E's
+/// `SubmitDisabled` impl + `Arc<dyn RelaySimulator>` upcast prevention
+/// + `live_send=true` config-validation reject).
+///
+/// Production `prefetch_for(&fetcher, opportunity)` integration —
+/// dispatched per-opportunity from this driver and wrapping
+/// `LocalSimulator` in `Arc<Mutex<...>>` so fixtures can be reloaded
+/// per block — is deliberately deferred to **Phase 5 Safety Gate**
+/// because it requires (1) a wired `Arc<dyn StateFetcher>` over an
+/// archive RPC (touches live mainnet state on every event), (2)
+/// per-block fixture-cache invalidation policy + freshness contract,
+/// (3) interior-mutability redesign of `LocalSimulator` (currently
+/// `&mut self` for fixture loading; `Arc<LocalSimulator>` is shared
+/// across drivers).
+///
+/// In P4-G the empty-fixture warn-log is the canonical signal that
+/// production simulation is offline; absence of `MismatchAbort`
+/// records in `mismatch.bin` confirms no comparator activity.
 async fn simulator_driver(
     mut rx: broadcast::Receiver<EventEnvelope<RiskCheckedOpportunity>>,
     sim_tx: broadcast::Sender<EventEnvelope<SimulationOutcomeWithFingerprint>>,
