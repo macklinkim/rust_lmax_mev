@@ -30,10 +30,13 @@
 pub mod cache_db_builder;
 pub mod fixtures;
 pub mod mock_router;
+pub mod observation;
 pub mod reconcile;
 pub mod rkyv_compat;
 pub mod strict_db;
 pub mod swap_calldata;
+
+pub use observation::{LocalStateFingerprint, StateObservation};
 
 use std::sync::Arc;
 
