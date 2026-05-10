@@ -158,6 +158,83 @@ fn sr_1_real_fixture_e2e_arb_emits_revm_computed() {
     );
 }
 
+/// FP-1 (P4-D §R13/§DP-D16): `simulate_with_fingerprint(&rc).0 ==
+/// simulate(&rc)` byte-identical on the same fixture + risk-checked
+/// input. Asserts parity, non-empty fingerprint, AND that a repeat
+/// call returns the same `(outcome, fingerprint)` — proving
+/// `LocalSimulator` does not gain interior state from the fingerprint
+/// path.
+#[test]
+fn fp_1_simulate_with_fingerprint_parity_and_non_mutation() {
+    use rust_lmax_mev_simulator::fixtures;
+
+    let opp = OpportunityEvent {
+        block_number: 22_000_000,
+        block_hash: B256::from(fixtures::V3_WETH_USDC_005_BLOCK_HASH),
+        source_pool: PoolId {
+            kind: PoolKind::UniswapV3Fee005,
+            address: Address::from(fixtures::V3_WETH_USDC_005_ADDRESS),
+        },
+        sink_pool: PoolId {
+            kind: PoolKind::UniswapV2,
+            address: Address::from(fixtures::V2_WETH_USDC_ADDRESS),
+        },
+        optimal_amount_in_wei: U256::from(10_000_000_000_000_000u128),
+        expected_profit_wei: U256::ZERO,
+        gas_estimate: GAS_ESTIMATE_TWO_HOP_ARB,
+    };
+    let risk_checked = RiskCheckedOpportunity {
+        opportunity: opp.clone(),
+        size_wei: opp.optimal_amount_in_wei,
+    };
+
+    let mut sim = LocalSimulator::new(SimConfig::defaults()).expect("new ok");
+    sim.load_fixture(
+        v3_fixture(),
+        v2_fixture(),
+        weth_fixture(),
+        usdc_proxy_fixture(),
+        usdc_impl_fixture(),
+        v2_factory_fixture(),
+    )
+    .expect("load_fixture ok");
+
+    // Parity: simulate_with_fingerprint must produce the same outcome
+    // as simulate on the same input.
+    let baseline = sim.simulate(&risk_checked).expect("simulate ok");
+    let (with_fp_outcome, fingerprint_a) = sim
+        .simulate_with_fingerprint(&risk_checked)
+        .expect("simulate_with_fingerprint ok");
+    assert_eq!(
+        baseline, with_fp_outcome,
+        "FP-1 parity: simulate_with_fingerprint must match simulate byte-for-byte"
+    );
+
+    // Fingerprint correctness: block_hash matches, observations
+    // captured (real-revm execution touches many slots).
+    assert_eq!(fingerprint_a.block_hash, opp.block_hash);
+    assert!(
+        !fingerprint_a.observations.is_empty(),
+        "FP-1: fingerprint must capture at least one storage read"
+    );
+
+    // Non-mutation: a second simulate_with_fingerprint must produce
+    // the same outcome AND the same fingerprint (LocalSimulator
+    // cannot have gained interior state).
+    let (with_fp_outcome_2, fingerprint_b) = sim
+        .simulate_with_fingerprint(&risk_checked)
+        .expect("simulate_with_fingerprint repeat ok");
+    assert_eq!(with_fp_outcome, with_fp_outcome_2);
+    assert_eq!(fingerprint_a, fingerprint_b);
+
+    // Cross-check: simulate also still works after simulate_with_fingerprint.
+    let baseline_after = sim.simulate(&risk_checked).expect("simulate ok after fp");
+    assert_eq!(
+        baseline, baseline_after,
+        "simulate is unaffected by interleaved simulate_with_fingerprint"
+    );
+}
+
 // --- Synthetic opportunity for SR-4 (no-fixture Setup error) -------------
 
 fn synthetic_opportunity_v2_to_v3() -> OpportunityEvent {

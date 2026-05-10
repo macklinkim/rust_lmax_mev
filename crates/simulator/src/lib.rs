@@ -32,11 +32,13 @@ pub mod fixtures;
 pub mod mock_router;
 pub mod observation;
 pub mod reconcile;
+pub mod recording_db;
 pub mod rkyv_compat;
 pub mod strict_db;
 pub mod swap_calldata;
 
 pub use observation::{LocalStateFingerprint, StateObservation};
+pub use recording_db::RecordingDb;
 
 use std::sync::Arc;
 
@@ -558,6 +560,235 @@ impl LocalSimulator {
             simulated_profit_wei: profit,
             profit_source: ProfitSource::RevmComputed,
         })
+    }
+
+    /// Phase 4 P4-D peer to `simulate(...)` that additionally records
+    /// the storage read-set into a `LocalStateFingerprint`. Same
+    /// inputs, same execution path, same `SimulationOutcome` (FP-1
+    /// parity invariant); the only difference is the database is
+    /// wrapped in `RecordingDb<StrictMissingDb>` so every successful
+    /// `Database::storage` call is captured. The wrapper lives
+    /// entirely on the call's stack frame — `LocalSimulator` does
+    /// NOT gain interior state.
+    ///
+    /// Used by the (deferred-to-P4-E/G) relay-sim comparator to
+    /// detect `MismatchCategory::StateDependency` divergences against
+    /// the relay's own observation set. Per the P4-D execution note
+    /// v0.4 §DP-D9'/§DP-D16/§R8/§R13.
+    pub fn simulate_with_fingerprint(
+        &self,
+        risk_checked: &RiskCheckedOpportunity,
+    ) -> Result<(SimulationOutcome, LocalStateFingerprint), SimulationError> {
+        let opp = &risk_checked.opportunity;
+        let fixtures = self.fixtures.as_ref().ok_or_else(|| {
+            SimulationError::Setup(
+                "no fixtures loaded; call load_fixture or prefetch_for first".into(),
+            )
+        })?;
+
+        if fixtures.block_hash != opp.block_hash {
+            return Err(SimulationError::Setup(format!(
+                "fixture block_hash {:?} != opportunity block_hash {:?}",
+                fixtures.block_hash, opp.block_hash
+            )));
+        }
+        if fixtures.source.pool != opp.source_pool {
+            return Err(SimulationError::Setup(format!(
+                "loaded source pool {:?} != opportunity source_pool {:?}",
+                fixtures.source.pool, opp.source_pool
+            )));
+        }
+        if fixtures.sink.pool != opp.sink_pool {
+            return Err(SimulationError::Setup(format!(
+                "loaded sink pool {:?} != opportunity sink_pool {:?}",
+                fixtures.sink.pool, opp.sink_pool
+            )));
+        }
+
+        let block_hash = fixtures.block_hash;
+        let weth_address = fixtures.weth.address;
+        let usdc_proxy_address = fixtures.usdc_proxy.address;
+
+        let router_weth_balance_slot = mapping_slot_u256(
+            U256::from(WETH9_BALANCES_SLOT),
+            address_key(MOCK_ROUTER_ADDRESS),
+        );
+        let mut weth_fixture = fixtures.weth.clone();
+        let prefund_value = B256::from(opp.optimal_amount_in_wei.to_be_bytes::<32>());
+        if let Some(entry) = weth_fixture
+            .storage
+            .iter_mut()
+            .find(|(s, _)| *s == router_weth_balance_slot)
+        {
+            entry.1 = prefund_value;
+        } else {
+            weth_fixture
+                .storage
+                .push((router_weth_balance_slot, prefund_value));
+        }
+
+        let extra_accounts = [
+            weth_fixture,
+            fixtures.usdc_proxy.clone(),
+            fixtures.usdc_impl.clone(),
+            fixtures.v2_factory.clone(),
+        ];
+
+        let aux = AuxiliaryAccounts {
+            mock_router_address: MOCK_ROUTER_ADDRESS,
+            mock_router_bytecode: Bytes::from_static(MOCK_ROUTER_RUNTIME),
+            mock_router_eth_balance_wei: self.cfg.eoa_initial_balance_wei,
+            mock_router_weth_balance_wei: opp.optimal_amount_in_wei,
+        };
+
+        let prepared = build_prepared(
+            &fixtures.source,
+            &fixtures.sink,
+            &extra_accounts,
+            &aux,
+            weth_address,
+            router_weth_balance_slot,
+        )?;
+        let mut inner = prepared.db;
+        let pre_router_weth = prepared.pre_router_weth_wei;
+
+        inner.insert_account(Address::ZERO, code_less_account(U256::ZERO));
+        inner.insert_account(
+            TEST_EOA_CALLER,
+            code_less_account(self.cfg.eoa_initial_balance_wei),
+        );
+
+        // Wrap in RecordingDb. From here on every Database::storage
+        // call is captured; basic/code/block_hash are pass-through.
+        let db = RecordingDb::new(inner);
+
+        let weth_in = opp.optimal_amount_in_wei;
+        let swap1_calldata = build_router_calldata_sell_weth(
+            &fixtures.sink,
+            weth_in,
+            weth_address,
+            usdc_proxy_address,
+        )?;
+
+        let block_timestamp = v2_block_timestamp_last(&fixtures.source)
+            .or_else(|| v2_block_timestamp_last(&fixtures.sink));
+        let mut evm = build_evm(db, &self.cfg, opp.block_number, block_timestamp);
+        let (swap1_status, swap1_gas) = exec_router_call(&mut evm, swap1_calldata, 0)?;
+        if !matches!(swap1_status, SimStatus::Success) {
+            let observations = evm.context.evm.db.observations();
+            return Ok((
+                SimulationOutcome {
+                    opportunity_block_number: opp.block_number,
+                    gas_used: swap1_gas,
+                    status: swap1_status,
+                    simulated_profit_wei: U256::ZERO,
+                    profit_source: ProfitSource::RevmComputed,
+                },
+                LocalStateFingerprint {
+                    block_hash,
+                    observations,
+                },
+            ));
+        }
+
+        let router_usdc_balance_slot = mapping_slot_u256(
+            U256::from(USDC_BALANCES_SLOT),
+            address_key(MOCK_ROUTER_ADDRESS),
+        );
+        let usdc_in = match evm
+            .context
+            .evm
+            .db
+            .storage(usdc_proxy_address, router_usdc_balance_slot)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let observations = evm.context.evm.db.observations();
+                return Ok((
+                    SimulationOutcome {
+                        opportunity_block_number: opp.block_number,
+                        gas_used: swap1_gas,
+                        status: SimStatus::Reverted {
+                            reason_hex: format!("read USDC balance after swap-1: {e:?}"),
+                        },
+                        simulated_profit_wei: U256::ZERO,
+                        profit_source: ProfitSource::RevmComputed,
+                    },
+                    LocalStateFingerprint {
+                        block_hash,
+                        observations,
+                    },
+                ));
+            }
+        };
+
+        let swap2_calldata = build_router_calldata_buy_weth(
+            &fixtures.source,
+            usdc_in,
+            weth_address,
+            usdc_proxy_address,
+        )?;
+
+        let (swap2_status, swap2_gas) = exec_router_call(&mut evm, swap2_calldata, 1)?;
+        if !matches!(swap2_status, SimStatus::Success) {
+            let observations = evm.context.evm.db.observations();
+            return Ok((
+                SimulationOutcome {
+                    opportunity_block_number: opp.block_number,
+                    gas_used: swap1_gas.saturating_add(swap2_gas),
+                    status: swap2_status,
+                    simulated_profit_wei: U256::ZERO,
+                    profit_source: ProfitSource::RevmComputed,
+                },
+                LocalStateFingerprint {
+                    block_hash,
+                    observations,
+                },
+            ));
+        }
+
+        let post_router_weth = match evm
+            .context
+            .evm
+            .db
+            .storage(weth_address, router_weth_balance_slot)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let observations = evm.context.evm.db.observations();
+                return Ok((
+                    SimulationOutcome {
+                        opportunity_block_number: opp.block_number,
+                        gas_used: swap1_gas.saturating_add(swap2_gas),
+                        status: SimStatus::Reverted {
+                            reason_hex: format!("read post WETH balance: {e:?}"),
+                        },
+                        simulated_profit_wei: U256::ZERO,
+                        profit_source: ProfitSource::RevmComputed,
+                    },
+                    LocalStateFingerprint {
+                        block_hash,
+                        observations,
+                    },
+                ));
+            }
+        };
+        let profit = post_router_weth.saturating_sub(pre_router_weth);
+        let observations = evm.context.evm.db.observations();
+
+        Ok((
+            SimulationOutcome {
+                opportunity_block_number: opp.block_number,
+                gas_used: swap1_gas.saturating_add(swap2_gas),
+                status: SimStatus::Success,
+                simulated_profit_wei: profit,
+                profit_source: ProfitSource::RevmComputed,
+            },
+            LocalStateFingerprint {
+                block_hash,
+                observations,
+            },
+        ))
     }
 }
 
