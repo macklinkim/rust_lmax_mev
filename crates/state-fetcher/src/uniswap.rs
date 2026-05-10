@@ -84,6 +84,25 @@ impl PoolSlotLayout for UniswapV2Layout {
     }
 }
 
+// --- SushiswapV2Pair layout (P4-F) ------------------------------------
+
+/// Phase 4 P4-F: SushiswapV2 storage layout. Sushiswap V2 is a
+/// UniswapV2 fork — the contract is bytecode-equivalent at the
+/// storage-layout level (factory, token0, token1, packed reserves +
+/// blockTimestampLast occupy the same slot indices). Defined as a
+/// separate type for caller-side dispatch clarity, but delegates
+/// every method to `UniswapV2Layout`.
+pub struct SushiswapV2Layout;
+
+impl PoolSlotLayout for SushiswapV2Layout {
+    fn base_slots(&self, pool: &PoolId) -> Vec<U256> {
+        UniswapV2Layout.base_slots(pool)
+    }
+    fn derived_slots(&self, pool: &PoolId, already: &[(U256, B256)]) -> Vec<U256> {
+        UniswapV2Layout.derived_slots(pool, already)
+    }
+}
+
 // --- UniswapV3Pool 0.05% layout ---------------------------------------
 
 /// Verified UniswapV3Pool storage layout (0.05% fee tier, tick spacing
@@ -309,6 +328,33 @@ mod tests {
         assert!(
             UniswapV2Layout.derived_slots(&pool, &[]).is_empty(),
             "V2 has no derived slots"
+        );
+    }
+
+    /// L-S-V2-1 (P4-F): SushiswapV2Layout returns slot indices identical
+    /// to UniswapV2Layout — Sushi V2 is a UniV2 fork with the same
+    /// storage layout. Catches an accidental future divergence (e.g.
+    /// someone adds a Sushi-specific slot remap that breaks the V2-fork
+    /// invariant).
+    #[test]
+    fn sushiswap_v2_layout_matches_uniswap_v2() {
+        use rust_lmax_mev_state::PoolKind;
+        let pool = PoolId {
+            kind: PoolKind::SushiswapV2,
+            address: alloy_primitives::address!("397ff1542f962076d0bfe58ea045ffa2d347aca0"),
+        };
+        let sushi = SushiswapV2Layout.base_slots(&pool);
+        let uni = UniswapV2Layout.base_slots(&PoolId {
+            kind: PoolKind::UniswapV2,
+            ..pool.clone()
+        });
+        assert_eq!(
+            sushi, uni,
+            "SushiswapV2Layout must mirror UniswapV2Layout (V2 fork)"
+        );
+        assert!(
+            SushiswapV2Layout.derived_slots(&pool, &[]).is_empty(),
+            "SushiV2 has no derived slots (matches UniV2)"
         );
     }
 

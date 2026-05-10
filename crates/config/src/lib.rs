@@ -166,6 +166,37 @@ pub struct IngressConfig {
     /// `tx.to ∈ watched_addresses`. `Config::validate` rejects an empty
     /// list with `ConfigError::EmptyWatchedAddresses`.
     pub watched_addresses: Vec<Address>,
+    /// Phase 4 P4-F per ADR-003 §"External feed options": runtime
+    /// selector between the GethWS local-node mempool (default —
+    /// existing P2-A behavior) and the external feed adapter (P4-F
+    /// scaffold; production transport is Phase 5+ per the
+    /// fail-closed `ExternalMempoolSource` contract). `#[serde(default)]`
+    /// keeps existing TOML configs (predating P4-F) parsing unchanged.
+    #[serde(default)]
+    pub mempool_source: MempoolSourceKind,
+    /// Phase 4 P4-F: optional external mempool endpoint URL. Held by
+    /// `ExternalMempoolSource` in a private field; never logged. Only
+    /// consumed when `mempool_source = "external"`.
+    #[serde(default)]
+    pub external_mempool_endpoint: Option<String>,
+    /// Phase 4 P4-F: optional external mempool API key (bloXroute /
+    /// Chainbound). Held in a private field; never logged.
+    #[serde(default)]
+    pub external_mempool_api_key: Option<String>,
+}
+
+/// Phase 4 P4-F per ADR-003: which mempool feed implementation to
+/// wire. `Default = GethWs` keeps the established P2-A behavior.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MempoolSourceKind {
+    #[default]
+    GethWs,
+    /// External-feed adapter scaffold (bloXroute / Chainbound). In
+    /// P4-F this resolves to `ExternalMempoolSource` which is
+    /// fail-closed (emits `ExternalNotConfigured` on every stream)
+    /// because production transport is Phase 5+ work.
+    External,
 }
 
 /// Typed WETH/USDC role identities per ADR-002 thin-path scope.
@@ -215,6 +246,14 @@ pub enum PoolKind {
     /// `uniswap_v3_fee_005` TOML form.
     #[serde(rename = "uniswap_v3_fee_005")]
     UniswapV3Fee005,
+    /// Phase 4 P4-F: Sushiswap V2 WETH/USDC per ADR-002 §"Deferred to
+    /// Phase 4". Sushiswap V2 is a UniswapV2Pair fork: identical
+    /// storage layout, identical `getReserves()` ABI, identical
+    /// constant-product math. Fetched via the existing UniV2 caller
+    /// path; opportunity engine treats it as another `PoolState::UniV2`
+    /// venue for cross-venue arb.
+    #[serde(rename = "sushiswap_v2")]
+    SushiswapV2,
 }
 
 /// Phase 4 P4-E relay section per execution-note v0.6 §D-E2 + DP-E3 +
@@ -756,6 +795,54 @@ address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
     // Phase 4 P4-E config tests (CFG-LIVE-SEND-1, CFG-RELAY-1,
     // CFG-MISMATCH-JOURNAL-1) per execution-note v0.6.
     // ----------------------------------------------------------------
+
+    /// CFG-MEMPOOL-1 (P4-F): mempool_source selector defaults to
+    /// GethWs when omitted; explicit "external" parses; the optional
+    /// endpoint + api_key fields are accepted (held for the
+    /// fail-closed ExternalMempoolSource adapter to consume).
+    #[test]
+    fn cfg_mempool_1_source_selector_default_and_external_parse() {
+        // Default: omitted [ingress.mempool_source] → GethWs.
+        let cfg = Config::from_toml_str(valid_minimum_toml()).expect("default ok");
+        assert_eq!(cfg.ingress.mempool_source, MempoolSourceKind::GethWs);
+        assert!(cfg.ingress.external_mempool_endpoint.is_none());
+        assert!(cfg.ingress.external_mempool_api_key.is_none());
+
+        // Explicit external + endpoint + api_key.
+        let toml = valid_minimum_toml().to_string().replace(
+            "watched_addresses = [",
+            "mempool_source = \"external\"\nexternal_mempool_endpoint = \"https://bdn.example/v2\"\nexternal_mempool_api_key = \"test-key\"\nwatched_addresses = [",
+        );
+        let cfg = Config::from_toml_str(&toml).expect("CFG-MEMPOOL-1 external must parse");
+        assert_eq!(cfg.ingress.mempool_source, MempoolSourceKind::External);
+        assert_eq!(
+            cfg.ingress.external_mempool_endpoint.as_deref(),
+            Some("https://bdn.example/v2")
+        );
+        assert_eq!(
+            cfg.ingress.external_mempool_api_key.as_deref(),
+            Some("test-key")
+        );
+    }
+
+    /// CFG-SUSHI-1 (P4-F): `sushiswap_v2` PoolKind round-trips through
+    /// TOML deserialization on a state.pools entry. Confirms ADR-002
+    /// §"Deferred to Phase 4" Sushi unlock is wired into the config
+    /// schema.
+    #[test]
+    fn cfg_sushi_1_pool_kind_sushiswap_v2_parses() {
+        let toml = valid_minimum_toml()
+            .to_string()
+            .replace("kind = \"uniswap_v2\"", "kind = \"sushiswap_v2\"");
+        let cfg = Config::from_toml_str(&toml).expect("CFG-SUSHI-1 must parse");
+        assert!(
+            cfg.state
+                .pools
+                .iter()
+                .any(|p| matches!(p.kind, PoolKind::SushiswapV2)),
+            "state.pools must contain a SushiswapV2 entry after rename"
+        );
+    }
 
     /// CFG-LIVE-SEND-1 (DP-E9): `relay.live_send = true` is rejected
     /// at config load with `ConfigError::LiveSendForbidden`. The

@@ -195,7 +195,12 @@ impl StateEngine {
         let mut events = Vec::with_capacity(self.pools.len());
         for pool in &self.pools {
             let state = match pool.kind {
-                PoolKind::UniswapV2 => self.fetch_v2(pool.address, block_id).await?,
+                // Phase 4 P4-F: SushiswapV2 reuses the V2 caller path
+                // (Sushi V2 is a UniV2 fork; identical getReserves()
+                // ABI + constant-product math).
+                PoolKind::UniswapV2 | PoolKind::SushiswapV2 => {
+                    self.fetch_v2(pool.address, block_id).await?
+                }
                 PoolKind::UniswapV3Fee005 => self.fetch_v3(pool.address, block_id).await?,
             };
             let key = snapshot_key(block_number, &pool.address);

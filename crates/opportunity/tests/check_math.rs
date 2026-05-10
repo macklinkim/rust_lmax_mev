@@ -273,3 +273,38 @@ fn identical_inputs_produce_identical_events() {
         .unwrap();
     assert_eq!(e1, e2);
 }
+
+/// O-SUSHI-1 (P4-F): SushiswapV2 venue participates in cross-venue arb
+/// using the pool-kind-agnostic Q64 math path. Asserts:
+/// - SushiV2 vs UniV2 with divergent ratios produces an OpportunityEvent.
+/// - source/sink pools carry the SushiswapV2 PoolKind verbatim.
+/// - SushiV2 vs UniV3-005 also works (the existing UniV2/UniV3 math
+///   doesn't care which V2-style pool feeds the math).
+#[test]
+fn o_sushi_1_sushiswap_v2_participates_in_cross_venue_arb() {
+    fn pool_sushi() -> PoolId {
+        PoolId {
+            kind: PoolKind::SushiswapV2,
+            address: Address::from([0xA1; 20]),
+        }
+    }
+    let v2_ratio = U256::from(1_000u64) << 64; // canonical mid
+    let sushi_ratio = U256::from(1_010u64) << 64; // sushi cheaper WETH
+
+    // SushiV2 vs UniV2: ratios differ → opportunity, source = sushi (higher Q64 = cheaper WETH).
+    let sushi = univ2_with_q64(sushi_ratio);
+    let univ2 = univ2_with_q64(v2_ratio);
+    let evt = engine()
+        .check(&ctx(), &pool_sushi(), &sushi, &pool_v2(), &univ2)
+        .expect("SushiV2 vs UniV2 must yield an opportunity");
+    assert_eq!(evt.source_pool.kind, PoolKind::SushiswapV2);
+    assert_eq!(evt.sink_pool.kind, PoolKind::UniswapV2);
+
+    // SushiV2 vs UniV3-005: same engine, different sink venue.
+    let v3 = univ3_with_root_shift64(1_000);
+    let evt = engine()
+        .check(&ctx(), &pool_sushi(), &sushi, &pool_v3(), &v3)
+        .expect("SushiV2 vs UniV3-005 must yield an opportunity");
+    assert_eq!(evt.source_pool.kind, PoolKind::SushiswapV2);
+    assert_eq!(evt.sink_pool.kind, PoolKind::UniswapV3Fee005);
+}

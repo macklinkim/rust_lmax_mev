@@ -41,6 +41,111 @@ pub trait MempoolSource: Send + Sync {
     ) -> Pin<Box<dyn Stream<Item = Result<MempoolEvent, IngressError>> + Send + 'static>>;
 }
 
+/// Phase 4 P4-F: external mempool feed adapter scaffold per ADR-003
+/// "External feed options (choose one at deployment time): bloXroute
+/// BDN | Chainbound Fiber". P4-F ships the structural shape ONLY:
+/// the production transport stays Phase 5+ work because both vendors
+/// require a paid API key + live network access. P4-E's secret-
+/// redaction discipline applies: endpoint URL + API key are held in
+/// private fields and NEVER emitted into `tracing::*` / `IngressError`
+/// / event journal payloads.
+///
+/// **Behavior in P4-F** (fail-closed):
+/// - `stream()` returns a stream that emits exactly ONE
+///   `Err(IngressError::ExternalNotConfigured)` and then ends.
+///   No HTTP / WS connection is opened. No URL is logged.
+///
+/// The `IngressConfig.mempool_source` selector lets operators wire
+/// the GethWS impl (default) or the external impl; selecting the
+/// external impl in P4-F means "always fail-closed", which is the
+/// correct behavior until Phase 5+ wires the real transport.
+pub struct ExternalMempoolSource {
+    // Fields are intentionally private + Debug-elided so the URL +
+    // API key cannot leak via Debug-derive. Phase 5+ adds the actual
+    // transport that consumes these.
+    _endpoint: Option<String>,
+    _api_key: Option<String>,
+}
+
+impl std::fmt::Debug for ExternalMempoolSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // SECRET REDACTION: never include endpoint or api_key.
+        f.debug_struct("ExternalMempoolSource")
+            .field("endpoint_set", &self._endpoint.is_some())
+            .field("api_key_set", &self._api_key.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExternalMempoolSource {
+    /// Construct from optional endpoint + api_key. Both fields can be
+    /// `None` (in which case `stream()` still fails closed). Only the
+    /// public test-helper [`programmable_for_tests`] produces a
+    /// non-fail-closed instance, and it does NOT touch the network.
+    pub fn new(endpoint: Option<String>, api_key: Option<String>) -> Self {
+        Self {
+            _endpoint: endpoint,
+            _api_key: api_key,
+        }
+    }
+
+    /// Test-only programmable constructor: returns a sink that emits
+    /// the supplied items as-is. Production code must use [`new`]
+    /// only. (Note: this is a free function to keep the production
+    /// `ExternalMempoolSource` struct shape unchanged.)
+    pub fn programmable_for_tests(
+        items: Vec<Result<MempoolEvent, IngressError>>,
+    ) -> ProgrammableMempoolSource {
+        ProgrammableMempoolSource { items }
+    }
+}
+
+impl MempoolSource for ExternalMempoolSource {
+    fn stream(
+        &self,
+    ) -> Pin<Box<dyn Stream<Item = Result<MempoolEvent, IngressError>> + Send + 'static>> {
+        // Fail-closed: emit exactly one ExternalNotConfigured error and
+        // end the stream. No URL/API-key access; nothing logged.
+        let (tx, rx) = mpsc::unbounded::<Result<MempoolEvent, IngressError>>();
+        let _ = tx.unbounded_send(Err(IngressError::ExternalNotConfigured));
+        drop(tx);
+        Box::pin(rx)
+    }
+}
+
+/// Test-only programmable mempool source. Drives the canonical
+/// `MempoolSource` contract from a fixed Vec of items so unit tests
+/// can verify that downstream wiring (drivers, journal-drains, the
+/// comparator chain) is invariant under a swap of mempool source.
+/// **Not used by production code.**
+pub struct ProgrammableMempoolSource {
+    items: Vec<Result<MempoolEvent, IngressError>>,
+}
+
+impl MempoolSource for ProgrammableMempoolSource {
+    fn stream(
+        &self,
+    ) -> Pin<Box<dyn Stream<Item = Result<MempoolEvent, IngressError>> + Send + 'static>> {
+        let (tx, rx) = mpsc::unbounded::<Result<MempoolEvent, IngressError>>();
+        for item in &self.items {
+            let cloned = match item {
+                Ok(ev) => Ok(ev.clone()),
+                Err(IngressError::ExternalNotConfigured) => {
+                    Err(IngressError::ExternalNotConfigured)
+                }
+                Err(IngressError::Closed) => Err(IngressError::Closed),
+                Err(IngressError::Decode(s)) => Err(IngressError::Decode(s.clone())),
+                Err(IngressError::Node(_)) => Err(IngressError::Decode(
+                    "programmable: Node errors not cloneable".into(),
+                )),
+            };
+            let _ = tx.unbounded_send(cloned);
+        }
+        drop(tx);
+        Box::pin(rx)
+    }
+}
+
 /// Geth WS pending-tx subscription wrapped with dedup + per-hash full-
 /// tx fetch + WETH/USDC filter.
 pub struct GethWsMempool {
@@ -252,6 +357,16 @@ pub enum IngressError {
 
     #[error("ingress closed")]
     Closed,
+
+    /// Phase 4 P4-F: external mempool source has missing or
+    /// unconfigured credentials/endpoint. Returned by
+    /// `ExternalMempoolSource` when the operator has selected the
+    /// external feed in config but has not supplied the required
+    /// fields. Payload-free (no string field) to eliminate any
+    /// secret-leak surface — the configuration error is signalled
+    /// purely by the variant identity.
+    #[error("external mempool source not configured")]
+    ExternalNotConfigured,
 }
 
 #[cfg(test)]
@@ -357,5 +472,100 @@ mod tests {
             1,
             "fetch called exactly once for the dedup'd hash"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 4 P4-F ExternalMempoolSource tests.
+    // ----------------------------------------------------------------
+
+    /// E-EXT-1 (P4-F): ExternalMempoolSource is fail-closed by default.
+    /// stream() emits exactly one ExternalNotConfigured error and ends;
+    /// no network I/O is attempted.
+    #[tokio::test]
+    async fn ext_1_external_mempool_is_fail_closed_by_default() {
+        let src = ExternalMempoolSource::new(None, None);
+        let mut s = src.stream();
+        let first = s.next().await;
+        match first {
+            Some(Err(IngressError::ExternalNotConfigured)) => {}
+            other => panic!("expected ExternalNotConfigured on first poll, got {other:?}"),
+        }
+        // Stream must end after the single error (no spurious retries).
+        assert!(
+            s.next().await.is_none(),
+            "stream must end after fail-closed error"
+        );
+    }
+
+    /// E-EXT-2 (P4-F): ExternalMempoolSource fails closed even when
+    /// the operator supplied an endpoint + API key. P4-F is structural-
+    /// shape only; production transport lands at Phase 5+. The test
+    /// also verifies the URL and API key NEVER leak into Debug output
+    /// or the error variant.
+    #[tokio::test]
+    async fn ext_2_external_mempool_with_creds_still_fail_closed_no_secret_leak() {
+        const SECRET_URL: &str = "https://example.invalid/?token=SECRETTOKEN";
+        const SECRET_KEY: &str = "SECRETKEY";
+        let src =
+            ExternalMempoolSource::new(Some(SECRET_URL.to_string()), Some(SECRET_KEY.to_string()));
+
+        // Debug elision: SECRETTOKEN + SECRETKEY must not appear.
+        let dbg = format!("{src:?}");
+        assert!(
+            !dbg.contains("SECRETTOKEN"),
+            "Debug must elide URL secret; got {dbg:?}"
+        );
+        assert!(
+            !dbg.contains("SECRETKEY"),
+            "Debug must elide API key; got {dbg:?}"
+        );
+
+        // Stream still fail-closes (production transport is Phase 5+).
+        let mut s = src.stream();
+        let first = s.next().await;
+        match &first {
+            Some(Err(IngressError::ExternalNotConfigured)) => {}
+            other => panic!("expected ExternalNotConfigured, got {other:?}"),
+        }
+
+        // Error display must NOT contain the secret (variant is
+        // payload-free; this guards against future regressions that
+        // add a payload).
+        let err_display = format!("{}", first.unwrap().unwrap_err());
+        assert!(!err_display.contains("SECRETTOKEN"));
+        assert!(!err_display.contains("SECRETKEY"));
+    }
+
+    /// E-EXT-3 (P4-F): the programmable test-mode source emits the
+    /// supplied items as-is. Proves the trait surface is wireable
+    /// from a deterministic test-only producer (used by future
+    /// integration tests to exercise downstream wiring under a swap
+    /// of mempool source).
+    #[tokio::test]
+    async fn ext_3_programmable_test_source_replays_items() {
+        let evt = mempool_event_with_target_address(watched_a());
+        let src = ExternalMempoolSource::programmable_for_tests(vec![
+            Ok(evt.clone()),
+            Err(IngressError::ExternalNotConfigured),
+        ]);
+        let mut s = src.stream();
+        let first = s.next().await.expect("first item");
+        assert!(matches!(first, Ok(ref ev) if ev.tx_hash == evt.tx_hash));
+        let second = s.next().await.expect("second item");
+        assert!(matches!(second, Err(IngressError::ExternalNotConfigured)));
+        assert!(s.next().await.is_none());
+    }
+
+    fn mempool_event_with_target_address(addr: alloy_primitives::Address) -> MempoolEvent {
+        MempoolEvent {
+            tx_hash: B256::from([0xAA; 32]),
+            from: addr,
+            to: Some(addr),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            gas_limit: 0,
+            max_fee: 0,
+            observed_at_ns: 1_700_000_000_000_000_000,
+        }
     }
 }

@@ -914,7 +914,10 @@ fn build_router_calldata_sell_weth(
     _usdc_address: Address,
 ) -> Result<Bytes, SimulationError> {
     match pool.pool.kind {
-        PoolKind::UniswapV2 => {
+        // P4-F: SushiswapV2 reuses the V2 swap calldata path
+        // (Sushi V2 is a UniV2 fork — same getReserves() shape +
+        // constant-product math).
+        PoolKind::UniswapV2 | PoolKind::SushiswapV2 => {
             let (reserve0_usdc, reserve1_weth) = decode_v2_reserves(pool).ok_or_else(|| {
                 SimulationError::Setup(format!(
                     "V2 pool {:?} reserves slot 8 not in fixture",
@@ -955,7 +958,8 @@ fn build_router_calldata_buy_weth(
     usdc_address: Address,
 ) -> Result<Bytes, SimulationError> {
     match pool.pool.kind {
-        PoolKind::UniswapV2 => {
+        // P4-F: SushiswapV2 reuses the V2 path (Sushi V2 is a UniV2 fork).
+        PoolKind::UniswapV2 | PoolKind::SushiswapV2 => {
             let (reserve0_usdc, reserve1_weth) = decode_v2_reserves(pool).ok_or_else(|| {
                 SimulationError::Setup(format!(
                     "V2 pool {:?} reserves slot 8 not in fixture",
@@ -1035,7 +1039,8 @@ fn extend_u256_be(buf: &mut Vec<u8>, v: U256) {
 /// Parse `blockTimestampLast` (uint32) from V2's packed slot 8. Returns
 /// `None` if the pool is not V2 or slot 8 isn't in the fixture.
 fn v2_block_timestamp_last(state: &FetchedPoolState) -> Option<u32> {
-    if !matches!(state.pool.kind, PoolKind::UniswapV2) {
+    // P4-F: SushiV2 has the same packed reserves slot 8 (V2 fork).
+    if !matches!(state.pool.kind, PoolKind::UniswapV2 | PoolKind::SushiswapV2) {
         return None;
     }
     let value = state
@@ -1076,7 +1081,10 @@ async fn layout_dispatch(
     block_hash: B256,
 ) -> Result<FetchedPoolState, SimulationError> {
     let result = match pool.kind {
-        PoolKind::UniswapV2 => fetcher.fetch_pool(pool, block_hash, &UniswapV2Layout).await,
+        // P4-F: SushiV2 reuses the V2 layout (Sushi V2 is a UniV2 fork).
+        PoolKind::UniswapV2 | PoolKind::SushiswapV2 => {
+            fetcher.fetch_pool(pool, block_hash, &UniswapV2Layout).await
+        }
         PoolKind::UniswapV3Fee005 => {
             fetcher
                 .fetch_pool(pool, block_hash, &UniswapV3Fee005Layout)

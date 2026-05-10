@@ -114,7 +114,8 @@ pub fn expected_events(blocks: &[RecordedBlock], pools: &[PoolId]) -> Vec<StateU
         let i = b.number - 100;
         for pool in pools {
             let state = match pool.kind {
-                PoolKind::UniswapV2 => PoolState::UniV2 {
+                // P4-F: SushiV2 emits UniV2-shaped state (V2 fork).
+                PoolKind::UniswapV2 | PoolKind::SushiswapV2 => PoolState::UniV2 {
                     reserve0: U256::from(1_000_000u128 + (i as u128) * 100),
                     reserve1: U256::from(2_000_000u128 + (i as u128) * 100),
                     block_timestamp_last: (0xDEAD_0000u32) + i as u32,

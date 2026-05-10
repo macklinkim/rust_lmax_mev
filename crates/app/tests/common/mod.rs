@@ -18,7 +18,8 @@ use std::path::PathBuf;
 
 use rust_lmax_mev_config::{
     BusConfig, Config, FallbackRpcConfig, IngressConfig, IngressTokens, JournalConfig, LogFormat,
-    NodeConfig, ObservabilityConfig, PoolConfig, PoolKind, RelayConfig, StateConfig,
+    MempoolSourceKind, NodeConfig, ObservabilityConfig, PoolConfig, PoolKind, RelayConfig,
+    StateConfig,
 };
 
 /// Builds a `Config` whose journal + snapshot paths live under
@@ -61,6 +62,11 @@ pub fn make_config(tempdir: &std::path::Path) -> Config {
             watched_addresses: vec!["0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
                 .parse()
                 .unwrap()],
+            // P4-F: default to GethWs (existing P2-A behavior); tests
+            // that exercise the External adapter set this explicitly.
+            mempool_source: MempoolSourceKind::GethWs,
+            external_mempool_endpoint: None,
+            external_mempool_api_key: None,
         },
         state: StateConfig {
             pools: vec![PoolConfig {

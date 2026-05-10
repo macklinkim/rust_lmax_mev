@@ -823,12 +823,13 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
         "comparator-driver",
     ));
 
-    let watched = config.ingress.watched_addresses.clone();
-    let producer_provider = Arc::clone(&provider);
+    // P4-F: dispatch on `config.ingress.mempool_source` selector.
+    let mempool_source = build_mempool_source_from_config(config, Arc::clone(&provider));
     let producer_ingress_tx = ingress_tx.clone();
-    let producer_task = tokio::spawn(async move {
-        producer_loop_phase4(producer_provider, watched, producer_ingress_tx).await
-    });
+    let producer_task =
+        tokio::spawn(
+            async move { producer_loop_phase4(mempool_source, producer_ingress_tx).await },
+        );
 
     Ok(AppHandle4 {
         provider,
@@ -858,14 +859,10 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
 }
 
 async fn producer_loop_phase4(
-    provider: Arc<NodeProvider>,
-    watched: Vec<alloy_primitives::Address>,
+    source: Box<dyn rust_lmax_mev_ingress::MempoolSource>,
     bus: broadcast::Sender<EventEnvelope<IngressEvent>>,
 ) {
     use futures::StreamExt;
-    use rust_lmax_mev_ingress::{GethWsMempool, MempoolSource};
-
-    let source = GethWsMempool::new(provider, watched);
     let mut stream = source.stream();
     let mut seq: u64 = 0;
     while let Some(item) = stream.next().await {
@@ -880,6 +877,30 @@ async fn producer_loop_phase4(
                 tracing::warn!(error = %e, "ingress source error; continuing");
             }
         }
+    }
+}
+
+/// P4-F: build the configured `MempoolSource` from `IngressConfig`.
+/// `MempoolSourceKind::GethWs` (default) constructs the existing
+/// `GethWsMempool`. `MempoolSourceKind::External` constructs the
+/// fail-closed `ExternalMempoolSource` per ADR-003. Endpoint + API
+/// key are passed by value into the adapter's private fields and
+/// never logged.
+fn build_mempool_source_from_config(
+    config: &Config,
+    provider: Arc<NodeProvider>,
+) -> Box<dyn rust_lmax_mev_ingress::MempoolSource> {
+    use rust_lmax_mev_config::MempoolSourceKind;
+    use rust_lmax_mev_ingress::{ExternalMempoolSource, GethWsMempool};
+    match config.ingress.mempool_source {
+        MempoolSourceKind::GethWs => Box::new(GethWsMempool::new(
+            provider,
+            config.ingress.watched_addresses.clone(),
+        )),
+        MempoolSourceKind::External => Box::new(ExternalMempoolSource::new(
+            config.ingress.external_mempool_endpoint.clone(),
+            config.ingress.external_mempool_api_key.clone(),
+        )),
     }
 }
 
