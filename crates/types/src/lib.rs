@@ -270,6 +270,45 @@ impl<T> EventEnvelope<T> {
     }
 }
 
+/// Phase 4 P4-D: Six ADR-006 §"Abort policy" mismatch categories.
+///
+/// Returned by the local-vs-relay simulation comparator (in
+/// `crates/relay-sim`) when a bundle is aborted due to a divergence
+/// between local revm pre-sim and relay `eth_callBundle` results. ADR-006
+/// mandates **zero tolerance**: any divergence triggers an abort.
+///
+/// `#[non_exhaustive]` so future ADR additions are non-breaking.
+/// Phase-1-frozen `crates/types` carve-out per the P3-A precedent;
+/// rationale + scope captured in the P4-D execution note v0.4.
+#[non_exhaustive]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum MismatchCategory {
+    /// Relay net profit deviates from local net profit by any amount.
+    Profitability,
+    /// Relay gas used deviates from local gas used by any amount.
+    Gas,
+    /// Local sim succeeds but relay sim reverts (or vice versa).
+    Revert,
+    /// Relay state slot values differ from local snapshot values.
+    StateDependency,
+    /// Bundle inclusion order or coinbase transfer amount differs.
+    BundleOutcome,
+    /// Any other relay sim error or unexpected response.
+    Unknown,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +506,82 @@ mod tests {
         decoded
             .validate()
             .expect("decoded envelope must pass validate()");
+    }
+
+    // ---------------------------------------------------------------
+    // P4-D MismatchCategory tests (MC-1..3 per execution note v0.4).
+    // ---------------------------------------------------------------
+
+    fn all_mismatch_categories() -> [MismatchCategory; 6] {
+        [
+            MismatchCategory::Profitability,
+            MismatchCategory::Gas,
+            MismatchCategory::Revert,
+            MismatchCategory::StateDependency,
+            MismatchCategory::BundleOutcome,
+            MismatchCategory::Unknown,
+        ]
+    }
+
+    /// MC-1: rkyv archive round-trip preserves every variant byte-identically.
+    #[test]
+    fn mc_1_mismatch_category_rkyv_round_trip() {
+        for original in all_mismatch_categories() {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).expect("rkyv serialize");
+            let decoded: MismatchCategory =
+                rkyv::from_bytes::<MismatchCategory, rkyv::rancor::Error>(&bytes)
+                    .expect("rkyv deserialize");
+            assert_eq!(
+                original, decoded,
+                "rkyv round-trip must preserve {original:?}"
+            );
+        }
+    }
+
+    /// MC-2: serde+bincode round-trip preserves every variant.
+    #[test]
+    fn mc_2_mismatch_category_serde_bincode_round_trip() {
+        for original in all_mismatch_categories() {
+            let bytes = bincode::serialize(&original).expect("bincode serialize");
+            let decoded: MismatchCategory =
+                bincode::deserialize(&bytes).expect("bincode deserialize");
+            assert_eq!(
+                original, decoded,
+                "bincode round-trip must preserve {original:?}"
+            );
+        }
+    }
+
+    /// MC-3: spec-drift guard. Adding a new `MismatchCategory` variant
+    /// breaks compile of the exhaustive match below (`#[non_exhaustive]`
+    /// only blocks FOREIGN-crate matches — within `crates/types` the
+    /// match is fully exhaustive). The author of the new variant must
+    /// then update both ADR-006 §"Abort policy" AND this match arm,
+    /// catching documentation drift at compile time. The runtime
+    /// assertion further confirms each variant maps to the canonical
+    /// ADR-006 wording.
+    #[test]
+    fn mc_3_mismatch_category_adr_006_wording() {
+        fn to_adr_wording(c: MismatchCategory) -> &'static str {
+            match c {
+                MismatchCategory::Profitability => "Profitability",
+                MismatchCategory::Gas => "Gas",
+                MismatchCategory::Revert => "Revert",
+                MismatchCategory::StateDependency => "StateDependency",
+                MismatchCategory::BundleOutcome => "BundleOutcome",
+                MismatchCategory::Unknown => "Unknown",
+            }
+        }
+        let pairs = [
+            (MismatchCategory::Profitability, "Profitability"),
+            (MismatchCategory::Gas, "Gas"),
+            (MismatchCategory::Revert, "Revert"),
+            (MismatchCategory::StateDependency, "StateDependency"),
+            (MismatchCategory::BundleOutcome, "BundleOutcome"),
+            (MismatchCategory::Unknown, "Unknown"),
+        ];
+        for (variant, wording) in pairs {
+            assert_eq!(to_adr_wording(variant), wording);
+        }
     }
 }

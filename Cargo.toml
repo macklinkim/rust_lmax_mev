@@ -17,6 +17,7 @@ members = [
     "crates/simulator",
     "crates/execution",
     "crates/state-fetcher",
+    "crates/relay-sim",
 ]
 
 [workspace.package]
@@ -85,3 +86,6 @@ futures = "0.3"
 # revm local pre-sim (Phase 3 P3-E; ADR-006 deferred-strict per
 # user-approved DP-S1; v0.2 plan pin). Default-features off; std-only.
 revm = { version = "14", default-features = false, features = ["std"] }
+
+# Async trait sugar for crates/relay-sim::RelaySimulator (Phase 4 P4-D).
+async-trait = "0.1"

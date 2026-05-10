@@ -3647,6 +3647,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-lmax-mev-relay-sim"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "async-trait",
+ "bincode",
+ "rkyv",
+ "rust-lmax-mev-simulator",
+ "rust-lmax-mev-types",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rust-lmax-mev-replay"
 version = "0.1.0"
 dependencies = [
