@@ -4,7 +4,7 @@
 //! Pure-function `BundleConstructor::construct` consumes a
 //! `SimulationOutcome` (from P3-E) and emits a `BundleCandidate`
 //! representing the *intent* to submit. NO relay submission, NO
-//! signing, NO funded key, NO `BundleRelay` — those land in Phase 4
+//! signing, NO production key material, NO `BundleRelay` — those land in Phase 4
 //! per ADR-002 + ADR-006.
 //!
 //! Per ADR-006 §"Gas bidding" Phase 4 thin-path uses conservative
@@ -86,8 +86,8 @@ pub enum ExecutionError {
 /// `BundleRelay` consumes this + signs + submits to relays. P3-F
 /// fields are deliberately the irreducible minimum needed by P4
 /// (gas bid + validity window + provenance) — no signed-tx hash, no
-/// relay endpoints, no signer-id (those land in P4 alongside funded
-/// key + signing infrastructure).
+/// relay endpoints, no signer-id (those land in P4 alongside production
+/// key material + signing infrastructure).
 ///
 /// Per `event-model.md` derives the spec-mandated `Clone, Debug,
 /// PartialEq, Eq, rkyv::*, serde::*`.

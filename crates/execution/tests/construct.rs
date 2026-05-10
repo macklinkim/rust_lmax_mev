@@ -2,7 +2,7 @@
 //! approved Batch F execution note v0.1.
 //!
 //! All fixtures are deterministic small-integer values constructed
-//! via crate-local helpers. No live network, no funded key.
+//! via crate-local helpers. No live network, no production key material.
 //!
 //! Test ladder:
 //! - E-1 happy: successful sim + positive profit + non-zero bid → BundleCandidate.

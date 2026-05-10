@@ -19,7 +19,7 @@ pub struct AuxiliaryAccounts {
     pub mock_router_address: RevmAddress,
     pub mock_router_bytecode: Bytes,
     pub mock_router_eth_balance_wei: U256,
-    /// Pre-funded WETH balance for the router. The router uses this
+    /// Pre-loaded WETH balance for the router. The router uses this
     /// in swap-1 (sells WETH at the expensive sink pool).
     pub mock_router_weth_balance_wei: U256,
 }

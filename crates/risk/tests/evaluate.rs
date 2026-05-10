@@ -3,7 +3,7 @@
 //!
 //! All fixtures are deterministic small-integer values constructed
 //! with crate-local helpers. No live trading, no relay, no submission,
-//! no network, no funded key.
+//! no network, no production key material.
 //!
 //! Test ladder R-1..R-9 (R-7 rkyv envelope round-trip lives in
 //! crates/risk/tests/rkyv_round_trip.rs):

@@ -1,8 +1,8 @@
 //! Phase 4 P4-E Flashbots `eth_callBundle` HTTP adapter.
 //!
 //! Per the user-approved P4-E execution note v0.6 §D-E2.
-//! Read-only `eth_callBundle` only. NO `eth_sendBundle`, NO funded
-//! key, NO signing, NO production submission.
+//! Read-only `eth_callBundle` only. NO `eth_sendBundle`, NO production
+//! key material, NO signing, NO production submission.
 //!
 //! `simulate_bundle` performs a fail-closed pre-check (R-E2): if
 //! `req.txs.is_empty()` the adapter returns `Err(UnsignedBundleUnavailable)`

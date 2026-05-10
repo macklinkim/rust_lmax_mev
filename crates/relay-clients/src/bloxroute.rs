@@ -1,8 +1,8 @@
 //! Phase 4 P4-E bloXroute `eth_callBundle` HTTP adapter.
 //!
 //! Per the user-approved P4-E execution note v0.6 §D-E2.
-//! Read-only `eth_callBundle` only. NO `eth_sendBundle`, NO funded
-//! key, NO signing, NO production submission.
+//! Read-only `eth_callBundle` only. NO `eth_sendBundle`, NO production
+//! key material, NO signing, NO production submission.
 //!
 //! bloXroute requires an `Authorization` API key for production. In
 //! P4-E the adapter accepts an `Option<String>` API key from config;

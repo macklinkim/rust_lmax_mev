@@ -34,7 +34,7 @@
 //!
 //! Hardening: this file contains ONLY public chain data
 //! (bytecode + storage values + addresses + block hash). No archive
-//! RPC URL, no API key, no funded key, no signer.
+//! RPC URL, no API key, no production key material, no signer.
 
 #![allow(clippy::unreadable_literal)]
 

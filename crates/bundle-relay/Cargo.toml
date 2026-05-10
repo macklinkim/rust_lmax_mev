@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Phase 4 P4-E BundleRelay trait + SignedBundle + SubmissionReceipt + SubmitDisabled. P4-E ships the trait surface only; every adapter submit_bundle returns Err(SubmitDisabled). No funded key, no signing."
+description = "Phase 4 P4-E BundleRelay trait + SignedBundle + SubmissionReceipt + SubmitDisabled. P4-E ships the trait surface only; every adapter submit_bundle returns Err(SubmitDisabled). No production key material, no signing."
 
 [dependencies]
 rust-lmax-mev-relay-sim = { path = "../relay-sim" }

@@ -3838,6 +3838,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-lmax-mev-signer"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "async-trait",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "rust-lmax-mev-simulator"
 version = "0.1.0"
 dependencies = [

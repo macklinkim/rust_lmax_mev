@@ -68,7 +68,7 @@
 //! ```
 //!
 //! Used ONLY by the LocalSimulator real-revm path against recorded
-//! mainnet fixtures. Holds NO funded key, signs NO tx, submits NO
+//! mainnet fixtures. Holds NO production key material, signs NO tx, submits NO
 //! bundle, talks to NO live network. Determinism tool only.
 
 use alloy_primitives::Address;

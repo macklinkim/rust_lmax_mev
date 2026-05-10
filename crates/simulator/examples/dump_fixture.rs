@@ -25,7 +25,7 @@
 //!   `cargo run --example`. No `#[test]` attribute. No
 //!   `tokio::test` macro.
 //! - No write to repo paths. Output goes to stdout only.
-//! - No funded key. No `live_send`. No relay submission. No
+//! - No production key material. No `live_send`. No relay submission. No
 //!   `eth_sendBundle`. Read-only `eth_getCode` + `eth_getStorageAt`.
 //!
 //! ## USDC slot-list workflow (iterative)

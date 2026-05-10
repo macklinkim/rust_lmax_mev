@@ -23,7 +23,7 @@
 //!   NOT wired into `wire_phase4` per plan v0.3 §DP-C14 — runtime
 //!   integration is P4-G's job.
 //!
-//! No relay sim, no submission, no live mainnet, no funded key.
+//! No relay sim, no submission, no live mainnet, no production key material.
 //! Mock router holds NO key, signs NO tx, is invoked by a code-less
 //! test EOA caller.
 

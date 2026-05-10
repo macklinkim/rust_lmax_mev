@@ -20,6 +20,7 @@ members = [
     "crates/relay-sim",
     "crates/bundle-relay",
     "crates/relay-clients",
+    "crates/signer",
 ]
 
 [workspace.package]

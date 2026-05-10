@@ -90,7 +90,7 @@ fn usdc_transfer_router_to_pool_succeeds_against_recorded_fixture_under_strict_m
         },
     );
 
-    // 4. Override the router's USDC balance slot with the pre-funded
+    // 4. Override the router's USDC balance slot with the pre-loaded
     //    amount (the recorded value is zero at the recording block).
     let usdc_proxy_addr = addr_from_arr(fixtures::USDC_PROXY_ADDRESS);
     let router_balance_slot =

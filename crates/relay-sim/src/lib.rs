@@ -12,7 +12,7 @@
 //! producer chain land in P4-E. P4-D's comparator is exercised
 //! against the in-memory `MockRelaySimulator` only.
 //!
-//! Forbids reaffirmed: no `eth_sendBundle`, no funded key, no
+//! Forbids reaffirmed: no `eth_sendBundle`, no production key material, no
 //! signing, no `live_send=true`, no relay submission, no live
 //! network tests, no `tracing::*` macros.
 

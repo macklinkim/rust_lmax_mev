@@ -23,8 +23,8 @@ use alloy_primitives::{Address, U256};
 
 /// Carrier of one signed bundle ready for submission. P4-E ships
 /// the type; the only writers in P4-E are tests + the deliberately
-/// fail-closed adapter `submit_bundle` impls. Real signers + funded
-/// keys land in Phase 5 Safety Gate.
+/// fail-closed adapter `submit_bundle` impls. Real signers + production
+/// key material land in Phase 5 Safety Gate.
 ///
 /// Per-field rkyv adapters (R-E12): `Address` + `U256` cannot derive
 /// rkyv natively. `block_hash` is `[u8; 32]` directly (rkyv-native).

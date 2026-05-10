@@ -6,8 +6,8 @@
 //! `comparator_driver`) AND `BundleRelay` (whose `submit_bundle`
 //! returns `Err(SubmitDisabled)` unconditionally per DP-E1).
 //!
-//! Read-only `eth_callBundle` only. NO `eth_sendBundle`, NO funded
-//! key, NO signing infrastructure, NO production submission.
+//! Read-only `eth_callBundle` only. NO `eth_sendBundle`, NO production
+//! key material, NO signing infrastructure, NO production submission.
 
 pub mod bloxroute;
 pub(crate) mod call_bundle;
