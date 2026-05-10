@@ -170,28 +170,32 @@ pub(crate) async fn call_eth_call_bundle(
         RelaySimError::UnrecognizedResponse("relay response missing 'result' field".to_string())
     })?;
 
-    // Status: any per-tx revert/error → Reverted with a sanitized
-    // reason; otherwise Success.
+    // Status: any per-tx revert/error → Reverted with a FIXED
+    // redacted reason; otherwise Success.
     //
-    // R-E22 SECRET REDACTION: relay-supplied free-form `error`
-    // strings are dropped entirely (replaced with a fixed-format
-    // tag). The `revert` field is sanitized to `0x[0-9a-f]*` only;
-    // any non-hex byte from a malicious or buggy relay is stripped
-    // before the value reaches `MismatchAbort.detail` or the journal.
+    // R-E22 + R-E24 SECRET REDACTION: BOTH relay-supplied `revert`
+    // AND `error` strings are dropped entirely. Relay-supplied
+    // hex-looking text (e.g. `0xdeadbeefcafebabe`) cannot be assumed
+    // safe — URL tokens / API keys can be hex-like, and relay-
+    // controlled revert data flows into `RelaySimulationOutcome.status`
+    // → `MismatchAbort.relay` → journal bytes. The comparator only
+    // needs Success-vs-Reverted enum equality (per DP-D17), not the
+    // text itself, so use a fixed marker.
     let status_field = result
         .results
         .iter()
         .find_map(|r| {
-            r.revert
-                .as_ref()
-                .map(|s| RelaySimStatus::Reverted {
-                    reason_hex: sanitize_hex(s),
+            if r.revert.is_some() {
+                Some(RelaySimStatus::Reverted {
+                    reason_hex: "relay-revert-redacted".to_string(),
                 })
-                .or_else(|| {
-                    r.error.as_ref().map(|_| RelaySimStatus::Reverted {
-                        reason_hex: "relay-tx-error-redacted".to_string(),
-                    })
+            } else if r.error.is_some() {
+                Some(RelaySimStatus::Reverted {
+                    reason_hex: "relay-tx-error-redacted".to_string(),
                 })
+            } else {
+                None
+            }
         })
         .unwrap_or(RelaySimStatus::Success);
 
@@ -214,25 +218,11 @@ pub(crate) async fn call_eth_call_bundle(
     })
 }
 
-/// R-E22 SECRET REDACTION: strip any non-hex byte from a
-/// relay-supplied "revert" string. Returns `"0x"` followed by ONLY
-/// the hex digits the relay sent. A malicious or buggy relay that
-/// stuffs `SECRETTOKEN` into the revert field would have those
-/// characters silently dropped here.
-fn sanitize_hex(s: &str) -> String {
-    let mut out = String::with_capacity(2 + s.len());
-    out.push_str("0x");
-    let trimmed = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s);
-    for c in trimmed.chars() {
-        if c.is_ascii_hexdigit() {
-            out.push(c.to_ascii_lowercase());
-        }
-    }
-    out
-}
+// R-E24 (P4-E closeout): the previous `sanitize_hex` revert-text
+// preserver was removed because hex-looking text from a relay is NOT
+// a safe-redaction boundary — URL tokens / API keys can be hex-like
+// (`0xdeadbeefcafebabe`-style). The revert path now uses a fixed
+// `"relay-revert-redacted"` marker; see the call site above.
 
 /// Best-effort U256 parse: accepts decimal-string, "0x"-hex, or empty
 /// (→ ZERO). Used for the relay's coinbaseDiff / ethSentToCoinbase
@@ -263,24 +253,5 @@ mod tests {
         assert_eq!(parse_decimal_or_hex_u256("12345"), U256::from(12_345u64));
         assert_eq!(parse_decimal_or_hex_u256("0xff"), U256::from(255u64));
         assert_eq!(parse_decimal_or_hex_u256("garbage"), U256::ZERO);
-    }
-
-    /// R-E22: sanitize_hex strips non-hex bytes (catches a malicious
-    /// or buggy relay echoing secrets into the revert field).
-    #[test]
-    fn sanitize_hex_strips_non_hex_bytes() {
-        assert_eq!(sanitize_hex(""), "0x");
-        assert_eq!(sanitize_hex("0xCAFEBABE"), "0xcafebabe");
-        // SECRETTOKEN contains chars that are also hex digits ('E','A','D')
-        // — those will pass through, but the alphabetic non-hex bytes
-        // ('S','R','T','K','N','O') are dropped.
-        let dirty = "0xCAFE_SECRETTOKEN_DEAD";
-        let out = sanitize_hex(dirty);
-        // Must NOT contain the full secret as a substring.
-        assert!(!out.contains("SECRETTOKEN"), "got {out}");
-        assert!(!out.contains("S"));
-        assert!(!out.contains("K"));
-        assert!(!out.contains("N"));
-        assert!(out.starts_with("0x"));
     }
 }

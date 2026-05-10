@@ -229,3 +229,134 @@ async fn rc_common_2_extra_jsonrpc_body_secret_redacted() {
         other => panic!("expected Transport, got {other:?}"),
     }
 }
+
+/// R-E24: hex-looking text in `result.results[0].revert` is NOT a
+/// safe-redaction boundary — URL tokens / API keys can be hex-like.
+/// Adapter MUST use a fixed redacted marker. Verified end-to-end:
+/// the secret hex string MUST NOT appear in `RelaySimulationOutcome`
+/// Debug/serde, `MismatchAbort` Debug/detail, OR rkyv journal bytes.
+#[tokio::test]
+async fn rc_common_2_extra_relay_revert_hex_secret_redacted() {
+    use rust_lmax_mev_relay_sim::compare;
+    use rust_lmax_mev_relay_sim::RelaySimulationOutcome;
+
+    // Hex-only secret — passes any "is_ascii_hexdigit" filter, stand-
+    // in for a hex-like API key the malicious relay echoed.
+    const HEX_SECRET: &str = "0xdeadbeefcafebabedeadbeefcafebabe";
+
+    let server = MockServer::start().await;
+    let body = json!({
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+            "totalGasUsed": 100_000u64,
+            "coinbaseDiff": "0",
+            "ethSentToCoinbase": "0",
+            "stateBlockNumber": 22_000_000u64,
+            "results": [{ "revert": HEX_SECRET }]
+        }
+    });
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    let relay = BloxrouteRelay::new(BloxrouteConfig {
+        endpoint: server.uri(),
+        timeout_ms: 1_000,
+        api_key: Some("dummy-test-key".to_string()),
+    })
+    .expect("ctor ok");
+    let req = RelaySimRequest {
+        block_hash: B256::from([0u8; 32]),
+        state_block_number: 22_000_000,
+        txs: vec![vec![0xAB]],
+    };
+    let outcome: RelaySimulationOutcome = relay
+        .simulate_bundle(req)
+        .await
+        .expect("R-E24: response with revert must parse to RelaySimulationOutcome");
+
+    // Surface 1: outcome Debug must not contain the hex secret.
+    let dbg = format!("{outcome:?}");
+    assert!(
+        !dbg.contains(HEX_SECRET),
+        "R-E24: RelaySimulationOutcome Debug must not preserve relay-supplied revert text; got {dbg:?}"
+    );
+    // Surface 2: outcome serde JSON form must not contain the hex secret.
+    let json_str = serde_json::to_string(&outcome).expect("serde");
+    assert!(
+        !json_str.contains(HEX_SECRET),
+        "R-E24: RelaySimulationOutcome serde must not preserve relay revert text; got {json_str:?}"
+    );
+
+    // Surface 3: feed outcome into compare() against a non-matching
+    // local sim → MismatchAbort.relay carries the redacted outcome;
+    // assert the secret does not appear in any field.
+    let local_outcome = SimulationOutcome {
+        opportunity_block_number: 22_000_000,
+        gas_used: 100_000,
+        status: SimStatus::Success,
+        simulated_profit_wei: U256::ZERO,
+        profit_source: ProfitSource::RevmComputed,
+    };
+    let local_shape = LocalBundleShape {
+        expected_inclusion_index: 0,
+        expected_coinbase_transfer_wei: U256::ZERO,
+    };
+    let local_fp = LocalStateFingerprint {
+        block_hash: B256::from([0xCD; 32]),
+        observations: Vec::new(),
+    };
+    // Local Success vs relay Reverted (after redaction) → comparator
+    // returns Err(Revert) per DP-D17 precedence.
+    let abort = compare(
+        ComparatorInputs {
+            local: &local_outcome,
+            local_shape: &local_shape,
+            local_fingerprint: &local_fp,
+        },
+        &outcome,
+    )
+    .expect_err("Revert expected");
+    let abort_dbg = format!("{abort:?}");
+    assert!(
+        !abort_dbg.contains(HEX_SECRET),
+        "R-E24: MismatchAbort Debug must not surface relay revert text; got {abort_dbg:?}"
+    );
+    assert!(
+        !abort.detail.contains(HEX_SECRET),
+        "R-E24: MismatchAbort.detail must not surface relay revert text; got {:?}",
+        abort.detail
+    );
+
+    // Surface 4: rkyv journal bytes must not contain the hex secret.
+    let envelope = EventEnvelope::seal(
+        PublishMeta {
+            source: EventSource::Relay,
+            chain_context: ChainContext {
+                chain_id: 1,
+                block_number: 22_000_000,
+                block_hash: [0u8; 32],
+            },
+            event_version: 1,
+            correlation_id: 42,
+        },
+        *abort,
+        1,
+        1_700_000_000_000_000_000,
+    )
+    .expect("envelope seal");
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&envelope).expect("rkyv ok");
+    let needle = HEX_SECRET.as_bytes();
+    let contains_subslice = |hay: &[u8], n: &[u8]| {
+        if n.is_empty() || hay.len() < n.len() {
+            return false;
+        }
+        hay.windows(n.len()).any(|w| w == n)
+    };
+    assert!(
+        !contains_subslice(&bytes, needle),
+        "R-E24: journal bytes must not contain the relay's hex-looking secret"
+    );
+}
