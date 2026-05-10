@@ -47,14 +47,38 @@ Rust LMAX Disruptor-style MEV detection and execution engine for Ethereum mainne
 - Topology Option A (`tokio::sync::broadcast` rebroadcast) implemented in P3-F `wire_phase4` with the v0.2 fail-closed `RecvError::Lagged` policy from P3-D documented design (W-2 test asserts the consumer task exits within 2s on `Lagged`).
 - `master` and `phase-3-complete` tag pushed to `origin` (tag object `7298660`).
 
-**Phase 4: NOT STARTED** — relay submission + `BundleRelay` + funded-key + ADR-006 strict revm against current state snapshot + ADR-007 archive node integration + dynamic gas bidding (Phase 5+ per ADR-006). Wait for explicit user prompt to begin.
+**Phase 4: COMPLETE** (git tag: `phase-4-complete` at `e5f13ea`, pushed to `origin`)
+- All seven batches CLOSED via the lean-batching policy (P4-A archive node integration; P4-B `crates/state-fetcher`; P4-C real revm against current state; P4-D `crates/relay-sim` comparator + `MismatchCategory`; P4-E `crates/bundle-relay` + `crates/relay-clients` Flashbots + bloXroute adapters with `submit_bundle` returning `Err(SubmitDisabled)` unconditionally + comparator_driver wired with mismatch journal append-before-broadcast; P4-F `MempoolSourceKind` runtime selector + `ExternalMempoolSource` fail-closed; P4-G final wiring + DoD audit + tag).
+- 19 workspace crates: Phase 3 15 + new `state-fetcher`, `relay-sim`, `bundle-relay`, `relay-clients`.
+- 206 workspace tests passing in CI + 1 ignored live-smoke env-contract stub.
+- Hard P4 invariants: `submit_bundle` returns `Err(SubmitDisabled)` unconditionally in every adapter; `crates/app` holds adapters as `Arc<dyn RelaySimulator>` only (DP-E13 type-system upcast prevention); zero `submit_bundle(` call sites in `crates/app/src/`; `live_send=true` config-validation rejected; multi-relay rejected; mismatch journal append+flush BEFORE broadcast (R-E9); full secret redaction at relay error rendering (R-E20).
+- `ProfitSource::RevmComputed` flipped from `HeuristicPassthrough` (P4-C2 SR-1 + FP-1 + T-USDC-1 fixtures).
+- Production `LocalSimulator::prefetch_for` integration deferred to Phase 5 P5-A per the P4-G fail-closed boundary.
+- `master` and `phase-4-complete` tag pushed to `origin`.
+
+**Phase 5: COMPLETE** (git tag: `phase-5-complete` at `55679a4`, pushed to `origin`)
+- Safety Gate scope: planning + design + fail-closed wiring; **NO live action** per the user-approved Phase 5 overview.
+- All five batches CLOSED via the lean-batching policy:
+  - Phase 5 overview (`ac07024`)
+  - P5-A `LocalSimulator::prefetch_for` shadow-mode wiring — archive-RPC-gated, fail-closed when archive unconfigured/stale, per-block fixture cache, interior-mutability redesign of `LocalSimulator` (`0c28d5c`).
+  - P5-B `crates/execution` dynamic gas bidding strategy infrastructure — `BidStrategy` trait + `FixedFractionBidStrategy` + `Eip1559BasefeeAwareBidStrategy` + `BundleConstructor::with_strategy(...)` explicit-strategy ctor per ADR-006 §"Gas bidding" Phase 5+ unlock; **no ADR text amendment** per Q-P5-7 / R-P5-3 (`84283d9`).
+  - P5-C boundary-only `crates/signer` workspace member — `Signer` trait + `DisabledSigner` fail-closed impl + `SignerError::SignerDisabled` whose `Display` pins the literal `"Phase 6b Production Gate"`; Phase 4 G2 zero-hit `Signer` grep promoted to four-gate G2a/G2b/G2c/G2d redefined gate per R-P5-2 (`db6a7b8`).
+  - P5-D `KillSwitch` (`Arc<AtomicBool>` newtype) in `crates/bundle-relay` + `BundleRelayError::KillSwitchActive` variant + `AppHandle4::{kill_switch(), set_execution_disabled(bool)}` surface + `comparator_driver` per-driver guard (top-of-iteration `kill_switch.is_active()` short-circuit). G9 leak gate added. Per-adapter wiring deferred to Phase 6 per Q-P5-5 / DP-D8 (`e3e11bb`).
+  - P5-E final wiring + Phase 5 DoD audit + `phase-5-complete` annotated tag (`55679a4`).
+- 20 workspace crates: Phase 4 19 + new `signer`.
+- 231 workspace tests passing in CI + 1 ignored live-smoke env-contract stub (P2-C carry-forward).
+- Hard P5 invariants HSI-1..11 verified at the `phase-5-complete` tag: NO production signer / NO funded key / NO key material / NO `secp256k1|k256|alloy-signer|ethers-signers|Wallet|PrivateKey|sign_transaction|funded` symbols anywhere in `crates/` (G2a + G2b + G2d zero-hit); NO `eth_sendBundle` runtime call (G1 only doc/`//!` "NO" assertions); NO `live_send=true` capability (config-validation reject preserved); NO actual relay submission (`submit_bundle` returns `Err(SubmitDisabled)` unchanged; G3 + G4 zero hits in `crates/app/src/`); NO new live-network surface (P5-A `prefetch_for` opt-in via `config.simulator.prefetch_enabled` default `false` AND archive-RPC-gated AND fail-closed); NO ADR text amendment; NO asset/venue/V3 fee-tier widening.
+- `crates/signer` is an isolated leaf crate — `crates/app` does NOT depend on it; the signer is reachable only by direct unit tests in `crates/signer/`. Phase 6b Production Gate is the only path to enabling real signing.
+- `master` and `phase-5-complete` tag pushed to `origin`.
+
+**Phase 6: NOT STARTED** — Phase 6a Pre-Production Gate (shadow-run with full submission-shape validation against test relays + per-adapter kill switch wiring + production signer integration with HSM/KMS-backed `Signer` impl + real `eth_callBundle` with signed transactions). Phase 6b Production Gate (funded key / production signer / `live_send=true` / actual `eth_sendBundle`) only AFTER Phase 6a passes. Wait for explicit user prompt to begin.
 
 ## Resume Instructions
 
 1. Read `.coordination/task_state.md`, `.coordination/claude_outbox.md`, and `.coordination/codex_review.md` first; they describe the current gate and live handoff state.
-2. Phase 1/2/3 closed at `phase-1-complete`/`phase-2-complete`/`phase-3-complete`. Do not re-open frozen Phase 1 / P2-A / P2-B / P2-C / P3 crates without an ADR/spec change. The P3-E ADR-006 deferral is documented in the `phase-3-complete` tag annotation; Phase 4 plan must reference that deferral and explicitly land the strict-revm requirement.
-3. To begin Phase 4 work: draft a Phase 4 plan under `docs/superpowers/plans/` mirroring the Phase 3 lean-batching pattern. Phase 4 owns ADR-007 archive node integration, real Uniswap V2/V3 bytecode + state-fetcher (flipping `ProfitSource::HeuristicPassthrough` → `RevmComputed`), `MismatchCategory` enum + relay sim comparator alongside `BundleRelay`, funded-key + signing infrastructure (gated by Safety Gate per ADR-001), and Sushiswap WETH/USDC inclusion per ADR-002 Phase 4 unlock.
-4. Use `superpowers:subagent-driven-development` for Phase 4 implementation work once a plan is user-approved.
+2. Phase 1/2/3/4/5 closed at `phase-1-complete`/`phase-2-complete`/`phase-3-complete`/`phase-4-complete`/`phase-5-complete`. Do not re-open frozen Phase 1 / P2-A..D / P3 / P4 / P5 crates without an ADR/spec change. The P3-E ADR-006 deferral, P4-G `prefetch_for` deferral, and Phase 5 Safety Gate scope (NO live action) are documented in their respective phase tag annotations; Phase 6 plan must reference those deferrals and explicitly land per-adapter kill-switch wiring + production signer integration + (Phase 6b) live submission.
+3. To begin Phase 6 work: draft a Phase 6 plan under `docs/superpowers/plans/` mirroring the Phase 5 lean-batching pattern. Phase 6a owns per-adapter kill switch wiring, production signer integration (HSM/KMS-backed `Signer` impl), real `eth_callBundle` with signed transactions, and shadow-run validation against test relays. Phase 6b owns funded key, `live_send=true` capability, and actual `eth_sendBundle`. Phase 6b is the ONLY path to live action per ADR-001 + `docs/specs/execution-safety.md`.
+4. Use `superpowers:subagent-driven-development` for Phase 6 implementation work once a plan is user-approved.
 
 ## Key Decisions (frozen in ADRs)
 
