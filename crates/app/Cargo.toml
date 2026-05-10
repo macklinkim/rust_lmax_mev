@@ -26,6 +26,8 @@ rust-lmax-mev-execution = { path = "../execution" }
 rust-lmax-mev-relay-sim = { path = "../relay-sim" }
 rust-lmax-mev-bundle-relay = { path = "../bundle-relay" }
 rust-lmax-mev-relay-clients = { path = "../relay-clients" }
+# Phase 5 P5-A: ArchiveStateFetcher construction in wire_phase4.
+rust-lmax-mev-state-fetcher = { path = "../state-fetcher" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -37,3 +39,5 @@ futures = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
 alloy-primitives = { workspace = true }
+# P5-A: PA-4 mock StateFetcher impls the async_trait-sugared trait.
+async-trait = { workspace = true }

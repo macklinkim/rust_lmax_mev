@@ -3612,6 +3612,7 @@ name = "rust-lmax-mev-app"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "async-trait",
  "futures",
  "rkyv",
  "rust-lmax-mev-bundle-relay",
@@ -3628,6 +3629,7 @@ dependencies = [
  "rust-lmax-mev-risk",
  "rust-lmax-mev-simulator",
  "rust-lmax-mev-state",
+ "rust-lmax-mev-state-fetcher",
  "rust-lmax-mev-types",
  "tempfile",
  "thiserror 2.0.18",

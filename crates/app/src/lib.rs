@@ -739,10 +739,36 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
     let risk = Arc::new(RiskGate::new(
         rust_lmax_mev_risk::RiskBudgetConfig::defaults(),
     ));
+    // P5-A: construct LocalSimulator with the configured cache
+    // capacity + retention window. `Config::validate` already ensured
+    // `simulator.prefetch_cache_capacity > 0` (DP-A8); `NonZeroUsize`
+    // wrap is infallible here.
+    let cache_capacity = std::num::NonZeroUsize::new(config.simulator.prefetch_cache_capacity)
+        .expect("Config::validate ensures prefetch_cache_capacity > 0");
     let simulator = Arc::new(
-        LocalSimulator::new(rust_lmax_mev_simulator::SimConfig::defaults())
-            .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?,
+        LocalSimulator::with_cache(
+            rust_lmax_mev_simulator::SimConfig::defaults(),
+            cache_capacity,
+            config.simulator.freshness_window_blocks,
+        )
+        .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?,
     );
+
+    // P5-A: build the prefetch fetcher iff prefetch_enabled. By DP-A9
+    // (CFG-A2 / R-A4), Config::validate has already rejected the
+    // prefetch_enabled=true + archive_rpc=None combination, so this
+    // branch is reached only when archive_rpc is configured.
+    let prefetch_fetcher: Option<Arc<dyn rust_lmax_mev_state_fetcher::StateFetcher>> =
+        if config.simulator.prefetch_enabled {
+            Some(Arc::new(
+                rust_lmax_mev_state_fetcher::ArchiveStateFetcher::new(
+                    Arc::clone(&provider),
+                    rust_lmax_mev_state_fetcher::StateFetcherConfig::defaults(),
+                ),
+            ))
+        } else {
+            None
+        };
     let bundle_constructor = Arc::new(
         BundleConstructor::new(rust_lmax_mev_execution::BundleConfig::defaults())
             .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?,
@@ -798,10 +824,15 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
         risk_tx.clone(),
         Arc::clone(&risk),
     ));
+    // P5-A: simulator_driver receives the optional prefetch fetcher;
+    // None → existing P4-G no-prefetch behavior preserved exactly.
     let simulator_driver_task = tokio::spawn(simulator_driver(
         risk_tx.subscribe(),
         sim_tx.clone(),
         Arc::clone(&simulator),
+        prefetch_fetcher,
+        config.ingress.tokens.weth,
+        config.ingress.tokens.usdc,
     ));
     let execution_driver_task = tokio::spawn(execution_driver(
         sim_tx.subscribe(),
@@ -1112,28 +1143,61 @@ async fn risk_driver(
 /// In P4-G the empty-fixture warn-log is the canonical signal that
 /// production simulation is offline; absence of `MismatchAbort`
 /// records in `mismatch.bin` confirms no comparator activity.
-async fn simulator_driver(
+/// P5-A `pub` for PA-1 / PA-4 integration tests.
+#[allow(clippy::too_many_arguments)]
+pub async fn simulator_driver(
     mut rx: broadcast::Receiver<EventEnvelope<RiskCheckedOpportunity>>,
     sim_tx: broadcast::Sender<EventEnvelope<SimulationOutcomeWithFingerprint>>,
     simulator: Arc<LocalSimulator>,
+    prefetch_fetcher: Option<Arc<dyn rust_lmax_mev_state_fetcher::StateFetcher>>,
+    weth_address: alloy_primitives::Address,
+    usdc_proxy_address: alloy_primitives::Address,
 ) {
     let mut seq: u64 = 0;
     loop {
         match rx.recv().await {
-            Ok(envelope) => match simulator.simulate_with_fingerprint(envelope.payload()) {
-                Ok((outcome, fingerprint)) => {
-                    let payload = SimulationOutcomeWithFingerprint {
-                        outcome,
-                        fingerprint,
-                    };
-                    if let Some(env) = seal_envelope(EventSource::Simulator, payload, &mut seq) {
-                        let _ = sim_tx.send(env);
+            Ok(envelope) => {
+                // P5-A: archive-RPC-gated production prefetch dispatch.
+                // When `prefetch_fetcher` is `Some` (operator opted in
+                // via `simulator.prefetch_enabled = true` AND
+                // `node.archive_rpc.is_some()` per CFG-A2 validation),
+                // we async-fetch the per-block fixtures into the
+                // shared `Arc<LocalSimulator>` cache before running
+                // `simulate_with_fingerprint`. Any prefetch error
+                // (`ArchiveNotConfigured` / `Transport` / decode /
+                // fixture-shape) → WARN + drop event (matches the
+                // existing simulate-failure handling pattern; never
+                // panics; never blocks the producer chain).
+                if let Some(fetcher) = prefetch_fetcher.as_ref() {
+                    if let Err(e) = simulator
+                        .prefetch_for(
+                            fetcher,
+                            &envelope.payload().opportunity,
+                            weth_address,
+                            usdc_proxy_address,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %e, "P5-A prefetch_for failed; dropping event");
+                        continue;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "local simulator failed; continuing");
+                match simulator.simulate_with_fingerprint(envelope.payload()) {
+                    Ok((outcome, fingerprint)) => {
+                        let payload = SimulationOutcomeWithFingerprint {
+                            outcome,
+                            fingerprint,
+                        };
+                        if let Some(env) = seal_envelope(EventSource::Simulator, payload, &mut seq)
+                        {
+                            let _ = sim_tx.send(env);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "local simulator failed; continuing");
+                    }
                 }
-            },
+            }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::error!(
                     consumer = "simulator-driver",
