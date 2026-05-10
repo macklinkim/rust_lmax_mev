@@ -96,7 +96,7 @@ fn sr_1_real_fixture_e2e_arb_emits_revm_computed() {
         size_wei: opp.optimal_amount_in_wei,
     };
 
-    let mut sim = LocalSimulator::new(SimConfig::defaults()).expect("new ok");
+    let sim = LocalSimulator::new(SimConfig::defaults()).expect("new ok");
     sim.load_fixture(
         // source = V3 (per the opportunity above)
         v3_fixture(),
@@ -188,7 +188,7 @@ fn fp_1_simulate_with_fingerprint_parity_and_non_mutation() {
         size_wei: opp.optimal_amount_in_wei,
     };
 
-    let mut sim = LocalSimulator::new(SimConfig::defaults()).expect("new ok");
+    let sim = LocalSimulator::new(SimConfig::defaults()).expect("new ok");
     sim.load_fixture(
         v3_fixture(),
         v2_fixture(),

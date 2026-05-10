@@ -223,26 +223,62 @@ pub struct FixtureSet {
 }
 
 /// LOCAL real-revm pre-sim engine.
+///
+/// Phase 5 P5-A interior-mutability redesign per execution-note v0.3
+/// §DP-A1 + §R-A2: `fixtures` moved behind `parking_lot::Mutex` so
+/// the existing `Arc<LocalSimulator>` shared from `wire_phase4` can
+/// drive `prefetch_for(...)` (which now takes `&self`) per inbound
+/// `RiskCheckedOpportunity`. The mutex protects both the active
+/// fixture slot AND the per-block LRU cache (DP-A3 cache-hit
+/// semantics). simulate paths CLONE the active fixture out of the
+/// lock, drop the lock, then run revm.
 pub struct LocalSimulator {
     cfg: SimConfig,
-    fixtures: Option<FixtureSet>,
+    state: parking_lot::Mutex<SimulatorState>,
+}
+
+struct SimulatorState {
+    active: Option<FixtureSet>,
+    cache: lru::LruCache<FixtureKey, FixtureSet>,
+    freshness_window_blocks: u64,
+    last_block_seen: Option<u64>,
+}
+
+/// Cache key per DP-A3 / Q-A2: `(block_hash, source_pool, sink_pool)`
+/// only — `optimal_amount_in_wei` is excluded because the fixture
+/// set depends on chain state at `block_hash` for the two pools, not
+/// on the input size (probe-size variance affects swap calldata, not
+/// the fixture).
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+struct FixtureKey {
+    block_hash: B256,
+    source_pool: Address,
+    sink_pool: Address,
+}
+
+impl FixtureKey {
+    fn from_fixture(f: &FixtureSet) -> Self {
+        Self {
+            block_hash: f.block_hash,
+            source_pool: f.source.pool.address,
+            sink_pool: f.sink.pool.address,
+        }
+    }
 }
 
 impl std::fmt::Debug for LocalSimulator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.state.lock();
         f.debug_struct("LocalSimulator")
             .field("cfg", &self.cfg)
-            .field("fixtures_loaded", &self.fixtures.is_some())
+            .field("fixtures_loaded", &s.active.is_some())
+            .field("cache_len", &s.cache.len())
             .finish_non_exhaustive()
     }
 }
 
 impl LocalSimulator {
-    /// Validates `SimConfig` and returns a sim engine with NO fixtures
-    /// loaded. Caller must subsequently invoke `load_fixture` (test)
-    /// OR `prefetch_for` (production async) before `simulate`, else
-    /// `simulate` returns `SimulationError::Setup`.
-    pub fn new(cfg: SimConfig) -> Result<Self, SimulationError> {
+    fn validate_cfg(cfg: &SimConfig) -> Result<(), SimulationError> {
         if cfg.chain_id == 0 {
             return Err(SimulationError::Setup(
                 "chain_id must be non-zero".to_string(),
@@ -258,9 +294,39 @@ impl LocalSimulator {
                 "eoa_initial_balance_wei must be non-zero".to_string(),
             ));
         }
+        Ok(())
+    }
+
+    /// Validates `SimConfig` and returns a sim engine with NO fixtures
+    /// loaded and a minimal cache (capacity 1, retention window 1 —
+    /// effectively no cache benefit; equivalent to the pre-P5-A
+    /// behavior). Existing test callers using `LocalSimulator::new`
+    /// keep working unchanged. Production wiring uses [`with_cache`].
+    pub fn new(cfg: SimConfig) -> Result<Self, SimulationError> {
+        // Per Q-A1 standing answer: separate `with_cache` ctor; `new`
+        // is the lean test-friendly ctor with capacity 1.
+        Self::with_cache(cfg, std::num::NonZeroUsize::new(1).expect("1 > 0"), 1)
+    }
+
+    /// Production constructor (P5-A) — explicit cache capacity +
+    /// retention window per DP-A8 + DP-A11. Capacity is
+    /// `NonZeroUsize` so a `0` is statically impossible; the wire-
+    /// shape `usize` in `SimulatorConfig` is validated to `> 0` by
+    /// `Config::validate` BEFORE this ctor is called.
+    pub fn with_cache(
+        cfg: SimConfig,
+        cache_capacity: std::num::NonZeroUsize,
+        freshness_window_blocks: u64,
+    ) -> Result<Self, SimulationError> {
+        Self::validate_cfg(&cfg)?;
         Ok(Self {
             cfg,
-            fixtures: None,
+            state: parking_lot::Mutex::new(SimulatorState {
+                active: None,
+                cache: lru::LruCache::new(cache_capacity),
+                freshness_window_blocks,
+                last_block_seen: None,
+            }),
         })
     }
 
@@ -268,15 +334,28 @@ impl LocalSimulator {
         &self.cfg
     }
 
-    pub fn fixtures(&self) -> Option<&FixtureSet> {
-        self.fixtures.as_ref()
+    /// P5-A R-A2: cheap loaded-check; locks briefly to read the
+    /// active slot's `is_some()`. Replaces the v0.4 `fixtures(&self)
+    /// -> Option<&FixtureSet>` API which was structurally impossible
+    /// behind a `Mutex` (cannot lend a borrow across the lock guard).
+    pub fn fixtures_loaded(&self) -> bool {
+        self.state.lock().active.is_some()
+    }
+
+    /// P5-A R-A2: clone-out snapshot of the active fixture slot.
+    /// Returns `None` if no fixture is loaded.
+    pub fn fixtures_snapshot(&self) -> Option<FixtureSet> {
+        self.state.lock().active.clone()
     }
 
     /// Test path. Loads pre-recorded fixtures into the engine. All
     /// inputs must share `block_hash`; otherwise returns
     /// `SimulationError::Setup`.
+    ///
+    /// P5-A: changed from `&mut self` to `&self` per DP-A1 +
+    /// interior mutability.
     pub fn load_fixture(
-        &mut self,
+        &self,
         source: FetchedPoolState,
         sink: FetchedPoolState,
         weth: FetchedAccount,
@@ -298,7 +377,7 @@ impl LocalSimulator {
                 )));
             }
         }
-        self.fixtures = Some(FixtureSet {
+        let fix = FixtureSet {
             block_hash: bh,
             source,
             sink,
@@ -306,22 +385,82 @@ impl LocalSimulator {
             usdc_proxy,
             usdc_impl,
             v2_factory,
-        });
+        };
+        let key = FixtureKey::from_fixture(&fix);
+        let mut s = self.state.lock();
+        s.cache.put(key, fix.clone());
+        s.active = Some(fix);
         Ok(())
     }
 
-    /// Production async path. Calls `StateFetcher::fetch_pool` for the
-    /// opportunity's `source_pool` + `sink_pool` and `fetch_account`
-    /// for WETH9 + USDC proxy + USDC impl, then `load_fixture`.
-    /// NOT wired into `wire_phase4` per plan v0.3 §DP-C14 — runtime
-    /// integration is P4-G's job.
+    /// Production async path (P5-A wired into `simulator_driver` when
+    /// `simulator.prefetch_enabled = true` in config).
+    ///
+    /// Per DP-A3 (cache-hit semantics): three cases under per-call
+    /// mutex acquisitions:
+    /// 1. Cache hit + active slot already matches the same key → no-op.
+    /// 2. Cache hit + active slot does NOT match → clone cached
+    ///    `FixtureSet` into active slot inside the critical section.
+    /// 3. Cache miss → drop the lock, fetch via `StateFetcher` (async
+    ///    I/O), re-acquire the lock + insert + clone-load.
+    ///
+    /// Per DP-A11 (retention-only semantics): cache key includes
+    /// `block_hash`, so a different block produces a different key by
+    /// construction — the cache CANNOT serve stale state under any
+    /// `freshness_window_blocks` value. When `block_number` advances
+    /// past the configured window, the cache is fully cleared as a
+    /// retention/eviction policy.
+    ///
+    /// Changed from `&mut self` to `&self` per DP-A1 + R-A2.
     pub async fn prefetch_for(
-        &mut self,
+        &self,
         fetcher: &Arc<dyn StateFetcher>,
         opp: &OpportunityEvent,
         weth_address: Address,
         usdc_proxy_address: Address,
     ) -> Result<(), SimulationError> {
+        let key = FixtureKey {
+            block_hash: opp.block_hash,
+            source_pool: opp.source_pool.address,
+            sink_pool: opp.sink_pool.address,
+        };
+
+        // Phase 1: cache lookup + retention/eviction under lock.
+        {
+            let mut s = self.state.lock();
+            // DP-A11 retention/eviction: when the block_number
+            // advances past the window, evict the entire cache.
+            // (Keying by block_hash means we can never serve stale
+            // state; this is purely an LRU-size policy.)
+            if let Some(last) = s.last_block_seen {
+                if opp.block_number > last
+                    && opp.block_number.saturating_sub(last) >= s.freshness_window_blocks
+                {
+                    s.cache.clear();
+                }
+            }
+            s.last_block_seen = Some(
+                s.last_block_seen
+                    .map_or(opp.block_number, |last| last.max(opp.block_number)),
+            );
+
+            // Cache hit?
+            let cached = s.cache.get(&key).cloned();
+            if let Some(fix) = cached {
+                let active_matches =
+                    s.active.as_ref().map(FixtureKey::from_fixture) == Some(key.clone());
+                if !active_matches {
+                    // Case 2: clone-load cache → active.
+                    s.active = Some(fix);
+                }
+                // Case 1 (active matches) OR Case 2 (just loaded) →
+                // return Ok.
+                return Ok(());
+            }
+            // Cache miss → drop lock + fall through to fetch.
+        }
+
+        // Phase 2: async fetch out of the lock.
         let source = layout_dispatch(fetcher, &opp.source_pool, opp.block_hash).await?;
         let sink = layout_dispatch(fetcher, &opp.sink_pool, opp.block_hash).await?;
         let weth_slots = vec![
@@ -341,13 +480,10 @@ impl LocalSimulator {
         let weth = fetcher
             .fetch_account(weth_address, &weth_slots, opp.block_hash)
             .await?;
-        // Conservative USDC slot list mirrors dump_fixture.rs. T-USDC-1
-        // is the load-bearing completeness proof for this list.
         let usdc_slots = build_usdc_proxy_slots(&opp.source_pool.address, &opp.sink_pool.address);
         let usdc_proxy = fetcher
             .fetch_account(usdc_proxy_address, &usdc_slots, opp.block_hash)
             .await?;
-        // Parse USDC impl address from the proxy fixture.
         let impl_addr = parse_usdc_impl_address(&usdc_proxy).ok_or_else(|| {
             SimulationError::Setup(
                 "USDC proxy impl slot is zero in both EIP-1967 and ZeppelinOS layouts".into(),
@@ -359,7 +495,23 @@ impl LocalSimulator {
         let v2_factory = fetcher
             .fetch_account(V2_FACTORY_ADDRESS, &[U256::from(0u64)], opp.block_hash)
             .await?;
-        self.load_fixture(source, sink, weth, usdc_proxy, usdc_impl, v2_factory)
+
+        let fix = FixtureSet {
+            block_hash: opp.block_hash,
+            source,
+            sink,
+            weth,
+            usdc_proxy,
+            usdc_impl,
+            v2_factory,
+        };
+
+        // Phase 3: re-acquire lock + insert into cache + clone-load
+        // into active slot.
+        let mut s = self.state.lock();
+        s.cache.put(key, fix.clone());
+        s.active = Some(fix);
+        Ok(())
     }
 
     /// Runs the real-revm pipeline for the given checked opportunity.
@@ -372,7 +524,7 @@ impl LocalSimulator {
         risk_checked: &RiskCheckedOpportunity,
     ) -> Result<SimulationOutcome, SimulationError> {
         let opp = &risk_checked.opportunity;
-        let fixtures = self.fixtures.as_ref().ok_or_else(|| {
+        let fixtures = self.state.lock().active.clone().ok_or_else(|| {
             SimulationError::Setup(
                 "no fixtures loaded; call load_fixture or prefetch_for first".into(),
             )
@@ -580,7 +732,7 @@ impl LocalSimulator {
         risk_checked: &RiskCheckedOpportunity,
     ) -> Result<(SimulationOutcome, LocalStateFingerprint), SimulationError> {
         let opp = &risk_checked.opportunity;
-        let fixtures = self.fixtures.as_ref().ok_or_else(|| {
+        let fixtures = self.state.lock().active.clone().ok_or_else(|| {
             SimulationError::Setup(
                 "no fixtures loaded; call load_fixture or prefetch_for first".into(),
             )

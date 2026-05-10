@@ -18,6 +18,11 @@ rkyv = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 revm = { workspace = true }
+# Phase 5 P5-A: interior-mutability for the active fixture slot +
+# bounded LRU cache for per-block fixture retention. Both are
+# already workspace deps; promoted to direct here.
+parking_lot = { workspace = true }
+lru = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -25,6 +30,9 @@ tempfile = "3"
 rust-lmax-mev-config = { path = "../config" }
 rust-lmax-mev-node = { path = "../node" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# P5-A: PA-2/3/5 mock StateFetcher uses #[async_trait] (the trait
+# declaration is async_trait-sugared in crates/state-fetcher).
+async-trait = { workspace = true }
 
 # P4-C2 fixture-recording tool. Operator-only:
 #   cargo run --release --example dump_fixture -- 0x<block_hash>
