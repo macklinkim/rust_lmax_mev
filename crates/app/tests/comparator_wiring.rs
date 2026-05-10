@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{B256, U256};
+use rust_lmax_mev_app::KillSwitch;
 use rust_lmax_mev_app::{
     _cw_5_compile_check_comparator_driver_takes_dyn_relay_simulator, comparator_driver,
     MismatchAbortRecord, MismatchCheckPassed, MismatchJournalSink,
@@ -151,6 +152,7 @@ async fn cw_1_happy_path_emits_mismatch_check_passed() {
         bundle,
         journal,
         "cw-1-driver",
+        KillSwitch::new(false),
     ));
 
     sim_tx.send(sample_outcome_envelope()).expect("publish ok");
@@ -202,6 +204,7 @@ async fn cw_2_mismatch_path_journals_before_broadcast() {
         bundle,
         journal,
         "cw-2-driver",
+        KillSwitch::new(false),
     ));
 
     sim_tx.send(sample_outcome_envelope()).expect("publish ok");
@@ -327,6 +330,7 @@ async fn cw_2_fail_journal_failure_suppresses_broadcast() {
         bundle,
         failing,
         "cw-2-fail-driver",
+        KillSwitch::new(false),
     ));
 
     sim_tx.send(sample_outcome_envelope()).expect("publish ok");
@@ -347,6 +351,66 @@ async fn cw_2_fail_journal_failure_suppresses_broadcast() {
     );
 
     drop(sim_tx);
+    drop(mismatch_tx);
+    let _ = driver.await;
+}
+
+/// KS-5 (P5-D DP-D7): comparator_driver per-driver kill-switch guard.
+/// Active kill switch suppresses the entire iteration: no comparator
+/// broadcast, no mismatch broadcast, no journal append. Off (default)
+/// behavior is byte-identical to CW-1 (covered by CW-1 itself).
+#[tokio::test(flavor = "multi_thread")]
+async fn ks_5_comparator_driver_kill_switch_suppresses_iteration() {
+    let dir = tempfile::tempdir().unwrap();
+    let (journal, journal_path) = open_journal(dir.path(), "ks5.bin");
+    let (sim_tx, sim_rx) = broadcast::channel::<EventEnvelope<SimulationOutcomeWithFingerprint>>(8);
+    let (cmp_tx, mut cmp_rx) = broadcast::channel::<MismatchCheckPassed>(8);
+    let (mismatch_tx, mut mismatch_rx) = broadcast::channel::<MismatchAbortRecord>(8);
+
+    let mock = Arc::new(MockRelaySimulator::default());
+    mock.program(Ok(sample_relay_outcome_matching_local()));
+    let relay_sim: Arc<dyn RelaySimulator> = mock;
+
+    let bundle = Arc::new(BundleConstructor::new(BundleConfig::defaults()).expect("ctor"));
+
+    // Kill switch ACTIVE from the start.
+    let ks = KillSwitch::new(true);
+
+    let driver = tokio::spawn(comparator_driver(
+        sim_rx,
+        cmp_tx.clone(),
+        mismatch_tx.clone(),
+        Some(relay_sim),
+        bundle,
+        journal,
+        "ks-5-driver",
+        ks,
+    ));
+
+    sim_tx.send(sample_outcome_envelope()).expect("publish ok");
+
+    // Neither comparator nor mismatch should fire while kill is active.
+    let cmp_result = tokio::time::timeout(Duration::from_millis(500), cmp_rx.recv()).await;
+    assert!(
+        cmp_result.is_err(),
+        "KS-5: comparator must NOT emit MismatchCheckPassed while kill switch active; got {cmp_result:?}"
+    );
+    let mis_result = tokio::time::timeout(Duration::from_millis(50), mismatch_rx.recv()).await;
+    assert!(
+        mis_result.is_err(),
+        "KS-5: comparator must NOT emit MismatchAbortRecord while kill switch active; got {mis_result:?}"
+    );
+
+    // Journal must remain at the file header (no abort records).
+    let bytes = std::fs::read(&journal_path).unwrap_or_default();
+    assert!(
+        bytes.len() <= 8,
+        "KS-5: journal must contain no records while kill switch active; got {} bytes",
+        bytes.len()
+    );
+
+    drop(sim_tx);
+    drop(cmp_tx);
     drop(mismatch_tx);
     let _ = driver.await;
 }

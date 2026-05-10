@@ -511,6 +511,7 @@ use tokio::sync::broadcast;
 // implement `BundleRelay` for use by the per-adapter
 // `submit_disabled` tests in `crates/relay-clients/tests/`, but the
 // app wiring stays simulator-side only.
+pub use rust_lmax_mev_bundle_relay::KillSwitch;
 use rust_lmax_mev_relay_clients::{
     BloxrouteConfig, BloxrouteRelay, FlashbotsConfig, FlashbotsRelay,
 };
@@ -594,6 +595,10 @@ pub struct AppHandle4 {
     // `FileJournal<MismatchAbort>` directly (no separate drain task
     // per DP-E8 v0.4 R-E16 fix).
     comparator_driver_task: tokio::task::JoinHandle<()>,
+    // Phase 5 P5-D (DP-D5): process-wide kill switch. Cloned into
+    // `comparator_driver` and any future submission boundary; toggled
+    // via `set_execution_disabled`.
+    kill_switch: KillSwitch,
 }
 
 impl std::fmt::Debug for AppHandle4 {
@@ -640,6 +645,20 @@ impl AppHandle4 {
         self.mismatch_tx.subscribe()
     }
 
+    /// Phase 5 P5-D (DP-D5): borrow the process-wide kill switch. The
+    /// returned reference is `Arc`-shared with the `comparator_driver`
+    /// task and any future submission boundary.
+    pub fn kill_switch(&self) -> &KillSwitch {
+        &self.kill_switch
+    }
+
+    /// Phase 5 P5-D (DP-D5): operator runtime toggle. `disabled = true`
+    /// activates the kill switch (every guarded site returns early /
+    /// errs); `disabled = false` deactivates. Lock-free atomic store.
+    pub fn set_execution_disabled(&self, disabled: bool) {
+        self.kill_switch.set_active(disabled);
+    }
+
     /// Async shutdown. Aborts producer + awaits it (so its
     /// broadcast Sender clones drop), then drops senders in reverse-
     /// pipeline order so each driver's recv() returns Closed, then
@@ -669,6 +688,7 @@ impl AppHandle4 {
             simulator_driver_task,
             execution_driver_task,
             comparator_driver_task,
+            kill_switch: _kill_switch,
         } = self;
 
         producer_task.abort();
@@ -840,6 +860,10 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
         Arc::clone(&bundle_constructor),
     ));
 
+    // Phase 5 P5-D (DP-D6): construct process-wide kill switch from
+    // config initial value once; clones share the same AtomicBool.
+    let kill_switch = KillSwitch::new(config.relay.execution_disabled);
+
     // Phase 4 P4-E: spawn comparator_driver. Subscribes to sim_tx
     // (independently of execution_driver so both see every
     // SimulationOutcomeWithFingerprint envelope). Owns the
@@ -852,6 +876,7 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
         Arc::clone(&bundle_constructor),
         mismatch_journal,
         "comparator-driver",
+        kill_switch.clone(),
     ));
 
     // P4-F: dispatch on `config.ingress.mempool_source` selector.
@@ -886,6 +911,7 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
         simulator_driver_task,
         execution_driver_task,
         comparator_driver_task,
+        kill_switch,
     })
 }
 
@@ -1305,6 +1331,7 @@ pub async fn comparator_driver<J: MismatchJournalSink>(
     constructor: Arc<BundleConstructor>,
     mut journal: J,
     name: &'static str,
+    kill_switch: KillSwitch,
 ) {
     if relay_sim.is_none() {
         tracing::info!(
@@ -1318,6 +1345,19 @@ pub async fn comparator_driver<J: MismatchJournalSink>(
     loop {
         match rx.recv().await {
             Ok(envelope) => {
+                // P5-D DP-D7 per-driver kill-switch guard: if active,
+                // skip iteration with WARN — no relay sim, no comparator
+                // broadcast, no journal append, no mismatch broadcast.
+                // Phase 5 has no actual submit, so this is the would-be-
+                // submission gate per overview Q-P5-5.
+                if kill_switch.is_active() {
+                    tracing::warn!(
+                        target: "kill_switch",
+                        consumer = name,
+                        "comparator_driver: kill switch active, skipping iteration"
+                    );
+                    continue;
+                }
                 let cc = envelope.chain_context().clone();
                 let correlation_id = envelope.correlation_id();
                 let local_outcome = envelope.payload().outcome.clone();

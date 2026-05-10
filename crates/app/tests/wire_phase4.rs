@@ -14,7 +14,9 @@ mod common;
 use std::time::Duration;
 
 use alloy_primitives::{Address, Bytes, B256, U256};
-use rust_lmax_mev_app::{journal_drain_loop, wire_phase4, AppError, WireOptions};
+use rust_lmax_mev_app::{
+    journal_drain_loop, wire_phase4, AppError, AppHandle4, KillSwitch, WireOptions,
+};
 use rust_lmax_mev_ingress::{IngressEvent, MempoolEvent};
 use rust_lmax_mev_journal::FileJournal;
 use rust_lmax_mev_types::{ChainContext, EventEnvelope, EventSource, PublishMeta};
@@ -82,6 +84,56 @@ async fn journal_drain_consumer_exits_on_broadcast_lagged() {
     );
     join.unwrap()
         .expect("journal_drain_loop task itself must not panic on Lagged");
+}
+
+/// KS-4 (P5-D DP-D5 + DP-D6): `AppHandle4` exposes the kill switch
+/// surface (`kill_switch()` accessor + `set_execution_disabled(bool)`
+/// toggle) and `wire_phase4` reads `config.relay.execution_disabled`
+/// into the `KillSwitch` ctor.
+///
+/// Compile-time + behavior split:
+/// - `_ks_4_compile_check_app_handle4_surface` pins the public method
+///   shape (returns `&KillSwitch`; `set_execution_disabled` takes
+///   `&self, bool`). A future renaming or signature drift fails to
+///   compile.
+/// - The runtime body asserts the wiring contract that `wire_phase4`
+///   uses: a `KillSwitch::new(config.relay.execution_disabled)`
+///   reflects the config initial value, and `set_active(disabled)`
+///   (the same call `set_execution_disabled` delegates to) flips it.
+///   `wire_phase4` itself requires a live geth endpoint (W-1 covers
+///   the bogus-URL Err path); KS-4 exercises the wiring's atomic-flag
+///   semantics directly so the test is hermetic.
+#[allow(dead_code)]
+fn _ks_4_compile_check_app_handle4_surface(handle: &AppHandle4) {
+    let _: &KillSwitch = handle.kill_switch();
+    handle.set_execution_disabled(true);
+    handle.set_execution_disabled(false);
+}
+
+#[test]
+fn ks_4_kill_switch_wiring_contract() {
+    // Mirrors wire_phase4: KillSwitch::new(config.relay.execution_disabled).
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut cfg_off = common::make_config(dir.path());
+    cfg_off.relay.execution_disabled = false;
+    let ks_off = KillSwitch::new(cfg_off.relay.execution_disabled);
+    assert!(!ks_off.is_active(), "KS-4: config off → kill switch off");
+    ks_off.set_active(true);
+    assert!(
+        ks_off.is_active(),
+        "KS-4: set_active(true) (delegate target of set_execution_disabled) must flip on"
+    );
+
+    let mut cfg_on = common::make_config(dir.path());
+    cfg_on.relay.execution_disabled = true;
+    let ks_on = KillSwitch::new(cfg_on.relay.execution_disabled);
+    assert!(
+        ks_on.is_active(),
+        "KS-4: config on → kill switch on at construction"
+    );
+    ks_on.set_active(false);
+    assert!(!ks_on.is_active(), "KS-4: set_active(false) must flip off");
 }
 
 fn make_envelope(seq: u64) -> EventEnvelope<IngressEvent> {

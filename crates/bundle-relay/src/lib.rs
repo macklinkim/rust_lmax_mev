@@ -13,7 +13,10 @@
 //!
 //! Phase 5 Safety Gate is the only path to enabling real submission.
 
+pub mod kill_switch;
 pub mod rkyv_compat;
+
+pub use kill_switch::KillSwitch;
 
 use async_trait::async_trait;
 use rust_lmax_mev_relay_sim::RelaySimulator;
@@ -84,6 +87,15 @@ pub enum BundleRelayError {
     /// text + spec docs (BR-3 spec-drift guard).
     #[error("submit_bundle disabled in this build (Phase 5 Safety Gate required)")]
     SubmitDisabled,
+
+    /// P5-D DP-D3: Kill switch active — process-wide execution disabled.
+    /// The `Display` text contains literal `"kill switch active"` AND
+    /// literal `"Phase 5 P5-D"` for the KS-3 BR-3-style spec-drift guard.
+    /// PRECEDENCE: when a `submit_bundle` impl is wired to a kill switch
+    /// (Phase 6), it MUST return this variant BEFORE returning
+    /// `SubmitDisabled` if the kill switch is active.
+    #[error("kill switch active — Phase 5 P5-D execution disabled")]
+    KillSwitchActive,
 }
 
 /// Object-safe async trait for relay endpoints that expose both the
@@ -101,6 +113,14 @@ pub trait BundleRelay: RelaySimulator + Send + Sync + 'static {
     /// `Err(BundleRelayError::SubmitDisabled)`. No call site exists
     /// in P4-E that invokes this method. Phase 5 Safety Gate is the
     /// only path to enabling real submission.
+    ///
+    /// PRECEDENCE (P5-D DP-D4): when a kill switch is threaded into
+    /// the implementation (Phase 6), the impl MUST check
+    /// `KillSwitch::is_active()` and return
+    /// `Err(BundleRelayError::KillSwitchActive)` BEFORE returning
+    /// `Err(SubmitDisabled)` if the kill switch is active. P5-D ships
+    /// the type + error variant; per-adapter wiring is deferred to
+    /// Phase 6 per overview Q-P5-5.
     async fn submit_bundle(
         &self,
         bundle: &SignedBundle,
@@ -171,6 +191,51 @@ mod tests {
         assert!(
             display.contains("Phase 5 Safety Gate"),
             "BR-3: SubmitDisabled Display must contain 'Phase 5 Safety Gate'; got {display:?}"
+        );
+    }
+
+    /// KS-1 (P5-D DP-D2): `KillSwitch::new` initial state matches the
+    /// `initial_disabled` arg.
+    #[test]
+    fn ks_1_kill_switch_initial_state() {
+        assert!(!KillSwitch::new(false).is_active());
+        assert!(KillSwitch::new(true).is_active());
+    }
+
+    /// KS-2 (P5-D DP-D2): `set_active` flips; the underlying
+    /// `Arc<AtomicBool>` is shared across `Clone` so a flip via one
+    /// clone is visible from every other clone.
+    #[test]
+    fn ks_2_kill_switch_toggle_and_shared_state() {
+        let ks = KillSwitch::new(false);
+        let ks_clone = ks.clone();
+
+        assert!(!ks.is_active());
+        assert!(!ks_clone.is_active());
+
+        ks.set_active(true);
+        assert!(ks.is_active());
+        assert!(ks_clone.is_active());
+
+        ks_clone.set_active(false);
+        assert!(!ks.is_active());
+        assert!(!ks_clone.is_active());
+    }
+
+    /// KS-3 (P5-D DP-D3 BR-3-style spec-drift guard): `Display` of
+    /// `KillSwitchActive` MUST contain literal `"kill switch active"`
+    /// AND literal `"Phase 5 P5-D"`.
+    #[test]
+    fn ks_3_kill_switch_active_display_literals() {
+        let err = BundleRelayError::KillSwitchActive;
+        let display = format!("{err}");
+        assert!(
+            display.contains("kill switch active"),
+            "KS-3: KillSwitchActive Display must contain 'kill switch active'; got {display:?}"
+        );
+        assert!(
+            display.contains("Phase 5 P5-D"),
+            "KS-3: KillSwitchActive Display must contain 'Phase 5 P5-D'; got {display:?}"
         );
     }
 }
