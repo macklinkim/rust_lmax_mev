@@ -10,9 +10,11 @@
 //! key, NO signing infrastructure, NO production submission.
 
 pub mod bloxroute;
+pub(crate) mod call_bundle;
 pub mod flashbots;
 
-// Concrete adapter types lands in commit 3; re-exports added then.
+pub use bloxroute::{BloxrouteConfig, BloxrouteRelay};
+pub use flashbots::{FlashbotsConfig, FlashbotsRelay};
 
 #[cfg(test)]
 mod tests {
