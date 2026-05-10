@@ -45,6 +45,12 @@ pub struct Config {
     /// execution-note v0.6 §DP-E3.
     #[serde(default)]
     pub relay: RelayConfig,
+    /// Phase 5 P5-A simulator section. `#[serde(default)]` so
+    /// existing TOML configs (predating P5-A) parse unchanged —
+    /// `prefetch_enabled = false` is the fail-closed P5-A default
+    /// (operator opt-in to incur live archive RPC cost).
+    #[serde(default)]
+    pub simulator: SimulatorConfig,
 }
 
 /// Node topology section per ADR-007. Primary Geth WS + HTTP plus at least
@@ -311,6 +317,43 @@ pub enum RelayKind {
     Bloxroute,
 }
 
+/// Phase 5 P5-A simulator section per execution-note v0.3.
+///
+/// `prefetch_enabled = false` is the fail-closed default per Q-P5-6
+/// (operator opt-in to incur live archive RPC cost). Setting
+/// `prefetch_enabled = true` requires `node.archive_rpc` to also be
+/// configured; `Config::validate` rejects the
+/// `prefetch_enabled=true + archive_rpc=None` combination with
+/// `ConfigError::PrefetchRequiresArchiveRpc` (DP-A9; CFG-A2).
+///
+/// `prefetch_cache_capacity` is `usize` on the wire (DP-A8 v0.2
+/// resolves the v0.1 `NonZeroUsize` ↔ `value: 0` contradiction); the
+/// runtime cache wraps in `NonZeroUsize::new(value).expect(...)`
+/// after `Config::validate` rejects `0`.
+///
+/// `freshness_window_blocks` is **retention/eviction only** (DP-A11):
+/// the cache is keyed by `block_hash`, so a different block produces
+/// a different cache key by construction — the cache CANNOT serve
+/// stale state under any value. `1` (default) evicts on each new
+/// block; `≥ 2` retains prior blocks' entries in the LRU.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct SimulatorConfig {
+    pub prefetch_enabled: bool,
+    pub prefetch_cache_capacity: usize,
+    pub freshness_window_blocks: u64,
+}
+
+impl Default for SimulatorConfig {
+    fn default() -> Self {
+        Self {
+            prefetch_enabled: false,
+            prefetch_cache_capacity: 64,
+            freshness_window_blocks: 1,
+        }
+    }
+}
+
 /// All errors produced by [`Config::load`] and [`Config::from_toml_str`].
 ///
 /// `#[non_exhaustive]` so Phase 2 may add variants additively without
@@ -398,6 +441,22 @@ pub enum ConfigError {
     /// fail-closed at validation time.
     #[error("relay.enabled_relays must contain at most 1 entry in P4-E; got {count}")]
     TooManyEnabledRelays { count: usize },
+
+    /// Phase 5 P5-A (DP-A8): `simulator.prefetch_cache_capacity`
+    /// must be >= 1. Wire-shape is `usize` (deserialize accepts 0)
+    /// plus this validate-time reject; runtime then wraps in
+    /// `NonZeroUsize::new(value).expect("validated > 0")`.
+    #[error("simulator.prefetch_cache_capacity must be >= 1, got {value}")]
+    InvalidCacheCapacity { value: usize },
+
+    /// Phase 5 P5-A (DP-A9): `simulator.prefetch_enabled = true`
+    /// without a configured `node.archive_rpc` is a fail-closed
+    /// validation error (NOT a runtime fallback). Operators get a
+    /// loud config-load error rather than silent prefetch-disabled
+    /// surprise. Payload-free by design (no string field that could
+    /// leak the archive endpoint URL).
+    #[error("simulator.prefetch_enabled = true requires node.archive_rpc to be configured")]
+    PrefetchRequiresArchiveRpc,
 }
 
 impl Config {
@@ -475,6 +534,14 @@ impl Config {
         // adapter is the second.
         if self.relay.live_send {
             return Err(ConfigError::LiveSendForbidden);
+        }
+        // Phase 5 P5-A: cache capacity > 0 invariant (DP-A8).
+        if self.simulator.prefetch_cache_capacity == 0 {
+            return Err(ConfigError::InvalidCacheCapacity { value: 0 });
+        }
+        // Phase 5 P5-A: prefetch_enabled requires archive_rpc (DP-A9 / R-A4).
+        if self.simulator.prefetch_enabled && self.node.archive_rpc.is_none() {
+            return Err(ConfigError::PrefetchRequiresArchiveRpc);
         }
         // Phase 4 P4-E (R-E23): at most one relay in P4-E. Multi-
         // relay fanout is Phase 5+ work; silently dropping the rest
@@ -961,5 +1028,48 @@ endpoint = ""
         let err = Config::from_toml_str(&dup)
             .expect_err("CFG-MISMATCH-JOURNAL-1: duplicate path must be rejected");
         assert!(matches!(err, ConfigError::DuplicateJournalPath { .. }));
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 5 P5-A SimulatorConfig tests (CFG-A1, CFG-A2) per
+    // execution-note v0.3.
+    // ----------------------------------------------------------------
+
+    /// CFG-A1 (DP-A8): `simulator` section omitted → defaults
+    /// (`prefetch_enabled = false`; capacity 64; window 1).
+    /// Explicit `prefetch_cache_capacity = 0` → InvalidCacheCapacity.
+    #[test]
+    fn cfg_a1_simulator_defaults_and_capacity_zero_rejected() {
+        let cfg = Config::from_toml_str(valid_minimum_toml()).expect("default ok");
+        assert!(!cfg.simulator.prefetch_enabled);
+        assert_eq!(cfg.simulator.prefetch_cache_capacity, 64);
+        assert_eq!(cfg.simulator.freshness_window_blocks, 1);
+
+        let bad = valid_minimum_toml().to_string() + "\n[simulator]\nprefetch_cache_capacity = 0\n";
+        let err = Config::from_toml_str(&bad).expect_err("CFG-A1: capacity 0 must be rejected");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidCacheCapacity { value: 0 }
+        ));
+    }
+
+    /// CFG-A2 (DP-A9 / R-A4): `prefetch_enabled = true` + missing
+    /// `node.archive_rpc` → PrefetchRequiresArchiveRpc. With archive
+    /// configured, the same prefetch_enabled = true parses cleanly.
+    #[test]
+    fn cfg_a2_prefetch_enabled_requires_archive_rpc() {
+        // Failure path: prefetch_enabled = true; no [node.archive_rpc].
+        let bad = valid_minimum_toml().to_string() + "\n[simulator]\nprefetch_enabled = true\n";
+        let err = Config::from_toml_str(&bad)
+            .expect_err("CFG-A2: prefetch_enabled=true without archive_rpc must be rejected");
+        assert!(matches!(err, ConfigError::PrefetchRequiresArchiveRpc));
+
+        // Happy path: prefetch_enabled = true with [node.archive_rpc].
+        let happy = valid_minimum_toml().to_string()
+            + "\n[node.archive_rpc]\nurl = \"https://archive.example/v2/demo\"\nlabel = \"alchemy-archive\"\n[simulator]\nprefetch_enabled = true\n";
+        let cfg = Config::from_toml_str(&happy)
+            .expect("CFG-A2 happy: prefetch_enabled=true with archive_rpc must parse");
+        assert!(cfg.simulator.prefetch_enabled);
+        assert!(cfg.node.archive_rpc.is_some());
     }
 }
