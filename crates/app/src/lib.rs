@@ -495,10 +495,73 @@ async fn producer_loop(
 use rust_lmax_mev_execution::BundleCandidate;
 use rust_lmax_mev_opportunity::OpportunityEvent;
 use rust_lmax_mev_risk::RiskCheckedOpportunity;
-use rust_lmax_mev_simulator::SimulationOutcome;
+use rust_lmax_mev_simulator::{LocalStateFingerprint, SimulationOutcome};
 use rust_lmax_mev_state::StateUpdateEvent;
 use rust_lmax_mev_types::{ChainContext, EventEnvelope, EventSource, PublishMeta};
 use tokio::sync::broadcast;
+
+// Phase 4 P4-E imports for the comparator_driver wiring per
+// execution-note v0.6 §D-E3.
+//
+// NOTE: `BundleRelay` trait is INTENTIONALLY NOT imported here.
+// `crates/app` constructs each adapter as its concrete type and
+// stores it as `Arc<dyn RelaySimulator>` per DP-E13 v0.3 — the
+// `BundleRelay` trait object is never named in this file (CW-3 grep
+// gate at batch close). The concrete adapters from `crates/relay-clients`
+// implement `BundleRelay` for use by the per-adapter
+// `submit_disabled` tests in `crates/relay-clients/tests/`, but the
+// app wiring stays simulator-side only.
+use rust_lmax_mev_relay_clients::{
+    BloxrouteConfig, BloxrouteRelay, FlashbotsConfig, FlashbotsRelay,
+};
+use rust_lmax_mev_relay_sim::{
+    compare_result, ComparatorInputs, LocalBundleShape, MismatchAbort, RelaySimRequest,
+    RelaySimulator,
+};
+
+/// Phase 4 P4-E DP-E5: payload of `sim_tx`. Carries both the
+/// `SimulationOutcome` (for the existing execution_driver) and the
+/// `LocalStateFingerprint` (for the new comparator_driver per R-E1 +
+/// DP-D9'). Wiring-only type; not journaled, not bus-archived; only
+/// `Clone + Debug` needed.
+#[derive(Debug, Clone)]
+pub struct SimulationOutcomeWithFingerprint {
+    pub outcome: SimulationOutcome,
+    pub fingerprint: LocalStateFingerprint,
+}
+
+/// Phase 4 P4-E: terminal "comparator passed" envelope payload. Emitted
+/// on `comparator_tx` when local + relay outcomes agree. **No subscriber
+/// reads `comparator_tx` in P4-E** — the type exists for Phase 5+
+/// submission consumers per the v0.6 honest closeout claim.
+#[derive(Debug, Clone)]
+pub struct MismatchCheckPassed {
+    pub candidate: BundleCandidate,
+}
+
+/// Phase 4 P4-E DP-E12: observability payload emitted on `mismatch_tx`
+/// AFTER the synchronous journal append+flush completes (per DP-E8
+/// v0.4 ordering guarantee). Used by future monitor subscribers.
+/// In P4-E nothing reads `mismatch_tx` either — the journal IS the
+/// canonical record.
+#[derive(Debug, Clone)]
+pub struct MismatchAbortRecord {
+    pub abort: MismatchAbort,
+}
+
+// Re-exports for crates/app/tests/comparator_wiring.rs CW-1..5.
+pub use rust_lmax_mev_relay_clients::{
+    BloxrouteConfig as RelayBloxrouteConfig, FlashbotsConfig as RelayFlashbotsConfig,
+};
+
+/// In-test verification (CW-5 type-system gate per DP-E13 v0.3): the
+/// `comparator_driver` parameter type for the relay simulator is
+/// `Arc<dyn RelaySimulator>` (NOT a BundleRelay trait object). This
+/// function exists ONLY to compile-assert the parameter type; never
+/// invoked at runtime.
+#[doc(hidden)]
+pub fn _cw_5_compile_check_comparator_driver_takes_dyn_relay_simulator(_: Arc<dyn RelaySimulator>) {
+}
 
 /// Phase 3 P3-F handle. Owns the producer task + the broadcast
 /// rebroadcast senders + every spawned driver task.
@@ -513,8 +576,12 @@ pub struct AppHandle4 {
     state_tx: broadcast::Sender<EventEnvelope<StateUpdateEvent>>,
     opp_tx: broadcast::Sender<EventEnvelope<OpportunityEvent>>,
     risk_tx: broadcast::Sender<EventEnvelope<RiskCheckedOpportunity>>,
-    sim_tx: broadcast::Sender<EventEnvelope<SimulationOutcome>>,
+    sim_tx: broadcast::Sender<EventEnvelope<SimulationOutcomeWithFingerprint>>,
     exec_tx: broadcast::Sender<EventEnvelope<BundleCandidate>>,
+    // Phase 4 P4-E (D-E3 + DP-E12): comparator broadcast channels.
+    // No subscribers in P4-E (terminal observability events).
+    comparator_tx: broadcast::Sender<MismatchCheckPassed>,
+    mismatch_tx: broadcast::Sender<MismatchAbortRecord>,
     producer_task: tokio::task::JoinHandle<()>,
     ingress_journal_task: tokio::task::JoinHandle<()>,
     state_driver_task: tokio::task::JoinHandle<()>,
@@ -523,6 +590,10 @@ pub struct AppHandle4 {
     risk_driver_task: tokio::task::JoinHandle<()>,
     simulator_driver_task: tokio::task::JoinHandle<()>,
     execution_driver_task: tokio::task::JoinHandle<()>,
+    // Phase 4 P4-E: comparator_driver task. Owns the
+    // `FileJournal<MismatchAbort>` directly (no separate drain task
+    // per DP-E8 v0.4 R-E16 fix).
+    comparator_driver_task: tokio::task::JoinHandle<()>,
 }
 
 impl std::fmt::Debug for AppHandle4 {
@@ -554,6 +625,21 @@ impl AppHandle4 {
         self.exec_tx.subscribe()
     }
 
+    /// Phase 4 P4-E (DP-E12 observability): subscribe to the comparator's
+    /// "mismatch passed" broadcast. P4-E has no production subscriber;
+    /// tests use this to verify CW-1 happy-path emission.
+    pub fn comparator_subscribe(&self) -> broadcast::Receiver<MismatchCheckPassed> {
+        self.comparator_tx.subscribe()
+    }
+
+    /// Phase 4 P4-E (DP-E12 observability): subscribe to the comparator's
+    /// "mismatch abort" broadcast. P4-E has no production subscriber;
+    /// tests use this to verify CW-2 abort-path emission AFTER the
+    /// synchronous journal append+flush completes.
+    pub fn mismatch_subscribe(&self) -> broadcast::Receiver<MismatchAbortRecord> {
+        self.mismatch_tx.subscribe()
+    }
+
     /// Async shutdown. Aborts producer + awaits it (so its
     /// broadcast Sender clones drop), then drops senders in reverse-
     /// pipeline order so each driver's recv() returns Closed, then
@@ -572,6 +658,8 @@ impl AppHandle4 {
             risk_tx,
             sim_tx,
             exec_tx,
+            comparator_tx,
+            mismatch_tx,
             producer_task,
             ingress_journal_task,
             state_driver_task,
@@ -580,10 +668,19 @@ impl AppHandle4 {
             risk_driver_task,
             simulator_driver_task,
             execution_driver_task,
+            comparator_driver_task,
         } = self;
 
         producer_task.abort();
         let _ = producer_task.await;
+
+        // Drop comparator broadcasts so any subscribers get Closed,
+        // then abort comparator driver. The driver owns the journal
+        // directly; its drop runs flush at shutdown.
+        drop(comparator_tx);
+        drop(mismatch_tx);
+        comparator_driver_task.abort();
+        let _ = comparator_driver_task.await;
 
         drop(exec_tx);
         execution_driver_task.abort();
@@ -661,8 +758,19 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
     let (state_tx, _) = broadcast::channel::<EventEnvelope<StateUpdateEvent>>(cap);
     let (opp_tx, _) = broadcast::channel::<EventEnvelope<OpportunityEvent>>(cap);
     let (risk_tx, _) = broadcast::channel::<EventEnvelope<RiskCheckedOpportunity>>(cap);
-    let (sim_tx, _) = broadcast::channel::<EventEnvelope<SimulationOutcome>>(cap);
+    // Phase 4 P4-E (DP-E5): sim_tx payload now carries the fingerprint.
+    let (sim_tx, _) = broadcast::channel::<EventEnvelope<SimulationOutcomeWithFingerprint>>(cap);
     let (exec_tx, _) = broadcast::channel::<EventEnvelope<BundleCandidate>>(cap);
+    // Phase 4 P4-E (D-E3 + DP-E12): comparator broadcasts.
+    let (comparator_tx, _) = broadcast::channel::<MismatchCheckPassed>(cap);
+    let (mismatch_tx, _) = broadcast::channel::<MismatchAbortRecord>(cap);
+
+    // Phase 4 P4-E: open the comparator's mismatch journal.
+    let mismatch_journal: FileJournal<MismatchAbort> =
+        FileJournal::open(&config.journal.mismatch_journal_path)?;
+    // Build the relay-sim adapter from config (None when
+    // `enabled_relays` is empty per DP-E3 → comparator inert).
+    let relay_sim = build_relay_sim_from_config(&config.relay)?;
 
     let ingress_journal_task = tokio::spawn(journal_drain_loop(
         "ingress-journal",
@@ -701,6 +809,20 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
         Arc::clone(&bundle_constructor),
     ));
 
+    // Phase 4 P4-E: spawn comparator_driver. Subscribes to sim_tx
+    // (independently of execution_driver so both see every
+    // SimulationOutcomeWithFingerprint envelope). Owns the
+    // FileJournal<MismatchAbort> directly per DP-E8 v0.4.
+    let comparator_driver_task = tokio::spawn(comparator_driver(
+        sim_tx.subscribe(),
+        comparator_tx.clone(),
+        mismatch_tx.clone(),
+        relay_sim,
+        Arc::clone(&bundle_constructor),
+        mismatch_journal,
+        "comparator-driver",
+    ));
+
     let watched = config.ingress.watched_addresses.clone();
     let producer_provider = Arc::clone(&provider);
     let producer_ingress_tx = ingress_tx.clone();
@@ -721,6 +843,8 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
         risk_tx,
         sim_tx,
         exec_tx,
+        comparator_tx,
+        mismatch_tx,
         producer_task,
         ingress_journal_task,
         state_driver_task,
@@ -729,6 +853,7 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
         risk_driver_task,
         simulator_driver_task,
         execution_driver_task,
+        comparator_driver_task,
     })
 }
 
@@ -933,17 +1058,26 @@ async fn risk_driver(
     }
 }
 
+/// Phase 4 P4-E (DP-E5): `simulator_driver` calls
+/// `simulate_with_fingerprint(...)` (R-E13 / DP-D16 — same input
+/// shape as `simulate(...)`) and emits `SimulationOutcomeWithFingerprint`
+/// envelopes so downstream consumers (execution_driver +
+/// comparator_driver) can both access the local state read-set.
 async fn simulator_driver(
     mut rx: broadcast::Receiver<EventEnvelope<RiskCheckedOpportunity>>,
-    sim_tx: broadcast::Sender<EventEnvelope<SimulationOutcome>>,
+    sim_tx: broadcast::Sender<EventEnvelope<SimulationOutcomeWithFingerprint>>,
     simulator: Arc<LocalSimulator>,
 ) {
     let mut seq: u64 = 0;
     loop {
         match rx.recv().await {
-            Ok(envelope) => match simulator.simulate(envelope.payload()) {
-                Ok(outcome) => {
-                    if let Some(env) = seal_envelope(EventSource::Simulator, outcome, &mut seq) {
+            Ok(envelope) => match simulator.simulate_with_fingerprint(envelope.payload()) {
+                Ok((outcome, fingerprint)) => {
+                    let payload = SimulationOutcomeWithFingerprint {
+                        outcome,
+                        fingerprint,
+                    };
+                    if let Some(env) = seal_envelope(EventSource::Simulator, payload, &mut seq) {
                         let _ = sim_tx.send(env);
                     }
                 }
@@ -964,15 +1098,17 @@ async fn simulator_driver(
     }
 }
 
+/// Phase 4 P4-E (DP-E5): one-line read of `.outcome` from the new
+/// envelope payload. No semantic change.
 async fn execution_driver(
-    mut rx: broadcast::Receiver<EventEnvelope<SimulationOutcome>>,
+    mut rx: broadcast::Receiver<EventEnvelope<SimulationOutcomeWithFingerprint>>,
     exec_tx: broadcast::Sender<EventEnvelope<BundleCandidate>>,
     constructor: Arc<BundleConstructor>,
 ) {
     let mut seq: u64 = 0;
     loop {
         match rx.recv().await {
-            Ok(envelope) => match constructor.construct(envelope.payload()) {
+            Ok(envelope) => match constructor.construct(&envelope.payload().outcome) {
                 Ok(candidate) => {
                     if let Some(env) = seal_envelope(EventSource::Execution, candidate, &mut seq) {
                         let _ = exec_tx.send(env);
@@ -993,6 +1129,202 @@ async fn execution_driver(
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+/// Phase 4 P4-E comparator_driver (D-E3 + DP-E12 + DP-E13).
+///
+/// Subscribes to `sim_tx` (the new `SimulationOutcomeWithFingerprint`
+/// broadcast). For each successful local simulation:
+/// 1. Runs `BundleConstructor::construct` to obtain the local
+///    `BundleCandidate`. If construction aborts (non-Success status,
+///    zero profit, etc.) the candidate is skipped — no relay sim
+///    needed.
+/// 2. Builds a `RelaySimRequest` (`txs` is EMPTY in P4-E since no
+///    signing exists; the adapter short-circuits with
+///    `Err(UnsignedBundleUnavailable)` BEFORE any HTTP I/O per R-E2).
+/// 3. Calls `RelaySimulator::simulate_bundle` on the held
+///    `Arc<dyn RelaySimulator>` (DP-E13: NO trait-object upcast;
+///    the simulator-trait object was constructed concretely in
+///    `wire_phase4`).
+/// 4. Calls `relay_sim::compare_result(...)`.
+///    - **Ok(())** → emit `MismatchCheckPassed` on `comparator_tx`.
+///      No subscriber reads it in P4-E (terminal observability event).
+///    - **Err(MismatchAbort)** OR **relay-sim Err(_)** → wrap into
+///      `EventEnvelope<MismatchAbort>` per DP-E8 v0.4, call
+///      `journal.append(&env)?` + `journal.flush()?` SYNCHRONOUSLY,
+///      then emit `MismatchAbortRecord` on `mismatch_tx` (also
+///      observability-only in P4-E).
+///
+/// **NO `submit_bundle` call site exists in this function** (CW-3
+/// grep gate); the held trait object is `Arc<dyn RelaySimulator>` so
+/// `submit_bundle` is not even type-reachable from here (CW-5
+/// type-system guarantee).
+/// Public for CW-1..5 integration tests in `crates/app/tests/`.
+#[allow(clippy::too_many_arguments)]
+pub async fn comparator_driver(
+    mut rx: broadcast::Receiver<EventEnvelope<SimulationOutcomeWithFingerprint>>,
+    comparator_tx: broadcast::Sender<MismatchCheckPassed>,
+    mismatch_tx: broadcast::Sender<MismatchAbortRecord>,
+    relay_sim: Option<Arc<dyn RelaySimulator>>,
+    constructor: Arc<BundleConstructor>,
+    mut journal: rust_lmax_mev_journal::FileJournal<MismatchAbort>,
+    name: &'static str,
+) {
+    if relay_sim.is_none() {
+        tracing::info!(
+            consumer = name,
+            "no relays configured (relay.enabled_relays empty per DP-E3); comparator inert"
+        );
+        return;
+    }
+    let relay_sim = relay_sim.expect("just checked is_some");
+    let mut seq: u64 = 0;
+    loop {
+        match rx.recv().await {
+            Ok(envelope) => {
+                let cc = envelope.chain_context().clone();
+                let correlation_id = envelope.correlation_id();
+                let local_outcome = envelope.payload().outcome.clone();
+                let local_fingerprint = envelope.payload().fingerprint.clone();
+
+                // Step 1: construct local bundle candidate (skip if Aborted).
+                let candidate = match constructor.construct(&local_outcome) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                // Step 2: build local-side comparator inputs.
+                let local_shape = LocalBundleShape {
+                    expected_inclusion_index: 0,
+                    expected_coinbase_transfer_wei: alloy_primitives::U256::ZERO,
+                };
+
+                // Step 3: build empty-`txs` relay request (P4-E has
+                // no signer; adapter short-circuits with
+                // UnsignedBundleUnavailable BEFORE any network I/O).
+                let req = RelaySimRequest {
+                    block_hash: alloy_primitives::B256::from(cc.block_hash),
+                    state_block_number: cc.block_number,
+                    txs: Vec::new(),
+                };
+                let relay_result = relay_sim.simulate_bundle(req).await;
+
+                // Step 4: comparator (compare_result handles BOTH
+                // Ok(outcome) and Err(_) → Unknown classification).
+                let inputs = ComparatorInputs {
+                    local: &local_outcome,
+                    local_shape: &local_shape,
+                    local_fingerprint: &local_fingerprint,
+                };
+                let cmp = compare_result(inputs, relay_result.as_ref());
+
+                match cmp {
+                    Ok(()) => {
+                        // No subscriber reads comparator_tx in P4-E.
+                        let _ = comparator_tx.send(MismatchCheckPassed { candidate });
+                    }
+                    Err(abort_box) => {
+                        let abort = *abort_box;
+                        // R-E9 + DP-E8 v0.4: SYNCHRONOUS journal
+                        // append+flush BEFORE any downstream emission.
+                        if let Some(env) = seal_envelope_with_context(
+                            EventSource::Relay,
+                            abort.clone(),
+                            &mut seq,
+                            cc,
+                            correlation_id,
+                        ) {
+                            if let Err(e) = journal.append(&env) {
+                                tracing::error!(
+                                    consumer = name,
+                                    error = %e,
+                                    "comparator journal append failed"
+                                );
+                            }
+                            if let Err(e) = journal.flush() {
+                                tracing::error!(
+                                    consumer = name,
+                                    error = %e,
+                                    "comparator journal flush failed"
+                                );
+                            }
+                        }
+                        // Observability-only broadcast AFTER journal
+                        // append+flush. No subscriber in P4-E.
+                        let _ = mismatch_tx.send(MismatchAbortRecord { abort });
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::error!(consumer = name, skipped = n, "broadcast lagged; aborting");
+                break;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    if let Err(e) = journal.flush() {
+        tracing::error!(consumer = name, error = %e, "journal flush at shutdown failed");
+    }
+}
+
+/// Comparator-side helper that threads an upstream chain_context +
+/// correlation_id into the new envelope (per DP-E8 v0.4
+/// metadata-preservation requirement).
+fn seal_envelope_with_context<T>(
+    source: EventSource,
+    payload: T,
+    seq: &mut u64,
+    chain_context: ChainContext,
+    correlation_id: u64,
+) -> Option<EventEnvelope<T>> {
+    let meta = PublishMeta {
+        source,
+        chain_context,
+        event_version: 1,
+        correlation_id,
+    };
+    let now_ns: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    *seq = seq.wrapping_add(1);
+    EventEnvelope::seal(meta, payload, *seq, now_ns).ok()
+}
+
+/// Build the `Arc<dyn RelaySimulator>` from `config.relay.enabled_relays`.
+/// Empty list → `None` (comparator_driver runs inert per DP-E3).
+/// More-than-one entry: P4-E uses ONLY THE FIRST entry — multi-relay
+/// fanout (concurrent `simulate_bundle` calls + first-success-wins
+/// merging) is Phase 5+ work. Documented here so a future PR cannot
+/// accidentally relax this without scope review.
+fn build_relay_sim_from_config(
+    cfg: &rust_lmax_mev_config::RelayConfig,
+) -> Result<Option<Arc<dyn RelaySimulator>>, AppError> {
+    use rust_lmax_mev_config::RelayKind;
+    let Some(first) = cfg.enabled_relays.first() else {
+        return Ok(None);
+    };
+    let timeout = cfg.simulate_timeout_ms;
+    let arc: Arc<dyn RelaySimulator> = match first.kind {
+        RelayKind::Flashbots => {
+            let r = FlashbotsRelay::new(FlashbotsConfig {
+                endpoint: first.endpoint.clone(),
+                timeout_ms: timeout,
+            })
+            .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
+            Arc::new(r)
+        }
+        RelayKind::Bloxroute => {
+            let r = BloxrouteRelay::new(BloxrouteConfig {
+                endpoint: first.endpoint.clone(),
+                timeout_ms: timeout,
+                api_key: first.api_key.clone(),
+            })
+            .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
+            Arc::new(r)
+        }
+    };
+    Ok(Some(arc))
 }
 
 fn seal_envelope<T>(source: EventSource, payload: T, seq: &mut u64) -> Option<EventEnvelope<T>> {

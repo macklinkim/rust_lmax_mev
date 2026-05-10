@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use rust_lmax_mev_config::{
     BusConfig, Config, FallbackRpcConfig, IngressConfig, IngressTokens, JournalConfig, LogFormat,
-    NodeConfig, ObservabilityConfig, PoolConfig, PoolKind, StateConfig,
+    NodeConfig, ObservabilityConfig, PoolConfig, PoolKind, RelayConfig, StateConfig,
 };
 
 /// Builds a `Config` whose journal + snapshot paths live under
@@ -46,6 +46,7 @@ pub fn make_config(tempdir: &std::path::Path) -> Config {
             rocksdb_snapshot_path: tempdir.join("snapshot"),
             ingress_journal_path: tempdir.join("ingress.log"),
             state_journal_path: tempdir.join("state.log"),
+            mismatch_journal_path: tempdir.join("mismatch.bin"),
         },
         bus: BusConfig { capacity: 8 },
         ingress: IngressConfig {
@@ -69,6 +70,9 @@ pub fn make_config(tempdir: &std::path::Path) -> Config {
                     .unwrap(),
             }],
         },
+        // Phase 4 P4-E (DP-E3): empty enabled_relays default →
+        // comparator_driver inert in tests that don't program a mock.
+        relay: RelayConfig::default(),
     }
 }
 

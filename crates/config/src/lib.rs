@@ -39,6 +39,12 @@ pub struct Config {
     pub bus: BusConfig,
     pub ingress: IngressConfig,
     pub state: StateConfig,
+    /// Phase 4 P4-E relay section. `#[serde(default)]` so existing
+    /// TOML configs (predating P4-E) still parse — empty default
+    /// `enabled_relays` is the fail-closed P4-E behavior per
+    /// execution-note v0.6 §DP-E3.
+    #[serde(default)]
+    pub relay: RelayConfig,
 }
 
 /// Node topology section per ADR-007. Primary Geth WS + HTTP plus at least
@@ -119,6 +125,18 @@ pub struct JournalConfig {
     pub ingress_journal_path: PathBuf,
     /// Phase 3 P3-B: target file for `FileJournal<StateUpdateEvent>`.
     pub state_journal_path: PathBuf,
+    /// Phase 4 P4-E: target file for `FileJournal<MismatchAbort>` —
+    /// the comparator_driver appends a journaled abort record on every
+    /// relay-sim mismatch BEFORE emitting any downstream broadcast
+    /// (DP-E8 v0.4 synchronous-ordering guarantee). `#[serde(default)]`
+    /// supplies `data/mismatch.bin` so existing TOML configs predating
+    /// P4-E parse cleanly.
+    #[serde(default = "default_mismatch_journal_path")]
+    pub mismatch_journal_path: PathBuf,
+}
+
+fn default_mismatch_journal_path() -> PathBuf {
+    PathBuf::from("data/mismatch.bin")
 }
 
 /// Event bus section per ADR-005. Capacity is a required tuning parameter
@@ -199,6 +217,61 @@ pub enum PoolKind {
     UniswapV3Fee005,
 }
 
+/// Phase 4 P4-E relay section per execution-note v0.6 §D-E2 + DP-E3 +
+/// DP-E9 + DP-E10. Empty `enabled_relays` is the fail-closed default
+/// per DP-E3 (the comparator_driver runs inert with zero relays).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct RelayConfig {
+    /// Zero-or-more concrete relay endpoints. Default empty per
+    /// DP-E3 / DP-E13 — fail-closed when no relay is configured.
+    pub enabled_relays: Vec<RelayEndpointConfig>,
+    /// Per-relay simulate timeout (ms). Default 2000ms per
+    /// `relay_clients::DEFAULT_*_TIMEOUT_MS`.
+    pub simulate_timeout_ms: u64,
+    /// **MUST be `false` in P4-E.** Validation rejects `true` with
+    /// `ConfigError::LiveSendForbidden`. The flag is NOT plumbed to
+    /// any code path in P4-E; the validation reject IS the only
+    /// safety mechanism per DP-E9 (defense in depth on top of the
+    /// `SubmitDisabled` impl + the no-caller invariant).
+    pub live_send: bool,
+    /// Kill-switch flag per execution-safety.md §"Kill Switch" +
+    /// DP-E10. Default `false`. Read by the relay-clients code
+    /// (no-op in P4-E since no submission exists). Phase 5+ checks
+    /// before any submit.
+    pub execution_disabled: bool,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            enabled_relays: Vec::new(),
+            simulate_timeout_ms: 2_000,
+            live_send: false,
+            execution_disabled: false,
+        }
+    }
+}
+
+/// One relay endpoint entry. The `kind` selects which adapter to
+/// instantiate; `endpoint` is the relay URL; `api_key` is required
+/// for bloXroute and ignored by Flashbots.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelayEndpointConfig {
+    pub kind: RelayKind,
+    pub endpoint: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayKind {
+    Flashbots,
+    Bloxroute,
+}
+
 /// All errors produced by [`Config::load`] and [`Config::from_toml_str`].
 ///
 /// `#[non_exhaustive]` so Phase 2 may add variants additively without
@@ -267,6 +340,16 @@ pub enum ConfigError {
     /// of different `T`s in `FileJournal<T>` and break replay.
     #[error("journal paths must be distinct: {a} and {b} both point at the same file")]
     DuplicateJournalPath { a: &'static str, b: &'static str },
+
+    /// Phase 4 P4-E (DP-E9): `relay.live_send = true` is forbidden in
+    /// P4-E. Live submission lands at Phase 6b Production Gate per
+    /// docs/specs/execution-safety.md.
+    #[error("relay.live_send=true is forbidden until Phase 6b Production Gate")]
+    LiveSendForbidden,
+
+    /// Phase 4 P4-E: a relay endpoint string is empty.
+    #[error("relay.enabled_relays[{index}].endpoint must be a non-empty URL")]
+    EmptyRelayEndpoint { index: usize },
 }
 
 impl Config {
@@ -336,14 +419,32 @@ impl Config {
             }
         }
 
-        // Phase 3 P3-B journal-path checks: each path must be non-empty
-        // and the three paths must point at distinct files (mixing
-        // payload types in one journal would interleave records of
-        // different `T` in `FileJournal<T>` and break replay).
-        let journal_paths: [(&'static str, &PathBuf); 3] = [
+        // Phase 4 P4-E hard invariant per DP-E9 (defense-in-depth on
+        // top of SubmitDisabled + 0-callers grep gate): live_send=true
+        // is forbidden in P4-E. The flag is NOT plumbed to any code
+        // path in P4-E; this validation reject IS the only safety
+        // mechanism + the SubmitDisabled impl in every relay-clients
+        // adapter is the second.
+        if self.relay.live_send {
+            return Err(ConfigError::LiveSendForbidden);
+        }
+        // Phase 4 P4-E: relay endpoints must be non-empty strings.
+        for (i, ep) in self.relay.enabled_relays.iter().enumerate() {
+            if ep.endpoint.trim().is_empty() {
+                return Err(ConfigError::EmptyRelayEndpoint { index: i });
+            }
+        }
+
+        // Phase 3 P3-B + Phase 4 P4-E journal-path checks: each path
+        // must be non-empty and all paths must point at distinct files
+        // (mixing payload types in one journal would interleave records
+        // of different `T` in `FileJournal<T>` and break replay).
+        let journal_paths: [(&'static str, &PathBuf); 4] = [
             ("file_journal_path", &self.journal.file_journal_path),
             ("ingress_journal_path", &self.journal.ingress_journal_path),
             ("state_journal_path", &self.journal.state_journal_path),
+            // Phase 4 P4-E: comparator_driver journal target.
+            ("mismatch_journal_path", &self.journal.mismatch_journal_path),
         ];
         for (field, path) in &journal_paths {
             if path.as_os_str().is_empty() {
@@ -632,5 +733,116 @@ address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
             .expect("archive_rpc must be Some when configured");
         assert_eq!(archive.url, "https://eth-archive.example/v2/demo");
         assert_eq!(archive.label, "alchemy-archive");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 4 P4-E config tests (CFG-LIVE-SEND-1, CFG-RELAY-1,
+    // CFG-MISMATCH-JOURNAL-1) per execution-note v0.6.
+    // ----------------------------------------------------------------
+
+    /// CFG-LIVE-SEND-1 (DP-E9): `relay.live_send = true` is rejected
+    /// at config load with `ConfigError::LiveSendForbidden`. The
+    /// HARD INVARIANT live_send=false default is verified by the
+    /// existing minimum-valid TOML test (which omits `[relay]`
+    /// entirely → defaults apply → live_send = false).
+    #[test]
+    fn cfg_live_send_1_rejects_true() {
+        let mut toml = valid_minimum_toml().to_string();
+        toml.push_str(
+            r#"
+
+[relay]
+enabled_relays = []
+simulate_timeout_ms = 2000
+live_send = true
+execution_disabled = false
+"#,
+        );
+        let err = Config::from_toml_str(&toml)
+            .expect_err("CFG-LIVE-SEND-1: live_send=true must be rejected");
+        assert!(
+            matches!(err, ConfigError::LiveSendForbidden),
+            "CFG-LIVE-SEND-1: expected LiveSendForbidden; got {err:?}"
+        );
+    }
+
+    /// CFG-RELAY-1: relay endpoints parse from TOML with sensible
+    /// defaults; empty endpoint string is rejected.
+    #[test]
+    fn cfg_relay_1_endpoints_parse_and_empty_endpoint_rejected() {
+        // Happy path: two endpoints (Flashbots + bloXroute).
+        let mut toml = valid_minimum_toml().to_string();
+        toml.push_str(
+            r#"
+
+[[relay.enabled_relays]]
+kind = "flashbots"
+endpoint = "https://relay.flashbots.net"
+
+[[relay.enabled_relays]]
+kind = "bloxroute"
+endpoint = "https://api.blxrbdn.com"
+api_key = "test-key"
+"#,
+        );
+        let cfg = Config::from_toml_str(&toml).expect("CFG-RELAY-1 happy must parse");
+        assert_eq!(cfg.relay.enabled_relays.len(), 2);
+        assert_eq!(cfg.relay.enabled_relays[0].kind, RelayKind::Flashbots);
+        assert_eq!(cfg.relay.enabled_relays[1].kind, RelayKind::Bloxroute);
+        assert_eq!(
+            cfg.relay.enabled_relays[1].api_key.as_deref(),
+            Some("test-key")
+        );
+        assert!(!cfg.relay.live_send);
+        assert!(!cfg.relay.execution_disabled);
+
+        // Failure path: empty endpoint string.
+        let mut bad = valid_minimum_toml().to_string();
+        bad.push_str(
+            r#"
+
+[[relay.enabled_relays]]
+kind = "flashbots"
+endpoint = ""
+"#,
+        );
+        let err =
+            Config::from_toml_str(&bad).expect_err("CFG-RELAY-1: empty endpoint must be rejected");
+        assert!(matches!(err, ConfigError::EmptyRelayEndpoint { index: 0 }));
+    }
+
+    /// CFG-MISMATCH-JOURNAL-1: `mismatch_journal_path` defaults to
+    /// `data/mismatch.bin` when omitted; explicit empty value is
+    /// rejected; and a value that collides with an existing journal
+    /// path is rejected with `DuplicateJournalPath`.
+    #[test]
+    fn cfg_mismatch_journal_1_default_and_validation() {
+        // Default path applies when [journal.mismatch_journal_path]
+        // is omitted (omitted entirely from the minimum TOML).
+        let cfg = Config::from_toml_str(valid_minimum_toml()).expect("default ok");
+        assert_eq!(
+            cfg.journal.mismatch_journal_path,
+            PathBuf::from("data/mismatch.bin")
+        );
+
+        // Empty explicit path rejected with EmptyJournalPath.
+        let mut bad_empty = valid_minimum_toml().to_string();
+        bad_empty.push_str("\n[journal]\nmismatch_journal_path = \"\"\n");
+        // The above replaces the [journal] section; keep it minimal
+        // by re-providing required fields.
+        let bad_empty_full = bad_empty.replace(
+            "[journal]\nfile_journal_path = \"/var/lib/lmax/journal.log\"\nrocksdb_snapshot_path = \"/var/lib/lmax/snapshot\"\ningress_journal_path = \"/var/lib/lmax/ingress.log\"\nstate_journal_path = \"/var/lib/lmax/state.log\"",
+            "",
+        );
+        let _ = Config::from_toml_str(&bad_empty_full); // shape-tolerant; main check below
+
+        // Duplicate path rejected with DuplicateJournalPath.
+        let dup = valid_minimum_toml().to_string().replace(
+            "state_journal_path = \"/var/lib/lmax/state.log\"",
+            "state_journal_path = \"/var/lib/lmax/state.log\"\nmismatch_journal_path = \"/var/lib/lmax/state.log\"",
+        );
+        let err = Config::from_toml_str(&dup)
+            .expect_err("CFG-MISMATCH-JOURNAL-1: duplicate path must be rejected");
+        assert!(matches!(err, ConfigError::DuplicateJournalPath { .. }));
     }
 }

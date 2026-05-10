@@ -22,6 +22,10 @@ rust-lmax-mev-opportunity = { path = "../opportunity" }
 rust-lmax-mev-risk = { path = "../risk" }
 rust-lmax-mev-simulator = { path = "../simulator" }
 rust-lmax-mev-execution = { path = "../execution" }
+# Phase 4 P4-E: relay-sim types + bundle-relay trait + concrete adapters.
+rust-lmax-mev-relay-sim = { path = "../relay-sim" }
+rust-lmax-mev-bundle-relay = { path = "../bundle-relay" }
+rust-lmax-mev-relay-clients = { path = "../relay-clients" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
