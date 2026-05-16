@@ -1,7 +1,13 @@
 # Phase 6 Batch D — Per-adapter kill-switch wiring (G10 enforcement)
 
 **Date:** 2026-05-16 KST
-**Status:** Draft v0.2 (revised after manual Codex REVISION REQUIRED HIGH on v0.1, 2026-05-16 KST). Four v0.1 → v0.2 fixes:
+**Status:** Draft v0.3 (revised 2026-05-16 KST after user **OVERRIDE** of Codex-APPROVED v0.2 — committed at `98ab10c`). User direction: **reduce P6-D test matrix from 8 to 4** before any implementation lands. Three v0.2 → v0.3 changes:
+(A) **Test matrix reduced to 4** (Flashbots precedence + bloXroute precedence + one shared-state on Flashbots + one inactive-baseline on bloXroute). All four together cover: the §3 PRECEDENCE rule on BOTH adapters, the shared-`Arc<AtomicBool>` clone-and-flip semantics across the ctor seam (one adapter), and the inactive-baseline regression (the other adapter, on the existing `submit_bundle` path). The G10 manual-inspection enforcement at Step 8 remains the authoritative "FIRST non-trivia statement / no pre-guard work" guard.
+(B) **D-T-D7 + D-T-D8 (no-HTTP-I/O) DROPPED.** Rationale: at HEAD `93803b2` (pre-P6-D) `submit_bundle` performs no HTTP I/O at all (every impl returns `Err(SubmitDisabled)` directly), so a wiremock zero-request assertion adds runtime cost without distinguishing "guard ran first" from "guard never ran but no I/O happened anyway". The "no pre-guard work" property is enforced statically by G10 manual inspection — that is sufficient for Phase 6a. If a Phase 6b PR adds real HTTP-issuing code to `submit_bundle`, that PR is the right place to add the no-HTTP-I/O regression guard, scoped to the new behavior.
+(C) **Duplicate-adapter coverage dropped.** v0.2 had both Flashbots AND bloXroute shared-state tests (D-T-D3 + D-T-D4) AND both inactive-baseline tests (D-T-D5 + D-T-D6). v0.3 keeps one shared-state (Flashbots) + one inactive-baseline (bloXroute) — asymmetric across adapters. Both adapters use the identical `if self.kill_switch.is_active() { return Err(KillSwitchActive); }` guard pattern (single canonical idiom proven once at the AST level via G10), so the cross-adapter duplication adds no new safety signal in Phase 6a. The PRECEDENCE proof (D-T-D1 + D-T-D2) stays on BOTH adapters because that is the property the boundary spec actually names per-adapter.
+Q-D5 reframed to RECOMMEND the lean 4-test matrix. Q-D1..Q-D4 unchanged from v0.2 (Codex APPROVED). Expected workspace test total **243 → 239 passed + 1 ignored** (235 baseline + 4 new). Awaiting manual Codex re-review.
+
+**Predecessor history retained verbatim below**: v0.1 → v0.2 had **four** Codex REVISION REQUIRED HIGH fixes:
 (1) **Ctor blast-radius corrected.** v0.1 claimed "zero `crates/app/` impact" but `crates/app/src/lib.rs` constructs both adapters at lines 1523 + 1531 inside `build_relay_sim_from_config`. v0.2 keeps Q-D1 = BREAKING `::new(cfg, kill_switch)` AND **includes the 2 `crates/app/src/lib.rs` call-site updates in scope**. The kill switch is constructed at `crates/app/src/lib.rs:890` AFTER `build_relay_sim_from_config` is called at `:844`; v0.2 reorders so the kill switch is constructed BEFORE the relay-sim build, and `build_relay_sim_from_config(&config.relay, kill_switch.clone())` threads it in. G3 stays 0 (no new `submit_bundle(` caller) and G4 stays 0 (return type at `crates/app/src/lib.rs:1521` stays `Arc<dyn RelaySimulator>` — the upcast prevents `dyn BundleRelay` from appearing in app). The change is reviewed-delta inside `crates/app/src/lib.rs` `build_relay_sim_from_config` ONLY; no other `crates/app/` code is touched.
 (2) **Ctor call-site inventory + count fixed.** v0.1 stated "19 inside `crates/relay-clients/`" but the correct decomposition at HEAD `93803b2` is: **17 inside `crates/relay-clients/`** (5 `flashbots.rs` test mod + 5 `bloxroute.rs` test mod + 2 `tests/{flashbots,bloxroute}.rs` `relay_pointing_at` helpers + 2 `tests/submit_disabled.rs` + 3 `tests/redaction.rs`) **+ 2 in `crates/app/src/lib.rs`** = 19 total. v0.2 corrects §D-D2 explicitly.
 (3) **D-D6 contradiction fixed.** v0.1 §D-D6 said "no `crates/relay-clients/tests/flashbots.rs` change. No `crates/relay-clients/tests/bloxroute.rs` change beyond the `relay_pointing_at` helper" — but those `relay_pointing_at` helpers DO need a mechanical signature change for the breaking ctor. v0.2 rewrites §D-D6 to: "test files listed in §"Tests summary" receive mechanical ctor-call signature updates ONLY (helper signature changes / `KillSwitch::new(false)` arg additions); no test assertion changes." The negative invariant `crates/app/src/lib.rs` adds the `build_relay_sim_from_config` reorder + kill_switch threading and nothing else.
@@ -67,7 +73,7 @@ What's missing — and what P6-D ships — is the **adapter-side wiring** and th
   - `crates/relay-clients/tests/submit_disabled.rs` — 2 sites (`submit_disabled_1_flashbots`, `submit_disabled_2_bloxroute`).
   - `crates/relay-clients/tests/redaction.rs` — 3 sites (lines 62, 196, 264 per `git grep`).
   - `crates/app/src/lib.rs` — **2 sites**: line 1523 (`FlashbotsRelay::new(FlashbotsConfig { ... })` inside `build_relay_sim_from_config` `RelayKind::Flashbots` arm) and line 1531 (`BloxrouteRelay::new(BloxrouteConfig { ... })` inside the `RelayKind::Bloxroute` arm).
-- The 17 sites inside `crates/relay-clients/` pass `KillSwitch::new(false)` (inactive baseline) — preserves existing semantics (`Err(SubmitDisabled)` continues to flow as the second statement). The 8 NEW tests (D-T-D1..D-T-D8 below) use explicit `KillSwitch` instances they construct + flip. The 2 sites inside `crates/app/src/lib.rs` receive the in-scope `kill_switch.clone()` parameter described in §D-D2a immediately below.
+- The 17 sites inside `crates/relay-clients/` pass `KillSwitch::new(false)` (inactive baseline) — preserves existing semantics (`Err(SubmitDisabled)` continues to flow as the second statement). The **4 NEW tests** (D-T-D1..D-T-D4 below, v0.3 lean matrix) use explicit `KillSwitch` instances they construct + flip (D-T-D3 is the only test that calls `set_active(true)`; D-T-D1/D-T-D2 construct with `KillSwitch::new(true)` directly; D-T-D4 constructs with `KillSwitch::new(false)`). The 2 sites inside `crates/app/src/lib.rs` receive the in-scope `kill_switch.clone()` parameter described in §D-D2a immediately below.
 
 ### D-D2a — `crates/app/src/lib.rs` `build_relay_sim_from_config` threading (in scope per Codex v0.1 verdict item 1)
 
@@ -77,7 +83,7 @@ What's missing — and what P6-D ships — is the **adapter-side wiring** and th
 - **G3 + G4 preservation analysis (the key Phase 6a invariant Codex v0.1 verdict item 1 required Claude to demonstrate):**
   - G3 (`submit_bundle(` callers in `crates/app/src/`): **stays 0**. The new code in `build_relay_sim_from_config` constructs adapters and returns `Arc<dyn RelaySimulator>`; it does NOT invoke `submit_bundle`. No new `submit_bundle(` call site is added in `crates/app/src/lib.rs`.
   - G4 (`dyn BundleRelay` / `Arc<dyn BundleRelay>` in `crates/app/src/`): **stays 0**. The return type at `crates/app/src/lib.rs:1521` (`let arc: Arc<dyn RelaySimulator>`) is unchanged — the adapter is upcast to `Arc<dyn RelaySimulator>` only (DP-E13 upcast-prevention). The function signature return is `Result<Option<Arc<dyn RelaySimulator>>, AppError>` — unchanged. No `Arc<dyn BundleRelay>` / `dyn BundleRelay` field, parameter, return type, or local binding is introduced anywhere in `crates/app/src/`.
-- **Why this preserves the "kill switch only reaches the adapter via the operator-flippable seam" property:** the `KillSwitch` instance held by `AppHandle4` and the `KillSwitch` field inside each adapter are clones of the same underlying `Arc<AtomicBool>`. An operator flipping the switch via `AppHandle4::set_execution_disabled(true)` is observed by `kill_switch.is_active()` inside the adapter's `submit_bundle` first statement on the very next call. D-T-D3 / D-T-D4 prove this at the adapter level with a synthetic `KillSwitch::clone()`; the production wiring at `build_relay_sim_from_config` uses exactly the same `Clone` mechanism.
+- **Why this preserves the "kill switch only reaches the adapter via the operator-flippable seam" property:** the `KillSwitch` instance held by `AppHandle4` and the `KillSwitch` field inside each adapter are clones of the same underlying `Arc<AtomicBool>`. An operator flipping the switch via `AppHandle4::set_execution_disabled(true)` is observed by `kill_switch.is_active()` inside the adapter's `submit_bundle` first statement on the very next call. **D-T-D3 alone** (v0.3 lean matrix) proves this at the adapter level with a synthetic `KillSwitch::clone()` on the Flashbots side; the property generalizes to bloXroute via the identical guard idiom (verified by G10) + the KS-1/KS-2 baseline `KillSwitch::clone()` semantics tests in `crates/bundle-relay/src/lib.rs` `#[cfg(test)]`. The production wiring at `build_relay_sim_from_config` uses exactly the same `Clone` mechanism.
 
 ### D-D3 — `submit_bundle` first-statement kill-switch guard in both adapters
 
@@ -103,29 +109,34 @@ What's missing — and what P6-D ships — is the **adapter-side wiring** and th
 
 Per the boundary-spec §G9 allow-list extension ("After P6-D: extended allow-list ALSO includes `crates/relay-clients/`"), the `KillSwitch` symbol may appear in `crates/relay-clients/src/` files. But the `crates/relay-clients/src/lib.rs` does NOT re-export `KillSwitch` — callers import it from `rust_lmax_mev_bundle_relay::KillSwitch` directly (single canonical re-export path; matches the existing `BundleRelay` + `BundleRelayError` + `SignedBundle` + `SubmissionReceipt` import pattern at `crates/relay-clients/src/flashbots.rs:25`). This avoids creating a second re-export path that could fork the type identity.
 
-### D-D5 — Tests (8 new)
+### D-D5 — Tests (4 new — v0.3 lean matrix per user override)
 
 | ID | File | Test function | Kind | New / modified |
 |---|---|---|---|---|
 | D-T-D1 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_3_flashbots_kill_switch_active_takes_precedence` | `#[tokio::test]` | **new** |
 | D-T-D2 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_4_bloxroute_kill_switch_active_takes_precedence` | `#[tokio::test]` | **new** |
 | D-T-D3 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_5_flashbots_shared_kill_switch_flip_visible` | `#[tokio::test]` | **new** |
-| D-T-D4 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_6_bloxroute_shared_kill_switch_flip_visible` | `#[tokio::test]` | **new** |
-| D-T-D5 | `crates/relay-clients/src/flashbots.rs` `#[cfg(test)]` | `flashbots_kill_switch_inactive_baseline_returns_submit_disabled` | `#[tokio::test]` | **new** |
-| D-T-D6 | `crates/relay-clients/src/bloxroute.rs` `#[cfg(test)]` | `bloxroute_kill_switch_inactive_baseline_returns_submit_disabled` | `#[tokio::test]` | **new** |
-| D-T-D7 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_7_flashbots_kill_switch_first_statement_no_io` | `#[tokio::test]` | **new** |
-| D-T-D8 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_8_bloxroute_kill_switch_first_statement_no_io` | `#[tokio::test]` | **new** |
+| D-T-D4 | `crates/relay-clients/src/bloxroute.rs` `#[cfg(test)]` | `bloxroute_kill_switch_inactive_baseline_returns_submit_disabled` | `#[tokio::test]` | **new** |
 
 Test details:
 
-- **D-T-D1 / D-T-D2 (PRECEDENCE proof)** — construct adapter with `KillSwitch::new(true)`, call `submit_bundle(&dummy_bundle())`, assert `Err(BundleRelayError::KillSwitchActive)`. Directly proves §3 PRECEDENCE: `KillSwitchActive` FIRST, ahead of `SubmitDisabled`.
-- **D-T-D3 / D-T-D4 (shared-state proof)** — construct `let ks = KillSwitch::new(false); let ks_clone = ks.clone();`, pass `ks_clone` to ctor, assert `submit_bundle` returns `SubmitDisabled`; then `ks.set_active(true)`; assert next `submit_bundle` call returns `KillSwitchActive`. Proves the Arc-backed shared state crosses the adapter boundary (operator can flip the switch from `AppHandle4` and the adapter observes it on the very next call).
-- **D-T-D5 / D-T-D6 (inactive baseline)** — `let ks = KillSwitch::new(false);` ctor + `submit_bundle` assert `Err(BundleRelayError::SubmitDisabled)`. Regression check that the new guard does NOT short-circuit when the switch is inactive (proves the second statement is still reachable). Co-located with the existing `flashbots_new_*` / `bloxroute_new_*` unit tests so the file is a complete adapter-ctor surface.
-- **D-T-D7 / D-T-D8 (no-HTTP-I/O under active kill switch)** — start a `MockServer` (no mock mounted), pass `kill_switch=KillSwitch::new(true)`, call `submit_bundle`, assert `Err(KillSwitchActive)`, then assert `server.received_requests().await.unwrap_or_default().is_empty()`. Runtime regression guard that complements G10: proves the active kill switch results in **zero HTTP requests** to the relay endpoint (mirrors the P4-E R-E2 invariant for the empty-txs short-circuit path). Scope clarification per Codex v0.1 verdict item 4: D-T-D7 / D-T-D8 do NOT enforce the "FIRST non-trivia statement" rule and do NOT prevent a pre-guard `tracing::*` / `dbg!` / non-network statement insertion — at HEAD `93803b2` `submit_bundle` performs no HTTP I/O at all (every impl returns `Err(SubmitDisabled)` directly), so wiremock zero-request runtime evidence alone cannot distinguish "guard ran first" from "guard never ran but no I/O happened anyway". The "no pre-guard work" guarantee is enforced by the **G10 manual inspection at Step 8** (`rg -n --type rust -B 1 -A 5 'fn submit_bundle' crates/relay-clients/src/` + visual confirmation that `if self.kill_switch.is_active() { return Err(...); }` is the FIRST non-trivia statement with no preceding `let` / pattern-match / `tracing::*` / `dbg!` / comment-only line that compiles to a statement). D-T-D7 / D-T-D8's role is narrower but still load-bearing: they ensure that any **future P6+** refactor that adds real HTTP-issuing code to `submit_bundle` (e.g., the Phase 6b actual-submission path) cannot accidentally bypass the kill-switch guard and reach the network when the switch is active.
+- **D-T-D1 / D-T-D2 (PRECEDENCE proof — BOTH adapters)** — construct adapter with `KillSwitch::new(true)`, call `submit_bundle(&dummy_bundle())`, assert `Err(BundleRelayError::KillSwitchActive)`. Directly proves §3 PRECEDENCE: `KillSwitchActive` FIRST, ahead of `SubmitDisabled`. Per-adapter because the boundary-spec §3 names the rule per-adapter; each adapter holds its own `KillSwitch` field and runs its own guard.
+- **D-T-D3 (shared-state proof — Flashbots only)** — construct `let ks = KillSwitch::new(false); let ks_clone = ks.clone();`, pass `ks_clone` to `FlashbotsRelay::new(...)`. **Phase 1**: `submit_bundle` returns `SubmitDisabled` (inactive-baseline path for Flashbots). **Phase 2**: `ks.set_active(true)` on the original outside-the-adapter handle. **Phase 3**: next `submit_bundle` call returns `KillSwitchActive` (shared-state proof). Single asymmetric test on Flashbots; the property generalizes to bloXroute because (a) both adapters use the identical guard pattern (verified by G10 manual inspection) and (b) `KillSwitch::clone()` semantics are owned by `crates/bundle-relay/src/kill_switch.rs` and proven generally by KS-1/KS-2 in `crates/bundle-relay/src/lib.rs` `#[cfg(test)]` (P5-D baseline).
+- **D-T-D4 (inactive-baseline regression — bloXroute only)** — `let ks = KillSwitch::new(false);` + `BloxrouteRelay::new(BloxrouteConfig::default(), ks)`, then `submit_bundle(&dummy)` asserts `Err(BundleRelayError::SubmitDisabled)`. Regression check that the new guard does NOT short-circuit when the switch is inactive (proves the second statement of the guarded `submit_bundle` body is still reachable on the asymmetric adapter — Flashbots inactive-baseline is covered by D-T-D3 Phase 1). Co-located with the existing `bloxroute_new_*` unit tests in the `#[cfg(test)]` mod. The Flashbots side's existing `rc_f_4_submit_bundle_always_disabled` test (carry-forward) is updated mechanically with `KillSwitch::new(false)` and continues to enforce the same inactive-baseline regression on Flashbots — no new test needed for that path.
+
+Coverage matrix:
+
+| Property | Flashbots | bloXroute | Where proved |
+|---|---|---|---|
+| PRECEDENCE (KS=active → `KillSwitchActive`) | YES | YES | D-T-D1 + D-T-D2 |
+| Shared-state (`KillSwitch::clone()` across ctor seam, flip-visible) | YES | (generalizes) | D-T-D3 + KS-1/KS-2 baseline |
+| Inactive-baseline (KS=inactive → `SubmitDisabled`) | YES (via D-T-D3 Phase 1 + existing `rc_f_4_*`) | YES (D-T-D4) | D-T-D3 + D-T-D4 + carry-forward `rc_f_4_*` / `rc_b_4_*` / `submit_disabled_1/2` |
+| FIRST non-trivia statement (no pre-guard work) | YES (G10 inspection) | YES (G10 inspection) | Step 8 manual inspection |
+| Bytes-on-the-wire under active KS | (not enforced runtime in Phase 6a) | (not enforced runtime in Phase 6a) | At HEAD `submit_bundle` performs no HTTP at all; reserved for the Phase 6+ PR that adds actual submission code |
 
 No `#[ignore]` additions; no live-network tests; no env-gated paths.
 
-Expected workspace test total at P6-D close: **235 + 8 = 243 passed + 1 ignored**.
+Expected workspace test total at P6-D close: **235 + 4 = 239 passed + 1 ignored**.
 
 ### D-D6 — NO new Cargo dep / feature / directory edit; touched-file inventory exhaustive
 
@@ -135,9 +146,9 @@ Expected workspace test total at P6-D close: **235 + 8 = 243 passed + 1 ignored*
 
   | File | Change kind | Why touched |
   |---|---|---|
-  | `crates/relay-clients/src/flashbots.rs` | substantive | new `kill_switch: KillSwitch` field; ctor sig; first-statement guard; D-T-D5; 5 existing `#[cfg(test)]` ctor-call updates (mechanical). |
-  | `crates/relay-clients/src/bloxroute.rs` | substantive | mirror of `flashbots.rs`; D-T-D6; 5 existing `#[cfg(test)]` ctor-call updates (mechanical). |
-  | `crates/relay-clients/tests/submit_disabled.rs` | substantive | 6 new tests (D-T-D1..D-T-D4 + D-T-D7 + D-T-D8); 2 existing tests get mechanical ctor-call updates (assertion preserved). |
+  | `crates/relay-clients/src/flashbots.rs` | substantive | new `kill_switch: KillSwitch` field; ctor sig; first-statement guard; 5 existing `#[cfg(test)]` ctor-call updates (mechanical). No new in-src test (Flashbots inactive-baseline covered by D-T-D3 Phase 1 + carry-forward `rc_f_4_*`). |
+  | `crates/relay-clients/src/bloxroute.rs` | substantive | new `kill_switch: KillSwitch` field; ctor sig; first-statement guard; **D-T-D4** (`bloxroute_kill_switch_inactive_baseline_returns_submit_disabled`); 5 existing `#[cfg(test)]` ctor-call updates (mechanical). |
+  | `crates/relay-clients/tests/submit_disabled.rs` | substantive | **3 new tests** (D-T-D1 + D-T-D2 + D-T-D3); 2 existing tests get mechanical ctor-call updates (assertion preserved). |
   | `crates/relay-clients/tests/flashbots.rs` | **mechanical only** | the `relay_pointing_at` helper signature is updated (`fn relay_pointing_at(uri: &str, kill_switch: KillSwitch) -> FlashbotsRelay`) and existing test bodies pass `KillSwitch::new(false)`. NO assertion change. NO new test. |
   | `crates/relay-clients/tests/bloxroute.rs` | **mechanical only** | mirror — `relay_pointing_at` helper signature updated; existing test bodies pass `KillSwitch::new(false)`. NO assertion change. NO new test. |
   | `crates/relay-clients/tests/redaction.rs` | **mechanical only** | 3 ctor-call sites updated to pass `KillSwitch::new(false)`. NO assertion change. NO new test. |
@@ -146,7 +157,7 @@ Expected workspace test total at P6-D close: **235 + 8 = 243 passed + 1 ignored*
 - **Forbidden outside the table above:**
   - No other `.rs` change in `crates/app/src/` beyond the four scoped edits in `build_relay_sim_from_config` + the kill_switch reorder.
   - No `.rs` change in `crates/execution/`, `crates/signer/`, `crates/bundle-relay/`, `crates/relay-sim/`, `crates/state-fetcher/`, `crates/opportunity/`, `crates/risk/`, `crates/simulator/`, `crates/relay-clients/src/call_bundle.rs`, `crates/relay-clients/src/lib.rs`.
-  - No new test file added (the 6 new integration tests land in the existing `crates/relay-clients/tests/submit_disabled.rs`; the 2 new unit tests land in the existing `#[cfg(test)]` mods of `flashbots.rs` + `bloxroute.rs`).
+  - No new test file added. v0.3 lean matrix: **3 new integration tests** land in the existing `crates/relay-clients/tests/submit_disabled.rs` (D-T-D1 + D-T-D2 + D-T-D3), and **1 new unit test** lands in the existing `#[cfg(test)]` mod of `crates/relay-clients/src/bloxroute.rs` (D-T-D4). Total: 3 integration + 1 unit = 4 new.
 
 ## Tests summary
 
@@ -155,11 +166,7 @@ Expected workspace test total at P6-D close: **235 + 8 = 243 passed + 1 ignored*
 | D-T-D1 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_3_flashbots_kill_switch_active_takes_precedence` | `#[tokio::test]` integration | **new** |
 | D-T-D2 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_4_bloxroute_kill_switch_active_takes_precedence` | `#[tokio::test]` integration | **new** |
 | D-T-D3 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_5_flashbots_shared_kill_switch_flip_visible` | `#[tokio::test]` integration | **new** |
-| D-T-D4 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_6_bloxroute_shared_kill_switch_flip_visible` | `#[tokio::test]` integration | **new** |
-| D-T-D5 | `crates/relay-clients/src/flashbots.rs` (test mod) | `flashbots_kill_switch_inactive_baseline_returns_submit_disabled` | `#[tokio::test]` unit | **new** |
-| D-T-D6 | `crates/relay-clients/src/bloxroute.rs` (test mod) | `bloxroute_kill_switch_inactive_baseline_returns_submit_disabled` | `#[tokio::test]` unit | **new** |
-| D-T-D7 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_7_flashbots_kill_switch_first_statement_no_io` | `#[tokio::test]` integration | **new** |
-| D-T-D8 | `crates/relay-clients/tests/submit_disabled.rs` | `submit_disabled_8_bloxroute_kill_switch_first_statement_no_io` | `#[tokio::test]` integration | **new** |
+| D-T-D4 | `crates/relay-clients/src/bloxroute.rs` (test mod) | `bloxroute_kill_switch_inactive_baseline_returns_submit_disabled` | `#[tokio::test]` unit | **new** |
 
 Existing tests touched only mechanically (ctor signature update; no assertion change):
 
@@ -167,10 +174,10 @@ Existing tests touched only mechanically (ctor signature update; no assertion ch
 - `crates/relay-clients/tests/bloxroute.rs` `relay_pointing_at` helper.
 - `crates/relay-clients/tests/submit_disabled.rs` `submit_disabled_1_flashbots` + `submit_disabled_2_bloxroute` (existing — call sites updated; assertions unchanged).
 - `crates/relay-clients/tests/redaction.rs` (3 mechanical ctor-call edits).
-- `crates/relay-clients/src/flashbots.rs` `#[cfg(test)]` 5 existing unit tests (ctor calls updated; assertions unchanged).
-- `crates/relay-clients/src/bloxroute.rs` `#[cfg(test)]` 5 existing unit tests (ctor calls updated; assertions unchanged).
+- `crates/relay-clients/src/flashbots.rs` `#[cfg(test)]` 5 existing unit tests (ctor calls updated; assertions unchanged) — `rc_f_4_submit_bundle_always_disabled` continues to enforce the Flashbots inactive-baseline regression (no separate Flashbots D-T-D needed).
+- `crates/relay-clients/src/bloxroute.rs` `#[cfg(test)]` 5 existing unit tests (ctor calls updated; assertions unchanged) — `rc_b_4_submit_bundle_always_disabled` continues to enforce the bloXroute inactive-baseline regression on the existing test path, while the new D-T-D4 lands in the same `#[cfg(test)]` mod with an explicit "inactive_baseline" name for spec-drift readability.
 
-Expected workspace test total at P6-D close: **235 + 8 = 243 passed + 1 ignored**.
+Expected workspace test total at P6-D close: **235 + 4 = 239 passed + 1 ignored**.
 
 ## Reused (no duplication)
 
@@ -178,7 +185,7 @@ Expected workspace test total at P6-D close: **235 + 8 = 243 passed + 1 ignored*
 - `BundleRelayError::KillSwitchActive` + Display literals `"kill switch active"` / `"Phase 5 P5-D"` (KS-3 spec-drift guard) — `crates/bundle-relay/src/lib.rs:97-98`. P5-D, unchanged.
 - `BundleRelay::submit_bundle` PRECEDENCE doc — `crates/bundle-relay/src/lib.rs:117-123`. P5-D, unchanged.
 - §3 PRECEDENCE + §G9 + §G10 of `docs/specs/phase-6a-boundary.md`. P6-A, unchanged.
-- `MockServer` + `MockServer::received_requests()` — wiremock dev-dep already present (used by D-T-D7/D-T-D8 for the no-IO assertion).
+- KS-1 + KS-2 baseline `KillSwitch::clone()` semantics tests in `crates/bundle-relay/src/lib.rs` `#[cfg(test)]` (P5-D) — generalize the shared-state property that D-T-D3 proves at the adapter boundary, so the bloXroute side does not need a redundant runtime test.
 
 ## Gates at P6-D close (deltas vs P6-C close baseline at `93803b2`)
 
@@ -196,11 +203,11 @@ Expected workspace test total at P6-D close: **235 + 8 = 243 passed + 1 ignored*
 | G6 | unchanged | no new `api_key` log emission; no new tracing of secrets. |
 | G7 | unchanged | no new `#[ignore]` tests. |
 | G8 | unchanged | no new workspace dep cycles. |
-| G9 | **allow-list EXTENDED** | per boundary-spec §G9 prose ("After P6-D: extended allow-list ALSO includes `crates/relay-clients/`"). New hits live only at: (a) the `KillSwitch` field on each adapter struct, (b) the `kill_switch: KillSwitch` ctor parameter, (c) the `self.kill_switch.is_active()` guard, (d) the `use ...::KillSwitch` import, (e) the 8 new test bodies. Expected hit count: ~12 in `crates/relay-clients/`; exact count locked at impl review. |
+| G9 | **allow-list EXTENDED** | per boundary-spec §G9 prose ("After P6-D: extended allow-list ALSO includes `crates/relay-clients/`"). New hits live only in the following **categories** (no count claim — exact `KillSwitch`-symbol hit count is closeout-owned and verified at P6-D close, not in this plan): (a) one `KillSwitch` field on each adapter struct; (b) the `kill_switch: KillSwitch` ctor parameter on each adapter ctor; (c) the `self.kill_switch.is_active()` guard inside each `submit_bundle` body; (d) the `use ...::KillSwitch` import at the top of each adapter `.rs`; (e) the new D-T-D1..D-T-D4 test bodies (v0.3 lean matrix); (f) the mechanical `KillSwitch::new(false)` arg added to each carry-forward ctor call site enumerated in the §D-D2 inventory. All hits must land under the post-P6-D allow-list (`crates/bundle-relay/`, `crates/app/`, `crates/relay-clients/`); zero hits outside the allow-list. |
 | G10 | **DOCUMENTED → ENFORCED** | each `impl BundleRelay for ... { fn submit_bundle }` body's FIRST non-trivia statement matches `if self.kill_switch.is_active() { return Err(BundleRelayError::KillSwitchActive); }`. Manual inspection per the spec §G10 grep. |
 | G11 | unchanged (1 site) | single `sign_tx` production call site at `crates/execution/src/lib.rs:238`; P6-D does not touch `crates/execution/`. |
 
-Workspace tests at P6-D close: **243 passed + 1 ignored**.
+Workspace tests at P6-D close: **239 passed + 1 ignored** (v0.3 lean matrix).
 
 ## Forbidden in P6-D
 
@@ -235,22 +242,33 @@ Workspace tests at P6-D close: **243 passed + 1 ignored**.
 - [ ] **Step 3: Green — D-T-D1.** (a) Add `KillSwitch` field + import to `FlashbotsRelay` struct. (b) Update `FlashbotsRelay::new` signature to take `kill_switch: KillSwitch`. (c) Add the two-line guard at the top of `FlashbotsRelay::submit_bundle`. (d) Mechanically update every existing `FlashbotsRelay::new(cfg)` callsite inside `crates/relay-clients/` to `FlashbotsRelay::new(cfg, KillSwitch::new(false))` (callsites enumerated in §D-D2). (e) `cargo test -p rust-lmax-mev-relay-clients --test submit_disabled` — D-T-D1 green; existing tests still green.
 - [ ] **Step 3a: `crates/app/src/lib.rs` threading (§D-D2a).** (a) Update `build_relay_sim_from_config` signature to take `kill_switch: KillSwitch`. (b) Move `let kill_switch = KillSwitch::new(config.relay.execution_disabled);` from line ~890 to BEFORE the `build_relay_sim_from_config` call at line ~844. (c) Update the call site at `:844` to pass `kill_switch.clone()`. (d) Inside `build_relay_sim_from_config`, pass `kill_switch` into `FlashbotsRelay::new` (line 1523) and `BloxrouteRelay::new` (line 1531) — `kill_switch.clone()` on the first arm if both arms need an instance after the move, otherwise move once. (e) Confirm `cargo build -p rust-lmax-mev-app` compiles; confirm `cargo test -p rust-lmax-mev-app` still green (existing app-side tests preserved). G3 + G4 verification at Step 10.
 - [ ] **Step 4: Red → green — D-T-D2.** Mirror for `BloxrouteRelay` (struct field + ctor sig + guard + callsite updates + D-T-D2 in `submit_disabled.rs`).
-- [ ] **Step 5: Red → green — D-T-D3 / D-T-D4.** Add the shared-state tests (clone + flip + observe).
-- [ ] **Step 6: Red → green — D-T-D5 / D-T-D6.** Add the inactive-baseline tests to each adapter's `#[cfg(test)]` mod.
-- [ ] **Step 7: Red → green — D-T-D7 / D-T-D8.** Add the no-IO-under-kill-switch tests (wiremock zero-request assertion).
+- [ ] **Step 5: Red → green — D-T-D3 (shared-state, Flashbots only).** Add the clone + flip + observe test on `FlashbotsRelay`.
+- [ ] **Step 6: Red → green — D-T-D4 (inactive-baseline, bloXroute only).** Add the test inside `crates/relay-clients/src/bloxroute.rs` `#[cfg(test)]` mod.
+- [ ] **Step 7 (v0.3): Deleted.** v0.2 D-T-D5/D-T-D6 (per-adapter inactive-baseline duplicates) consolidated — Flashbots inactive-baseline is covered by D-T-D3 Phase 1 + carry-forward `rc_f_4_*`; bloXroute inactive-baseline is covered by D-T-D4 + carry-forward `rc_b_4_*`. v0.2 D-T-D7/D-T-D8 (no-HTTP-I/O) DROPPED per user override + §Status item (B). G10 is the static authority for "no pre-guard work".
 - [ ] **Step 8: G10 manual inspection.** Run `rg -n --type rust -B 1 -A 5 'fn submit_bundle' crates/relay-clients/src/`; verify both adapter `submit_bundle` bodies' first non-trivia statement is `if self.kill_switch.is_active() { return Err(BundleRelayError::KillSwitchActive); }`. No comments / `let` bindings / `tracing::*` calls precede.
 - [ ] **Step 9: G9 inspection.** Run `rg -n --type rust 'KillSwitch' crates/`; verify new hits land only under `crates/bundle-relay/`, `crates/app/`, AND `crates/relay-clients/` (the post-P6-D extended allow-list per boundary-spec §G9). No hits under `crates/execution/`, `crates/signer/`, `crates/relay-sim/`, `crates/state-fetcher/`, etc.
-- [ ] **Step 10: Full gate set.** Workspace `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (expect **243 passed + 1 ignored**), `cargo deny check`, `cargo tree -d`, and all G1..G11 ripgrep gates from §"Gates at P6-D close".
+- [ ] **Step 10: Full gate set.** Workspace `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (expect **239 passed + 1 ignored**), `cargo deny check`, `cargo tree -d`, and all G1..G11 ripgrep gates from §"Gates at P6-D close".
 - [ ] **Step 11: Commit + push.** Single routine `feat(p6-d)` commit. Suggested message: `feat(p6-d): per-adapter kill-switch wiring (G10 enforcement) on Flashbots + bloXroute adapters`.
 - [ ] **Step 12: Update `.coordination/claude_outbox.md`** with the P6-D closeout report; emit P6-E pre-impl plan draft.
 
 ## Risks + open questions
 
 - **Q-D1 — Ctor signature: breaking `::new(cfg, kill_switch)` vs additive `with_kill_switch(cfg, ks)` keeping `::new(cfg)` as default-inactive shim.** v0.2 **recommends BREAKING** (`::new(cfg, kill_switch)`): matches the boundary-spec §2.3 wording literally ("Adapters take `KillSwitch` ... directly in their ctors") and is the only option that actually wires the operator-flippable `AppHandle4::kill_switch()` to production adapters — additive `with_kill_switch` keeps `crates/app/src/lib.rs::build_relay_sim_from_config` on the default-inactive `::new(cfg)` path, disconnecting production adapters from the operator surface and defeating the purpose of P6-D. Blast radius is **19 ctor call sites total** = 17 inside `crates/relay-clients/` + 2 inside `crates/app/src/lib.rs`; the latter is covered in scope per §D-D2a with G3 + G4 preservation explicitly analyzed. Codex verdict?
-- **Q-D2 — Should existing `submit_disabled_1_flashbots` / `submit_disabled_2_bloxroute` be split into two assertions (KS-inactive → `SubmitDisabled` AND KS-active → `KillSwitchActive`)?** v0.1 recommends **NO** — keep `submit_disabled_1/2` semantics narrow (the original P4-E invariant they encode is "regardless of input, ctor-default returns `SubmitDisabled`"), and add `submit_disabled_3..8` as the new PRECEDENCE + shared-state + no-IO assertions. This preserves the original tests' historical meaning and prevents test-name semantic drift. Codex verdict?
-- **Q-D3 — Should a `crates/app/`-side integration test be added that constructs adapters via `AppHandle4::kill_switch()` and proves the operator can flip the switch from outside?** v0.1 recommends **NO**. Such a test would require either (a) a `submit_bundle` caller in `crates/app/src/` (breaks G3) or (b) an `Arc<dyn BundleRelay>` field in `AppHandle4` (breaks G4). Both are explicitly forbidden in Phase 6a. The shared-state property is already proven by D-T-D3 / D-T-D4 at the adapter level; the `AppHandle4` ↔ adapter wiring lands in Phase 6b when production submission unlocks. Codex verdict?
+- **Q-D2 — Should existing `submit_disabled_1_flashbots` / `submit_disabled_2_bloxroute` be split into two assertions (KS-inactive → `SubmitDisabled` AND KS-active → `KillSwitchActive`)?** v0.1 → v0.3 LOCKED: **NO** — keep `submit_disabled_1/2` semantics narrow (the original P4-E invariant they encode is "regardless of input, ctor-default returns `SubmitDisabled`"). v0.3 adds `submit_disabled_3..5` as the new PRECEDENCE + shared-state assertions (3 new tests in that file); the bloXroute inactive-baseline goes to the `crates/relay-clients/src/bloxroute.rs` `#[cfg(test)]` mod as D-T-D4 instead of a fourth `submit_disabled_*` test, keeping the integration file focused on cross-adapter PRECEDENCE + shared-state. No no-IO assertions in v0.3 (D-T-D7/D-T-D8 dropped per §Q-D5). This preserves the original tests' historical meaning and prevents test-name semantic drift. Codex verdict?
+- **Q-D3 — Should a `crates/app/`-side integration test be added that constructs adapters via `AppHandle4::kill_switch()` and proves the operator can flip the switch from outside?** v0.1 → v0.3 LOCKED: **NO**. Such a test would require either (a) a `submit_bundle` caller in `crates/app/src/` (breaks G3) or (b) an `Arc<dyn BundleRelay>` field in `AppHandle4` (breaks G4). Both are explicitly forbidden in Phase 6a. The shared-state property is proven by **D-T-D3 alone** at the adapter level (Flashbots clone + flip + observe), generalized to bloXroute via the identical guard idiom + KS-1/KS-2 baseline `KillSwitch::clone()` semantics. The `AppHandle4` ↔ adapter wiring lands in Phase 6b when production submission unlocks. Codex verdict?
 - **Q-D4 — Should the `Debug` impl emit `kill_switch: <active|inactive>`?** v0.1 recommends **NO**. The `Debug` impl is the DP-E11 secret-redaction surface and should remain conservative. Operators read `kill_switch.is_active()` directly via the `AppHandle4` surface, not via adapter `Debug`. Adding the state to `Debug` would invite tracing of it, which has no current consumer. Codex verdict?
-- **Q-D5 — Is the test count 8 right-sized, or should D-T-D7 / D-T-D8 (no-HTTP-I/O under active kill switch) be collapsed?** v0.2 recommends **keep all 8**. D-T-D7 / D-T-D8 are NOT a `tracing::*` guard (that role belongs to G10 manual inspection at Step 8) — they are **no-HTTP-I/O regression guards** that future-proof against a P6+ refactor adding real HTTP-issuing code to `submit_bundle` (e.g., the Phase 6b actual-submission path) accidentally bypassing the kill-switch guard. Cost is 2 tests + wiremock baseline already imported via P6-C; runtime evidence is complementary to G10's static enforcement. Codex verdict?
+- **Q-D5 — Test matrix size: 8 (v0.2) vs lean 4 (v0.3) vs other shape?** **v0.3 RECOMMENDS LEAN 4** per user override:
+  1. `submit_disabled_3_flashbots_kill_switch_active_takes_precedence` — Flashbots PRECEDENCE proof.
+  2. `submit_disabled_4_bloxroute_kill_switch_active_takes_precedence` — bloXroute PRECEDENCE proof.
+  3. `submit_disabled_5_flashbots_shared_kill_switch_flip_visible` — Flashbots shared-state (also covers Flashbots inactive-baseline Phase 1).
+  4. `bloxroute_kill_switch_inactive_baseline_returns_submit_disabled` — bloXroute inactive-baseline (in `#[cfg(test)]` mod).
+
+  **Dropped** vs v0.2:
+  - D-T-D7 + D-T-D8 (no-HTTP-I/O wiremock zero-request) — at HEAD `submit_bundle` performs no HTTP I/O at all, so these tests add runtime cost without distinguishing "guard ran first" from "guard never ran". G10 manual inspection at Step 8 is the authoritative static enforcement of "FIRST non-trivia statement / no pre-guard work". The no-HTTP-I/O regression guard belongs to the future Phase 6+ PR that introduces real HTTP-issuing code to `submit_bundle`, scoped to that PR's new behavior.
+  - D-T-D4 v0.2 (bloXroute shared-state) — redundant with D-T-D3 Flashbots shared-state given (a) identical guard idiom across both adapters (G10) and (b) `KillSwitch::clone()` semantics already proven by KS-1/KS-2 in `crates/bundle-relay/src/lib.rs` `#[cfg(test)]`.
+  - D-T-D5 v0.2 (Flashbots inactive-baseline standalone) — Phase 1 of D-T-D3 already covers it; plus carry-forward `rc_f_4_*` continues to enforce on the existing path.
+
+  **G10 manual inspection at Step 8 remains the main enforcement** for the "first non-trivia statement / no pre-guard work" rule. Workspace test total at P6-D close: **243 → 239 passed + 1 ignored**. Codex verdict?
 
 ## Process
 
