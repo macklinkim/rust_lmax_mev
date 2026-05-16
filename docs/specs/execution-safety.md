@@ -35,6 +35,8 @@ Gas estimate uncertainty = abort.
 
 A funded private key or production signer is banned from use in any capacity until the Phase 6b Production Gate is formally passed. Violation is a critical safety failure.
 
+The Phase 6b unlock contract -- five hard requirements a production signer impl must satisfy -- is documented at `docs/specs/production-signer.md`.
+
 ## Gas Bidding Strategy
 
 Conservative fixed gas bidding only, through Phase 4. Dynamic gas strategies and ML-based bidding are deferred to Phase 5 and later.
