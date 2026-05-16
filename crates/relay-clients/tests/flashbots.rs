@@ -120,3 +120,69 @@ async fn rc_f_5_empty_txs_short_circuits_before_network_io() {
         "RC-F-5: empty-txs path must NOT issue any HTTP request"
     );
 }
+
+// P6-C D-C1: synthetic wire-format placeholder bytes — NOT a valid
+// RLP-encoded signed transaction; NO key material implied; the only
+// purpose of these bytes is to exercise the hex-encoding path inside
+// `crates/relay-clients/src/call_bundle.rs`.
+const FIXTURE_PLACEHOLDER_BYTES: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xF0, 0x0D];
+const FIXTURE_PLACEHOLDER_HEX: &str = "0xdeadbeefcafef00d";
+
+/// RC-F-6 (P6-C D-T-C1): asserts the JSON-RPC body the FlashbotsRelay
+/// POSTs to the relay matches the expected `eth_callBundle` envelope
+/// exactly when fed synthetic placeholder bytes. Strategy: permissive
+/// happy-path mock (no body matcher) + `received_requests()` + exact
+/// `serde_json::Value` equality. Exact equality enforces both presence
+/// of every expected key AND absence of any extra key — any future
+/// addition of `coinbase` / `gas_price` / `tx_index` in the adapter
+/// will fail this test until the expected envelope is updated.
+#[tokio::test]
+async fn rc_f_6_call_bundle_body_shape_matches_with_placeholder_bytes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "result": {
+                "totalGasUsed": 1u64,
+                "coinbaseDiff": "0",
+                "ethSentToCoinbase": "0",
+                "stateBlockNumber": 22_000_000u64,
+                "results": [{}]
+            }
+        })))
+        .mount(&server)
+        .await;
+    let relay = relay_pointing_at(&server.uri());
+    let req = RelaySimRequest {
+        block_hash: B256::from([0u8; 32]),
+        state_block_number: 22_000_000u64, // 0x14fb180
+        txs: vec![FIXTURE_PLACEHOLDER_BYTES.to_vec()],
+    };
+    relay
+        .simulate_bundle(req)
+        .await
+        .expect("happy path must succeed");
+    let received = server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    assert_eq!(received.len(), 1, "exactly one POST expected");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&received[0].body).expect("body is valid JSON");
+    let expected = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_callBundle",
+        "params": [{
+            "txs": [FIXTURE_PLACEHOLDER_HEX],
+            "blockNumber": "0x14fb180",
+            "stateBlockNumber": "0x14fb180"
+        }]
+    });
+    assert_eq!(
+        parsed, expected,
+        "request body must match expected JSON-RPC envelope exactly"
+    );
+}
