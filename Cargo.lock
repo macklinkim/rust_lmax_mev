@@ -3627,6 +3627,7 @@ dependencies = [
  "rust-lmax-mev-relay-clients",
  "rust-lmax-mev-relay-sim",
  "rust-lmax-mev-risk",
+ "rust-lmax-mev-signer",
  "rust-lmax-mev-simulator",
  "rust-lmax-mev-state",
  "rust-lmax-mev-state-fetcher",
@@ -3681,12 +3682,14 @@ dependencies = [
  "rkyv",
  "rust-lmax-mev-opportunity",
  "rust-lmax-mev-risk",
+ "rust-lmax-mev-signer",
  "rust-lmax-mev-simulator",
  "rust-lmax-mev-state",
  "rust-lmax-mev-types",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

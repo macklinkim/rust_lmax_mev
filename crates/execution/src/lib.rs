@@ -23,6 +23,9 @@ pub use bid_strategy::{
 use std::sync::Arc;
 
 use alloy_primitives::{Address, U256};
+#[cfg(test)]
+use rust_lmax_mev_signer::{BundleTx, SignedTxBytes, SignerError};
+use rust_lmax_mev_signer::{DisabledSigner, Signer};
 use rust_lmax_mev_simulator::{ProfitSource, SimStatus, SimulationOutcome};
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +130,16 @@ pub struct BundleCandidate {
 pub struct BundleConstructor {
     cfg: BundleConfig,
     strategy: BidStrategyRef,
+    /// Phase 6 P6-B (D-B2): signer injection. Stored but NOT invoked
+    /// from `construct(...)` / `construct_with_context(...)` in Phase 6a;
+    /// the production runtime path stays byte-identical to P3-F. Reachable
+    /// only via the `#[cfg(test)] pub(crate) async fn invoke_signer_for_test`
+    /// accessor. Phase 6b lands the runtime invocation alongside the relay
+    /// submission path. See `docs/specs/phase-6a-boundary.md` §2.2 + §3.
+    /// `dead_code` allowed because in non-test builds the field is intentionally
+    /// stored-but-not-read until Phase 6b.
+    #[allow(dead_code)]
+    signer: Arc<dyn Signer>,
 }
 
 impl BundleConstructor {
@@ -134,8 +147,12 @@ impl BundleConstructor {
     /// engine using the default `FixedFractionBidStrategy` per
     /// `cfg.fixed_bid_fraction_bps`. `Err(ExecutionError::Setup)`
     /// for `validity_block_window == 0` or
-    /// `fixed_bid_fraction_bps > 10_000`. P3-F byte-identical
-    /// behavior preserved (BS-4 regression-guards this).
+    /// `fixed_bid_fraction_bps > 10_000`. Public signature and
+    /// observable behavior preserved from P3-F (BS-4 regression-guards
+    /// this); P6-B (Q-B1 (b)) default-constructs `Arc::new(DisabledSigner)`
+    /// for the new private `signer` field so this ctor is NOT literally
+    /// byte-identical at the body level — but it preserves every observable
+    /// property the prior tests assert.
     pub fn new(cfg: BundleConfig) -> Result<Self, ExecutionError> {
         if cfg.validity_block_window == 0 {
             return Err(ExecutionError::Setup(
@@ -147,13 +164,20 @@ impl BundleConstructor {
         // returned.
         let strategy: BidStrategyRef =
             Arc::new(FixedFractionBidStrategy::new(cfg.fixed_bid_fraction_bps)?);
-        Ok(Self { cfg, strategy })
+        let signer: Arc<dyn Signer> = Arc::new(DisabledSigner);
+        Ok(Self {
+            cfg,
+            strategy,
+            signer,
+        })
     }
 
     /// Phase 5 P5-B (DP-B5): explicit-strategy constructor. The
     /// strategy is responsible for its own validation; this ctor
     /// validates only `cfg.validity_block_window`. Existing tests
-    /// using `BundleConstructor::new(cfg)` are unaffected.
+    /// using `BundleConstructor::new(cfg)` are unaffected. P6-B
+    /// default-constructs `Arc::new(DisabledSigner)` for the new
+    /// private `signer` field (Q-B1 (b)).
     pub fn with_strategy(
         cfg: BundleConfig,
         strategy: BidStrategyRef,
@@ -163,7 +187,55 @@ impl BundleConstructor {
                 "validity_block_window must be non-zero".to_string(),
             ));
         }
-        Ok(Self { cfg, strategy })
+        let signer: Arc<dyn Signer> = Arc::new(DisabledSigner);
+        Ok(Self {
+            cfg,
+            strategy,
+            signer,
+        })
+    }
+
+    /// Phase 6 P6-B (D-B2): explicit-signer constructor. The signer
+    /// is stored in `self.signer` and reachable from the private
+    /// signing-request hook (test-only in Phase 6a). In Phase 6a
+    /// the only impl that should be passed is
+    /// [`rust_lmax_mev_signer::DisabledSigner`]; Phase 6b unlocks
+    /// production signer impls. See `docs/specs/phase-6a-boundary.md`
+    /// §2.2 + §3 PRECEDENCE rule.
+    ///
+    /// Validates `cfg.validity_block_window != 0` (parity with `new`
+    /// and `with_strategy`); strategy validates itself.
+    pub fn with_signer(
+        cfg: BundleConfig,
+        strategy: BidStrategyRef,
+        signer: Arc<dyn Signer>,
+    ) -> Result<Self, ExecutionError> {
+        if cfg.validity_block_window == 0 {
+            return Err(ExecutionError::Setup(
+                "validity_block_window must be non-zero".to_string(),
+            ));
+        }
+        Ok(Self {
+            cfg,
+            strategy,
+            signer,
+        })
+    }
+
+    /// Phase 6 P6-B (D-B2): the `BundleConstructor`-private async
+    /// signing-request hook. Inherent async method (NOT a trait
+    /// method, so no `async-trait` dev-dep). Reachable only from
+    /// inline `#[cfg(test)] mod tests` within this crate (Q-B4 (a));
+    /// production `construct(...)` / `construct_with_context(...)`
+    /// do NOT invoke this hook in Phase 6a — runtime byte-identity
+    /// at the call sites is preserved. Phase 6b lands the runtime
+    /// invocation alongside the relay submission path.
+    #[cfg(test)]
+    pub(crate) async fn invoke_signer_for_test(
+        &self,
+        tx: &BundleTx,
+    ) -> Result<SignedTxBytes, SignerError> {
+        self.signer.sign_tx(tx).await
     }
 
     pub fn cfg(&self) -> &BundleConfig {
@@ -291,5 +363,55 @@ mod construct_tests {
             "cap < fixed-fraction bid"
         );
         assert_eq!(ctor.strategy_name(), "eip1559_basefee_aware");
+    }
+
+    /// P6-B D-T1: `BundleConstructor::with_signer(cfg, strategy,
+    /// Arc::new(DisabledSigner))` constructs successfully, and the
+    /// `#[cfg(test)] pub(crate) async fn invoke_signer_for_test`
+    /// hook routes through `&dyn Signer` and returns
+    /// `Err(SignerError::SignerDisabled)` for a representative
+    /// `BundleTx`. Positive constructor-level signer-injection
+    /// assertion (the assurance that subsequent batches build on).
+    #[tokio::test]
+    async fn dt_1_with_signer_routes_disabled_signer_through_hook() {
+        let cfg = BundleConfig::defaults();
+        let strategy: BidStrategyRef =
+            Arc::new(FixedFractionBidStrategy::new(cfg.fixed_bid_fraction_bps).expect("strategy"));
+        let signer: Arc<dyn Signer> = Arc::new(DisabledSigner);
+        let ctor = BundleConstructor::with_signer(cfg, strategy, signer).expect("ctor ok");
+        let tx = BundleTx::new(
+            Address::ZERO,
+            Address::ZERO,
+            U256::ZERO,
+            Vec::new(),
+            21_000,
+            0,
+            1,
+            0,
+        );
+        let result = ctor.invoke_signer_for_test(&tx).await;
+        assert_eq!(result, Err(SignerError::SignerDisabled));
+    }
+
+    /// P6-B D-T2: `BundleConstructor::with_signer` returns
+    /// `Err(ExecutionError::Setup)` for `validity_block_window == 0`
+    /// (parity with `new` and `with_strategy`).
+    #[test]
+    fn dt_2_with_signer_rejects_zero_validity_window() {
+        let mut cfg = BundleConfig::defaults();
+        cfg.validity_block_window = 0;
+        let strategy: BidStrategyRef =
+            Arc::new(FixedFractionBidStrategy::new(cfg.fixed_bid_fraction_bps).expect("strategy"));
+        let signer: Arc<dyn Signer> = Arc::new(DisabledSigner);
+        let err = BundleConstructor::with_signer(cfg, strategy, signer)
+            .err()
+            .expect("expected Err(Setup)");
+        match err {
+            ExecutionError::Setup(msg) => assert!(
+                msg.contains("validity_block_window"),
+                "Setup message mentions validity_block_window: {msg}"
+            ),
+            other => panic!("expected Err(Setup), got {other:?}"),
+        }
     }
 }

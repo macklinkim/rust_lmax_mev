@@ -28,6 +28,8 @@ rust-lmax-mev-bundle-relay = { path = "../bundle-relay" }
 rust-lmax-mev-relay-clients = { path = "../relay-clients" }
 # Phase 5 P5-A: ArchiveStateFetcher construction in wire_phase4.
 rust-lmax-mev-state-fetcher = { path = "../state-fetcher" }
+# Phase 6 P6-B: Signer boundary; only DisabledSigner reachable in Phase 6a.
+rust-lmax-mev-signer = { path = "../signer" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

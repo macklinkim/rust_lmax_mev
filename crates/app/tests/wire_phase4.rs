@@ -11,6 +11,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, Bytes, B256, U256};
@@ -19,18 +20,33 @@ use rust_lmax_mev_app::{
 };
 use rust_lmax_mev_ingress::{IngressEvent, MempoolEvent};
 use rust_lmax_mev_journal::FileJournal;
+// P6-B (D-T3 / D-B4 Site T): `crates/app/tests/wire_phase4.rs` is the third
+// G2c allow-list entry; the test directly constructs the disabled signer
+// for the new `wire_phase4(config, opts, signer)` signature. See
+// `docs/specs/phase-6a-boundary.md` §2.2.
+use rust_lmax_mev_signer::{DisabledSigner, Signer};
 use rust_lmax_mev_types::{ChainContext, EventEnvelope, EventSource, PublishMeta};
 use tokio::sync::broadcast;
 
 /// W-1 deterministic shutdown: bogus geth_http_url → Err(Node|Io)
 /// within 5s. NodeProvider::connect parses URL synchronously so this
 /// never touches the network.
+///
+/// P6-B (D-T3): also exercises the new `wire_phase4(config, opts, signer)`
+/// signature by passing `Arc::new(DisabledSigner)`. The test proves that
+/// adding the signer parameter did NOT regress the existing fail-closed
+/// bogus-URL behavior. Positive signer-injection coverage is provided by
+/// `crates/execution` D-T1 (`BundleConstructor::with_signer` + hook) +
+/// manual code review of the single `BundleConstructor::with_signer`
+/// call site in `wire_phase4` + G11 grep gate. See
+/// `docs/specs/phase-6a-boundary.md` §2.2.
 #[tokio::test(flavor = "multi_thread")]
 async fn wire_phase4_returns_error_for_bogus_geth_url() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = common::make_config(dir.path());
     config.node.geth_http_url = "not-a-url".to_string();
 
+    let signer: Arc<dyn Signer> = Arc::new(DisabledSigner);
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         wire_phase4(
@@ -38,6 +54,7 @@ async fn wire_phase4_returns_error_for_bogus_geth_url() {
             WireOptions {
                 init_observability: false,
             },
+            signer,
         ),
     )
     .await

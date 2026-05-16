@@ -25,6 +25,9 @@ use rust_lmax_mev_journal::{FileJournal, JournalError, RocksDbSnapshot};
 use rust_lmax_mev_node::{NodeError, NodeProvider};
 use rust_lmax_mev_opportunity::OpportunityEngine;
 use rust_lmax_mev_risk::RiskGate;
+// P6-B (D-B3): Signer boundary; only DisabledSigner reachable in Phase 6a.
+// See `docs/specs/phase-6a-boundary.md` §2.2.
+use rust_lmax_mev_signer::{DisabledSigner, Signer};
 use rust_lmax_mev_simulator::LocalSimulator;
 use rust_lmax_mev_state::{PoolId, StateEngine, StateError};
 use rust_lmax_mev_types::SmokeTestPayload;
@@ -173,7 +176,13 @@ pub fn run(config_path: impl AsRef<Path>) -> Result<(), AppError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let handle = runtime.block_on(wire_phase4(&config, WireOptions::default()))?;
+    // P6-B (D-B3): construct the disabled signer at the binary boundary
+    // and pass it as `Arc<dyn Signer>`. In Phase 6a, `DisabledSigner` is
+    // the only reachable impl; every signing call returns
+    // `Err(SignerError::SignerDisabled)`. Phase 6b lands the real signer.
+    // See `docs/specs/phase-6a-boundary.md` §2.2.
+    let signer: Arc<dyn Signer> = Arc::new(DisabledSigner);
+    let handle = runtime.block_on(wire_phase4(&config, WireOptions::default(), signer))?;
     runtime.block_on(async { tokio::signal::ctrl_c().await })?;
     runtime.block_on(handle.shutdown())?;
     drop(runtime);
@@ -740,7 +749,11 @@ impl AppHandle4 {
 }
 
 /// Phase 3 P3-F async constructor. Wires the full pipeline.
-pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle4, AppError> {
+pub async fn wire_phase4(
+    config: &Config,
+    opts: WireOptions,
+    signer: Arc<dyn Signer>,
+) -> Result<AppHandle4, AppError> {
     if opts.init_observability {
         let _obs = rust_lmax_mev_observability::init(&config.observability)?;
     }
@@ -789,8 +802,20 @@ pub async fn wire_phase4(config: &Config, opts: WireOptions) -> Result<AppHandle
         } else {
             None
         };
+    // P6-B (D-B3): thread the injected `Arc<dyn Signer>` into
+    // `BundleConstructor::with_signer`. In Phase 6a the only impl
+    // is `DisabledSigner`; the production runtime path does NOT invoke
+    // the signer (test-only hook reachability per the boundary spec).
+    // Default strategy is `FixedFractionBidStrategy::new(cfg.fixed_bid_fraction_bps)`
+    // via `with_strategy` parity — observable behavior matches P3-F (BS-4).
+    // See `docs/specs/phase-6a-boundary.md` §2.2 + §3.
+    let bundle_cfg = rust_lmax_mev_execution::BundleConfig::defaults();
+    let bundle_strategy: rust_lmax_mev_execution::BidStrategyRef = Arc::new(
+        rust_lmax_mev_execution::FixedFractionBidStrategy::new(bundle_cfg.fixed_bid_fraction_bps)
+            .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?,
+    );
     let bundle_constructor = Arc::new(
-        BundleConstructor::new(rust_lmax_mev_execution::BundleConfig::defaults())
+        BundleConstructor::with_signer(bundle_cfg, bundle_strategy, Arc::clone(&signer))
             .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?,
     );
 

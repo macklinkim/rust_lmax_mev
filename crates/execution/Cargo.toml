@@ -12,6 +12,7 @@ rust-lmax-mev-state = { path = "../state" }
 rust-lmax-mev-opportunity = { path = "../opportunity" }
 rust-lmax-mev-risk = { path = "../risk" }
 rust-lmax-mev-simulator = { path = "../simulator" }
+rust-lmax-mev-signer = { path = "../signer" }
 alloy-primitives = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 rkyv = { workspace = true }
@@ -20,3 +21,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true }
