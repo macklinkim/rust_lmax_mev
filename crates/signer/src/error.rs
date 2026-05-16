@@ -14,4 +14,12 @@
 pub enum SignerError {
     #[error("signer disabled — production signing requires Phase 6b Production Gate")]
     SignerDisabled,
+    /// P6B-B D-B5: signer is structurally configured (via the
+    /// `KeyBackend::HsmKms` config path) but operationally not yet
+    /// wired to a live HSM/KMS connection. P6B-C wires the HSM/KMS
+    /// SDK + signing-call and switches this return to
+    /// `Ok(SignedTxBytes)` under proper config. Display contains
+    /// no key material per `production-signer.md` Section 2.3(b).
+    #[error("signer not configured")]
+    NotConfigured,
 }

@@ -78,10 +78,16 @@ pub fn make_config(tempdir: &std::path::Path) -> Config {
         },
         // Phase 4 P4-E (DP-E3): empty enabled_relays default →
         // comparator_driver inert in tests that don't program a mock.
+        // P6B-B (D-B4): RelayConfig::default() now also initializes
+        // key_backend = Disabled + audit_key_id = "" (additive).
         relay: RelayConfig::default(),
         // Phase 5 P5-A: prefetch_enabled = false (default); existing
         // app integration tests stay on the no-prefetch path.
         simulator: SimulatorConfig::default(),
+        // P6B-B (D-B4): default profile = Dev (the fail-closed posture).
+        // Tests that exercise the Production-profile path set this
+        // explicitly; existing tests inherit Dev unchanged.
+        active_profile: rust_lmax_mev_config::Profile::Dev,
     }
 }
 

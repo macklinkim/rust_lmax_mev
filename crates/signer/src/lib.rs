@@ -18,11 +18,13 @@
 mod bundle_tx;
 mod disabled;
 mod error;
+pub mod production;
 mod signer_trait;
 
 pub use bundle_tx::{BundleTx, SignedTxBytes};
 pub use disabled::DisabledSigner;
 pub use error::SignerError;
+pub use production::ProductionSigner;
 pub use signer_trait::Signer;
 
 #[cfg(test)]

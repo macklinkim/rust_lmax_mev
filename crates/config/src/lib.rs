@@ -25,6 +25,41 @@ use serde::{Deserialize, Serialize};
 const ENV_PREFIX: &str = "RUST_LMAX_MEV";
 const ENV_SEPARATOR: &str = "__";
 
+/// P6B-B D-B4: Engine profile selector. The active profile
+/// constrains which `KeyBackend` (see below) is permissible per
+/// `Config::validate()`. `Profile::Production` is the only profile
+/// that permits `KeyBackend::HsmKms`; dev/test/shadow profiles
+/// continue to reject `HsmKms` unconditionally. Default
+/// `Profile::Dev` is the fail-closed posture for any config that
+/// omits `active_profile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    /// Default. Fail-closed posture; rejects `KeyBackend::HsmKms`.
+    #[default]
+    Dev,
+    Test,
+    Shadow,
+    Production,
+}
+
+/// P6B-B D-B4: Selects which signer construction the
+/// `crates/app/src/lib.rs::run` boot fn instantiates. `Disabled`
+/// constructs the Phase 6a disabled-signer baseline; `HsmKms`
+/// constructs the P6B-B production stub (which itself returns
+/// `NotConfigured` until P6B-C wires the HSM/KMS SDK + signing-call).
+/// Bidirectional config-validation rejects guard against mismatched
+/// (Profile, KeyBackend) pairs. Default `Disabled` is the fail-closed
+/// posture. (See `crates/signer/` for the concrete types referenced.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyBackend {
+    /// Default. Constructs the disabled-signer baseline at the app boot site.
+    #[default]
+    Disabled,
+    HsmKms,
+}
+
 /// Top-level engine configuration.
 ///
 /// Layered loading: a single TOML file, then environment-variable overlay
@@ -51,6 +86,13 @@ pub struct Config {
     /// (operator opt-in to incur live archive RPC cost).
     #[serde(default)]
     pub simulator: SimulatorConfig,
+    /// P6B-B D-B4: active engine profile. Constrains which
+    /// `relay.key_backend` is permissible per `Config::validate()`.
+    /// Default `Profile::Dev` via `#[serde(default)]` -- omitting
+    /// `active_profile` from a TOML config yields `Dev`, which is
+    /// the fail-closed posture (rejects `key_backend=HsmKms`).
+    #[serde(default)]
+    pub active_profile: Profile,
 }
 
 /// Node topology section per ADR-007. Primary Geth WS + HTTP plus at least
@@ -285,6 +327,19 @@ pub struct RelayConfig {
     /// (no-op in P4-E since no submission exists). Phase 5+ checks
     /// before any submit.
     pub execution_disabled: bool,
+    /// P6B-B D-B4: signer backend selector. `Disabled` (default)
+    /// constructs the Phase 6a disabled-signer baseline; `HsmKms`
+    /// constructs the P6B-B production stub. Bidirectional validation
+    /// rejects guard the pairing with `Config.active_profile`. (See
+    /// `crates/signer/` for the concrete types referenced.)
+    pub key_backend: KeyBackend,
+    /// P6B-B D-B4: audit-safe key identifier surfaced in the
+    /// production signer's structured audit log per
+    /// `docs/specs/production-signer.md` Section 2.4. Default
+    /// empty `""`. Empty is valid only for `key_backend=Disabled`;
+    /// `key_backend=HsmKms` requires a non-empty value per the
+    /// `HsmKmsRequiresNonEmptyAuditKeyId` validation rule.
+    pub audit_key_id: String,
 }
 
 impl Default for RelayConfig {
@@ -294,6 +349,8 @@ impl Default for RelayConfig {
             simulate_timeout_ms: 2_000,
             live_send: false,
             execution_disabled: false,
+            key_backend: KeyBackend::Disabled,
+            audit_key_id: String::new(),
         }
     }
 }
@@ -457,6 +514,29 @@ pub enum ConfigError {
     /// leak the archive endpoint URL).
     #[error("simulator.prefetch_enabled = true requires node.archive_rpc to be configured")]
     PrefetchRequiresArchiveRpc,
+
+    /// P6B-B D-B4 reject rule 1: `active_profile = Production`
+    /// requires `relay.key_backend = HsmKms`. Dev/test/shadow
+    /// profiles continue to require `key_backend = Disabled`
+    /// (rule 2). Payload-free; no key material in Display.
+    #[error("Production profile requires key_backend=HsmKms")]
+    ProductionProfileRequiresHsmKms,
+
+    /// P6B-B D-B4 reject rule 2: `relay.key_backend = HsmKms`
+    /// requires `active_profile = Production`. Dev/test/shadow
+    /// profiles continue to reject `HsmKms` unconditionally.
+    /// Payload-free; no key material in Display.
+    #[error("key_backend=HsmKms requires Production profile")]
+    HsmKmsRequiresProductionProfile,
+
+    /// P6B-B D-B4 reject rule 3: `relay.key_backend = HsmKms`
+    /// requires a non-empty `audit_key_id`. Empty / whitespace-only
+    /// audit identifier loses the audit-safe-identifier field of
+    /// the operator-visible signing audit log per
+    /// `docs/specs/production-signer.md` Section 2.4. Payload-free;
+    /// no key material in Display.
+    #[error("key_backend=HsmKms requires non-empty audit_key_id")]
+    HsmKmsRequiresNonEmptyAuditKeyId,
 }
 
 impl Config {
@@ -534,6 +614,23 @@ impl Config {
         // adapter is the second.
         if self.relay.live_send {
             return Err(ConfigError::LiveSendForbidden);
+        }
+        // P6B-B D-B4 reject rule 1: Production profile requires HSM/KMS signer.
+        if self.active_profile == Profile::Production
+            && self.relay.key_backend != KeyBackend::HsmKms
+        {
+            return Err(ConfigError::ProductionProfileRequiresHsmKms);
+        }
+        // P6B-B D-B4 reject rule 2: HSM/KMS signer requires Production profile.
+        if self.relay.key_backend == KeyBackend::HsmKms
+            && self.active_profile != Profile::Production
+        {
+            return Err(ConfigError::HsmKmsRequiresProductionProfile);
+        }
+        // P6B-B D-B4 reject rule 3: HSM/KMS signer requires non-empty audit_key_id.
+        if self.relay.key_backend == KeyBackend::HsmKms && self.relay.audit_key_id.trim().is_empty()
+        {
+            return Err(ConfigError::HsmKmsRequiresNonEmptyAuditKeyId);
         }
         // Phase 5 P5-A: cache capacity > 0 invariant (DP-A8).
         if self.simulator.prefetch_cache_capacity == 0 {
@@ -1071,5 +1168,103 @@ endpoint = ""
             .expect("CFG-A2 happy: prefetch_enabled=true with archive_rpc must parse");
         assert!(cfg.simulator.prefetch_enabled);
         assert!(cfg.node.archive_rpc.is_some());
+    }
+
+    // ----------------------------------------------------------------
+    // P6B-B D-T-B4 + D-T-B5: Profile + KeyBackend + audit_key_id
+    // bidirectional validation reject + serde defaults.
+    // ----------------------------------------------------------------
+
+    /// D-T-B4: config validation rejects ALL FIVE illegal combos of
+    /// `(active_profile, relay.key_backend, relay.audit_key_id)`:
+    ///   (Production, Disabled, _)        -> ProductionProfileRequiresHsmKms
+    ///   (Dev,        HsmKms,   _)        -> HsmKmsRequiresProductionProfile
+    ///   (Test,       HsmKms,   _)        -> HsmKmsRequiresProductionProfile
+    ///   (Shadow,     HsmKms,   _)        -> HsmKmsRequiresProductionProfile
+    ///   (Production, HsmKms,   "")       -> HsmKmsRequiresNonEmptyAuditKeyId
+    #[test]
+    fn config_validate_rejects_all_5_illegal_profile_keybackend_audit_combos() {
+        // Helper: build a complete TOML by prepending `active_profile` at the
+        // top (before any [section] header) + appending `[relay]` with the
+        // given key_backend + audit_key_id.
+        let make_toml = |profile: &str, key_backend: &str, audit_key_id: &str| -> String {
+            format!(
+                "active_profile = \"{profile}\"\n{}\n[relay]\nkey_backend = \"{key_backend}\"\naudit_key_id = \"{audit_key_id}\"\n",
+                valid_minimum_toml()
+            )
+        };
+
+        // Case 1: (Production, Disabled, "anything") -> ProductionProfileRequiresHsmKms.
+        let case_1 = make_toml("production", "disabled", "k1");
+        let err =
+            Config::from_toml_str(&case_1).expect_err("Case 1 must reject: Production + Disabled");
+        assert!(
+            matches!(err, ConfigError::ProductionProfileRequiresHsmKms),
+            "Case 1: expected ProductionProfileRequiresHsmKms; got {err:?}"
+        );
+
+        // Cases 2-4: (Dev/Test/Shadow, HsmKms, "k1") all reject with
+        // HsmKmsRequiresProductionProfile.
+        for profile in &["dev", "test", "shadow"] {
+            let case = make_toml(profile, "hsmkms", "k1");
+            let err = Config::from_toml_str(&case)
+                .expect_err(&format!("Case profile={profile} + HsmKms must reject"));
+            assert!(
+                matches!(err, ConfigError::HsmKmsRequiresProductionProfile),
+                "Case profile={profile}: expected HsmKmsRequiresProductionProfile; got {err:?}"
+            );
+        }
+
+        // Case 5: (Production, HsmKms, "") -> HsmKmsRequiresNonEmptyAuditKeyId.
+        let case_5 = make_toml("production", "hsmkms", "");
+        let err = Config::from_toml_str(&case_5)
+            .expect_err("Case 5: Production + HsmKms + empty audit_key_id must reject");
+        assert!(
+            matches!(err, ConfigError::HsmKmsRequiresNonEmptyAuditKeyId),
+            "Case 5: expected HsmKmsRequiresNonEmptyAuditKeyId; got {err:?}"
+        );
+
+        // Case 5b: whitespace-only audit_key_id also rejects.
+        let case_5b = make_toml("production", "hsmkms", "   ");
+        let err = Config::from_toml_str(&case_5b)
+            .expect_err("Case 5b: whitespace-only audit_key_id must reject");
+        assert!(matches!(err, ConfigError::HsmKmsRequiresNonEmptyAuditKeyId));
+
+        // Happy path: (Production, HsmKms, "k1") passes.
+        let happy = make_toml("production", "hsmkms", "k1");
+        let cfg = Config::from_toml_str(&happy)
+            .expect("Happy: Production + HsmKms + non-empty audit_key_id must parse");
+        assert_eq!(cfg.active_profile, Profile::Production);
+        assert_eq!(cfg.relay.key_backend, KeyBackend::HsmKms);
+        assert_eq!(cfg.relay.audit_key_id, "k1");
+    }
+
+    /// D-T-B5: serde defaults via `#[serde(default)]` + type-level
+    /// `Default` impls. Omitting `active_profile` yields `Dev`;
+    /// omitting `key_backend` yields `Disabled`; omitting
+    /// `audit_key_id` yields `""`. The `(Dev, Disabled, "")` default
+    /// triple passes validation.
+    #[test]
+    fn profile_and_key_backend_serde_defaults() {
+        let cfg = Config::from_toml_str(valid_minimum_toml())
+            .expect("minimum TOML must parse with serde defaults");
+        assert_eq!(
+            cfg.active_profile,
+            Profile::Dev,
+            "active_profile default must be Dev"
+        );
+        assert_eq!(
+            cfg.relay.key_backend,
+            KeyBackend::Disabled,
+            "relay.key_backend default must be Disabled"
+        );
+        assert_eq!(
+            cfg.relay.audit_key_id, "",
+            "relay.audit_key_id default must be empty"
+        );
+
+        // Compile-asserts Default impls return the expected variants.
+        assert_eq!(Profile::default(), Profile::Dev);
+        assert_eq!(KeyBackend::default(), KeyBackend::Disabled);
     }
 }

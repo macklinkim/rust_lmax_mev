@@ -26,8 +26,12 @@ use rust_lmax_mev_node::{NodeError, NodeProvider};
 use rust_lmax_mev_opportunity::OpportunityEngine;
 use rust_lmax_mev_risk::RiskGate;
 // P6-B (D-B3): Signer boundary; only DisabledSigner reachable in Phase 6a.
-// See `docs/specs/phase-6a-boundary.md` §2.2.
-use rust_lmax_mev_signer::{DisabledSigner, Signer};
+// P6B-B (D-B4): ProductionSigner stub added; reachable ONLY when
+// `Config::active_profile == Production && RelayConfig::key_backend == HsmKms`,
+// AND even then `sign_tx` returns `Err(SignerError::NotConfigured)` until
+// P6B-C wires the HSM/KMS SDK + signing-call.
+// See `docs/specs/phase-6a-boundary.md` §2.2 + `docs/specs/phase-6b-boundary.md` §2.
+use rust_lmax_mev_signer::{DisabledSigner, ProductionSigner, Signer};
 use rust_lmax_mev_simulator::LocalSimulator;
 use rust_lmax_mev_state::{PoolId, StateEngine, StateError};
 use rust_lmax_mev_types::SmokeTestPayload;
@@ -176,12 +180,24 @@ pub fn run(config_path: impl AsRef<Path>) -> Result<(), AppError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    // P6-B (D-B3): construct the disabled signer at the binary boundary
-    // and pass it as `Arc<dyn Signer>`. In Phase 6a, `DisabledSigner` is
-    // the only reachable impl; every signing call returns
-    // `Err(SignerError::SignerDisabled)`. Phase 6b lands the real signer.
-    // See `docs/specs/phase-6a-boundary.md` §2.2.
-    let signer: Arc<dyn Signer> = Arc::new(DisabledSigner);
+    // P6-B (D-B3) + P6B-B (D-B4): construct the appropriate signer at the
+    // binary boundary based on `config.relay.key_backend`. The bidirectional
+    // config-validation in `Config::validate()` (P6B-B D-B4 rules 1-3)
+    // guarantees that `KeyBackend::HsmKms` is only reachable here when
+    // `active_profile == Production` AND `audit_key_id` is non-empty.
+    // wire_phase4's `Arc<dyn Signer>` signature stays UNCHANGED; this match
+    // is the only P6B-B caller-side wiring.
+    // In Phase 6a + P6B-B, neither signer impl performs real signing:
+    // `DisabledSigner::sign_tx` returns `Err(SignerError::SignerDisabled)`;
+    // `ProductionSigner::sign_tx` returns `Err(SignerError::NotConfigured)`
+    // (stub; P6B-C wires the HSM/KMS SDK + signing-call).
+    // See `docs/specs/phase-6a-boundary.md` §2.2 + `docs/specs/phase-6b-boundary.md` §2.
+    let signer: Arc<dyn Signer> = match config.relay.key_backend {
+        rust_lmax_mev_config::KeyBackend::Disabled => Arc::new(DisabledSigner),
+        rust_lmax_mev_config::KeyBackend::HsmKms => {
+            Arc::new(ProductionSigner::new(config.relay.audit_key_id.clone()))
+        }
+    };
     let handle = runtime.block_on(wire_phase4(&config, WireOptions::default(), signer))?;
     runtime.block_on(async { tokio::signal::ctrl_c().await })?;
     runtime.block_on(handle.shutdown())?;
