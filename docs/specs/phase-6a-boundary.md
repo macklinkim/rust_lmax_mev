@@ -76,7 +76,7 @@ All commands use **unescaped `|` regex alternation** or explicit `-e <pattern>` 
 | Gate | Command | Expected | Reason |
 |---|---|---|---|
 | G1 | `rg -n --type rust 'eth_sendBundle' crates/` | Only `//!` / `///` doc-comment lines asserting NO `eth_sendBundle`; zero non-doc hits. | Phase 5 carry. |
-| G2a | `rg -n --type rust -e 'Wallet' -e 'PrivateKey' -e 'secp256k1' -e 'k256' -e 'sign_transaction' -e 'funded' crates/` | 0 hits | Phase 5 carry. Forbidden signer-symbol set in code. |
+| G2a | `rg -n --type rust -e 'Wallet' -e 'PrivateKey' -e 'secp256k1' -e '\bk256\b' -e 'sign_transaction' -e 'funded' crates/` | 0 hits | Phase 5 carry. Forbidden signer-symbol set in code. `\bk256\b` excludes the `keccak256` substring match (P6-B D-B0 fix; ripgrep default-regex word boundary). |
 | G2b | `rg -n --glob 'crates/**/Cargo.toml' -e 'alloy-signer' -e 'ethers-signers' -e 'secp256k1' -e 'k256'` | 0 hits | Phase 5 carry. Forbidden dep set. |
 | G2c | `rg -n --type rust -e 'Signer' -e 'DisabledSigner' -e 'SignerError' -e 'SignerDisabled' crates/` | **Inventory** of allowed Signer-symbol sites. Phase 5 baseline `55679a4`: all hits under `crates/signer/`. After P6-B: `crates/signer/` + approved P6-B file:line pairs in `crates/execution/` + `crates/app/`. | Phase 5 carry. Allow-list expanded by two sites at P6-B (overview Q-P6-F). |
 | G2d | Same command as G2c. | Every hit MUST appear in the explicit allow-list (Phase 5 baseline = `crates/signer/...` only; post-P6-B = + approved sites in `crates/execution/` + `crates/app/`). **Zero hits outside the allow-list.** Relocating or adding an unapproved site is a gate failure. | Positive allow-list gate (overview-locked redefinition). |
