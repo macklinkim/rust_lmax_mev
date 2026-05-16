@@ -17,6 +17,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use alloy_primitives::{B256, U256};
+use rust_lmax_mev_bundle_relay::KillSwitch;
 use rust_lmax_mev_relay_clients::{BloxrouteConfig, BloxrouteRelay};
 use rust_lmax_mev_relay_sim::{
     compare_result, ComparatorInputs, LocalBundleShape, RelaySimError, RelaySimRequest,
@@ -59,7 +60,7 @@ async fn rc_common_2_secret_redaction_across_five_surfaces() {
         timeout_ms: 1_000,
         api_key: Some(SECRET_KEY.to_string()),
     };
-    let relay = BloxrouteRelay::new(cfg).expect("ctor ok");
+    let relay = BloxrouteRelay::new(cfg, KillSwitch::new(false)).expect("ctor ok");
 
     // Surface 1: Debug elision.
     let dbg = format!("{relay:?}");
@@ -193,11 +194,14 @@ async fn rc_common_2_extra_jsonrpc_body_secret_redacted() {
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(&server)
         .await;
-    let relay = BloxrouteRelay::new(BloxrouteConfig {
-        endpoint: server.uri(),
-        timeout_ms: 1_000,
-        api_key: Some(SECRET_KEY.to_string()),
-    })
+    let relay = BloxrouteRelay::new(
+        BloxrouteConfig {
+            endpoint: server.uri(),
+            timeout_ms: 1_000,
+            api_key: Some(SECRET_KEY.to_string()),
+        },
+        KillSwitch::new(false),
+    )
     .expect("ctor ok");
     let req = RelaySimRequest {
         block_hash: B256::from([0u8; 32]),
@@ -261,11 +265,14 @@ async fn rc_common_2_extra_relay_revert_hex_secret_redacted() {
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(&server)
         .await;
-    let relay = BloxrouteRelay::new(BloxrouteConfig {
-        endpoint: server.uri(),
-        timeout_ms: 1_000,
-        api_key: Some("dummy-test-key".to_string()),
-    })
+    let relay = BloxrouteRelay::new(
+        BloxrouteConfig {
+            endpoint: server.uri(),
+            timeout_ms: 1_000,
+            api_key: Some("dummy-test-key".to_string()),
+        },
+        KillSwitch::new(false),
+    )
     .expect("ctor ok");
     let req = RelaySimRequest {
         block_hash: B256::from([0u8; 32]),

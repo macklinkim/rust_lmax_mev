@@ -2,6 +2,7 @@
 //! `wiremock::MockServer`. No live network calls.
 
 use alloy_primitives::{B256, U256};
+use rust_lmax_mev_bundle_relay::KillSwitch;
 use rust_lmax_mev_relay_clients::{BloxrouteConfig, BloxrouteRelay};
 use rust_lmax_mev_relay_sim::{RelaySimError, RelaySimRequest, RelaySimStatus, RelaySimulator};
 use serde_json::json;
@@ -9,11 +10,14 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn relay_pointing_at(uri: &str) -> BloxrouteRelay {
-    BloxrouteRelay::new(BloxrouteConfig {
-        endpoint: uri.to_string(),
-        timeout_ms: 2_000,
-        api_key: Some("dummy-test-key".to_string()),
-    })
+    BloxrouteRelay::new(
+        BloxrouteConfig {
+            endpoint: uri.to_string(),
+            timeout_ms: 2_000,
+            api_key: Some("dummy-test-key".to_string()),
+        },
+        KillSwitch::new(false),
+    )
     .expect("ctor ok")
 }
 

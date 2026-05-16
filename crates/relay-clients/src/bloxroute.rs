@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rust_lmax_mev_bundle_relay::{BundleRelay, BundleRelayError, SignedBundle, SubmissionReceipt};
+use rust_lmax_mev_bundle_relay::{
+    BundleRelay, BundleRelayError, KillSwitch, SignedBundle, SubmissionReceipt,
+};
 use rust_lmax_mev_relay_sim::{
     RelaySimError, RelaySimRequest, RelaySimulationOutcome, RelaySimulator,
 };
@@ -59,6 +61,11 @@ pub struct BloxrouteRelay {
     /// otherwise.
     http: Option<reqwest::Client>,
     timeout: Duration,
+    /// P6-D D-D1: process-wide kill switch. Internally `Arc<AtomicBool>`
+    /// so this clone shares state with the operator-flippable
+    /// `AppHandle4::kill_switch()`. `submit_bundle` checks
+    /// `is_active()` as its FIRST non-trivia statement (G10).
+    kill_switch: KillSwitch,
 }
 
 impl std::fmt::Debug for BloxrouteRelay {
@@ -73,12 +80,18 @@ impl std::fmt::Debug for BloxrouteRelay {
 }
 
 impl BloxrouteRelay {
-    /// Construct a bloXroute adapter from the given config.
+    /// Construct a bloXroute adapter from the given config + kill switch.
     /// Returns `Err(RelaySimError::NotConfigured)` if the endpoint
     /// is not parseable. If `api_key` is `None`, the adapter is
     /// constructed but every `simulate_bundle` call returns
     /// `Err(NotConfigured)` (fail-closed).
-    pub fn new(cfg: BloxrouteConfig) -> Result<Self, RelaySimError> {
+    ///
+    /// P6-D D-D2: `kill_switch` is taken by value (boundary-spec §2.3 —
+    /// `KillSwitch` already owns its `Arc<AtomicBool>` internally; no
+    /// `Arc<KillSwitch>` / `Option<KillSwitch>`). Pass `kill_switch.clone()`
+    /// from a shared instance to keep the adapter wired to the operator
+    /// surface via `AppHandle4::kill_switch()`.
+    pub fn new(cfg: BloxrouteConfig, kill_switch: KillSwitch) -> Result<Self, RelaySimError> {
         if cfg.endpoint.trim().is_empty() {
             return Err(RelaySimError::NotConfigured);
         }
@@ -104,6 +117,7 @@ impl BloxrouteRelay {
             endpoint,
             http,
             timeout,
+            kill_switch,
         })
     }
 
@@ -137,11 +151,16 @@ impl BundleRelay for BloxrouteRelay {
         &self.name
     }
 
-    /// HARD INVARIANT (DP-E1): always `Err(SubmitDisabled)`.
+    /// HARD INVARIANT (DP-E1): returns `Err(SubmitDisabled)` when the
+    /// kill switch is inactive. P6-D §3 PRECEDENCE: when the kill
+    /// switch is active, returns `Err(KillSwitchActive)` FIRST (G10).
     async fn submit_bundle(
         &self,
         _bundle: &SignedBundle,
     ) -> Result<SubmissionReceipt, BundleRelayError> {
+        if self.kill_switch.is_active() {
+            return Err(BundleRelayError::KillSwitchActive);
+        }
         Err(BundleRelayError::SubmitDisabled)
     }
 }
@@ -152,7 +171,8 @@ mod tests {
 
     #[test]
     fn bloxroute_new_default_succeeds() {
-        let r = BloxrouteRelay::new(BloxrouteConfig::default()).expect("default config ok");
+        let r = BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(false))
+            .expect("default config ok");
         assert_eq!(r.name(), "bloxroute");
         assert_eq!(r.timeout().as_millis() as u64, DEFAULT_BLOXROUTE_TIMEOUT_MS);
     }
@@ -164,7 +184,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            BloxrouteRelay::new(cfg),
+            BloxrouteRelay::new(cfg, KillSwitch::new(false)),
             Err(RelaySimError::NotConfigured)
         ));
     }
@@ -176,7 +196,7 @@ mod tests {
             timeout_ms: 1_000,
             api_key: Some("SECRETKEY".to_string()),
         };
-        let r = BloxrouteRelay::new(cfg).expect("ctor ok");
+        let r = BloxrouteRelay::new(cfg, KillSwitch::new(false)).expect("ctor ok");
         let dbg = format!("{r:?}");
         assert!(!dbg.contains("SECRETTOKEN"));
         assert!(!dbg.contains("SECRETKEY"));
@@ -191,7 +211,7 @@ mod tests {
             api_key: None,
             ..Default::default()
         };
-        let r = BloxrouteRelay::new(cfg).expect("ctor ok");
+        let r = BloxrouteRelay::new(cfg, KillSwitch::new(false)).expect("ctor ok");
         let req = RelaySimRequest {
             block_hash: alloy_primitives::B256::from([0u8; 32]),
             state_block_number: 0,
@@ -203,10 +223,12 @@ mod tests {
         }
     }
 
-    /// RC-B-4: submit_bundle always returns Err(SubmitDisabled).
+    /// RC-B-4: submit_bundle returns Err(SubmitDisabled) when the
+    /// kill switch is inactive.
     #[tokio::test]
     async fn rc_b_4_submit_bundle_always_disabled() {
-        let r = BloxrouteRelay::new(BloxrouteConfig::default()).expect("ctor ok");
+        let r = BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(false))
+            .expect("ctor ok");
         let dummy = SignedBundle {
             block_hash: [0u8; 32],
             state_block_number: 0,
@@ -219,6 +241,34 @@ mod tests {
         match r.submit_bundle(&dummy).await {
             Err(BundleRelayError::SubmitDisabled) => {}
             other => panic!("submit_bundle must return SubmitDisabled; got {other:?}"),
+        }
+    }
+
+    /// P6-D D-T-D4 (v0.5 lean matrix): explicit bloXroute
+    /// inactive-baseline regression. Asymmetric coverage — Flashbots
+    /// inactive-baseline is covered by D-T-D3 Phase 1 + carry-forward
+    /// `rc_f_4_*`; this test names the bloXroute side explicitly so
+    /// any future refactor that re-orders the guard / Err arms is
+    /// caught at the test-name level (spec-drift readability).
+    #[tokio::test]
+    async fn bloxroute_kill_switch_inactive_baseline_returns_submit_disabled() {
+        let r = BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(false))
+            .expect("ctor ok");
+        let dummy = SignedBundle {
+            block_hash: [0u8; 32],
+            state_block_number: 0,
+            signed_txs: vec![vec![0x01]],
+            coinbase_recipient: alloy_primitives::Address::ZERO,
+            coinbase_transfer_wei: alloy_primitives::U256::ZERO,
+            validity_block_min: 0,
+            validity_block_max: 0,
+        };
+        match r.submit_bundle(&dummy).await {
+            Err(BundleRelayError::SubmitDisabled) => {}
+            other => panic!(
+                "submit_bundle with inactive KillSwitch must return \
+                 SubmitDisabled; got {other:?}"
+            ),
         }
     }
 }

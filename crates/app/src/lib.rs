@@ -839,9 +839,15 @@ pub async fn wire_phase4(
     // Phase 4 P4-E: open the comparator's mismatch journal.
     let mismatch_journal: FileJournal<MismatchAbort> =
         FileJournal::open(&config.journal.mismatch_journal_path)?;
+    // Phase 5 P5-D (DP-D6): construct process-wide kill switch from
+    // config initial value once; clones share the same AtomicBool.
+    // P6-D §D-D2a: moved BEFORE `build_relay_sim_from_config` so the
+    // adapter ctors receive a `kill_switch.clone()` and observe operator
+    // flips via the same `Arc<AtomicBool>` as `AppHandle4::kill_switch()`.
+    let kill_switch = KillSwitch::new(config.relay.execution_disabled);
     // Build the relay-sim adapter from config (None when
     // `enabled_relays` is empty per DP-E3 → comparator inert).
-    let relay_sim = build_relay_sim_from_config(&config.relay)?;
+    let relay_sim = build_relay_sim_from_config(&config.relay, kill_switch.clone())?;
 
     let ingress_journal_task = tokio::spawn(journal_drain_loop(
         "ingress-journal",
@@ -884,10 +890,6 @@ pub async fn wire_phase4(
         exec_tx.clone(),
         Arc::clone(&bundle_constructor),
     ));
-
-    // Phase 5 P5-D (DP-D6): construct process-wide kill switch from
-    // config initial value once; clones share the same AtomicBool.
-    let kill_switch = KillSwitch::new(config.relay.execution_disabled);
 
     // Phase 4 P4-E: spawn comparator_driver. Subscribes to sim_tx
     // (independently of execution_driver so both see every
@@ -1512,6 +1514,7 @@ fn seal_envelope_with_context<T>(
 /// accidentally relax this without scope review.
 fn build_relay_sim_from_config(
     cfg: &rust_lmax_mev_config::RelayConfig,
+    kill_switch: KillSwitch,
 ) -> Result<Option<Arc<dyn RelaySimulator>>, AppError> {
     use rust_lmax_mev_config::RelayKind;
     let Some(first) = cfg.enabled_relays.first() else {
@@ -1520,19 +1523,25 @@ fn build_relay_sim_from_config(
     let timeout = cfg.simulate_timeout_ms;
     let arc: Arc<dyn RelaySimulator> = match first.kind {
         RelayKind::Flashbots => {
-            let r = FlashbotsRelay::new(FlashbotsConfig {
-                endpoint: first.endpoint.clone(),
-                timeout_ms: timeout,
-            })
+            let r = FlashbotsRelay::new(
+                FlashbotsConfig {
+                    endpoint: first.endpoint.clone(),
+                    timeout_ms: timeout,
+                },
+                kill_switch,
+            )
             .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
             Arc::new(r)
         }
         RelayKind::Bloxroute => {
-            let r = BloxrouteRelay::new(BloxrouteConfig {
-                endpoint: first.endpoint.clone(),
-                timeout_ms: timeout,
-                api_key: first.api_key.clone(),
-            })
+            let r = BloxrouteRelay::new(
+                BloxrouteConfig {
+                    endpoint: first.endpoint.clone(),
+                    timeout_ms: timeout,
+                    api_key: first.api_key.clone(),
+                },
+                kill_switch,
+            )
             .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
             Arc::new(r)
         }

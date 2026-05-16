@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rust_lmax_mev_bundle_relay::{BundleRelay, BundleRelayError, SignedBundle, SubmissionReceipt};
+use rust_lmax_mev_bundle_relay::{
+    BundleRelay, BundleRelayError, KillSwitch, SignedBundle, SubmissionReceipt,
+};
 use rust_lmax_mev_relay_sim::{
     RelaySimError, RelaySimRequest, RelaySimulationOutcome, RelaySimulator,
 };
@@ -63,6 +65,11 @@ pub struct FlashbotsRelay {
     endpoint: Url,
     http: reqwest::Client,
     timeout: Duration,
+    /// P6-D D-D1: process-wide kill switch. Internally `Arc<AtomicBool>`
+    /// so this clone shares state with the operator-flippable
+    /// `AppHandle4::kill_switch()`. `submit_bundle` checks
+    /// `is_active()` as its FIRST non-trivia statement (G10).
+    kill_switch: KillSwitch,
 }
 
 impl std::fmt::Debug for FlashbotsRelay {
@@ -75,10 +82,16 @@ impl std::fmt::Debug for FlashbotsRelay {
 }
 
 impl FlashbotsRelay {
-    /// Construct a Flashbots adapter from the given config.
+    /// Construct a Flashbots adapter from the given config + kill switch.
     /// Returns `Err(RelaySimError::NotConfigured)` if the endpoint is
     /// not a parseable URL or the reqwest client cannot be built.
-    pub fn new(cfg: FlashbotsConfig) -> Result<Self, RelaySimError> {
+    ///
+    /// P6-D D-D2: `kill_switch` is taken by value (boundary-spec §2.3 —
+    /// `KillSwitch` already owns its `Arc<AtomicBool>` internally; no
+    /// `Arc<KillSwitch>` / `Option<KillSwitch>`). Pass `kill_switch.clone()`
+    /// from a shared instance to keep the adapter wired to the operator
+    /// surface via `AppHandle4::kill_switch()`.
+    pub fn new(cfg: FlashbotsConfig, kill_switch: KillSwitch) -> Result<Self, RelaySimError> {
         if cfg.endpoint.trim().is_empty() {
             return Err(RelaySimError::NotConfigured);
         }
@@ -93,6 +106,7 @@ impl FlashbotsRelay {
             endpoint,
             http,
             timeout,
+            kill_switch,
         })
     }
 
@@ -125,11 +139,16 @@ impl BundleRelay for FlashbotsRelay {
         &self.name
     }
 
-    /// HARD INVARIANT (DP-E1): always `Err(SubmitDisabled)`.
+    /// HARD INVARIANT (DP-E1): returns `Err(SubmitDisabled)` when the
+    /// kill switch is inactive. P6-D §3 PRECEDENCE: when the kill
+    /// switch is active, returns `Err(KillSwitchActive)` FIRST (G10).
     async fn submit_bundle(
         &self,
         _bundle: &SignedBundle,
     ) -> Result<SubmissionReceipt, BundleRelayError> {
+        if self.kill_switch.is_active() {
+            return Err(BundleRelayError::KillSwitchActive);
+        }
         Err(BundleRelayError::SubmitDisabled)
     }
 }
@@ -141,7 +160,8 @@ mod tests {
     /// Construct succeeds with the default endpoint.
     #[test]
     fn flashbots_new_default_succeeds() {
-        let r = FlashbotsRelay::new(FlashbotsConfig::default()).expect("default config ok");
+        let r = FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(false))
+            .expect("default config ok");
         assert_eq!(r.name(), "flashbots");
         assert_eq!(r.timeout().as_millis() as u64, DEFAULT_FLASHBOTS_TIMEOUT_MS);
     }
@@ -154,7 +174,7 @@ mod tests {
             timeout_ms: 1_000,
         };
         assert!(matches!(
-            FlashbotsRelay::new(cfg),
+            FlashbotsRelay::new(cfg, KillSwitch::new(false)),
             Err(RelaySimError::NotConfigured)
         ));
     }
@@ -167,7 +187,7 @@ mod tests {
             timeout_ms: 1_000,
         };
         assert!(matches!(
-            FlashbotsRelay::new(cfg),
+            FlashbotsRelay::new(cfg, KillSwitch::new(false)),
             Err(RelaySimError::NotConfigured)
         ));
     }
@@ -179,7 +199,7 @@ mod tests {
             endpoint: "http://example.com/?token=SECRETTOKEN".to_string(),
             timeout_ms: 1_000,
         };
-        let r = FlashbotsRelay::new(cfg).expect("ctor ok");
+        let r = FlashbotsRelay::new(cfg, KillSwitch::new(false)).expect("ctor ok");
         let dbg = format!("{r:?}");
         assert!(
             !dbg.contains("SECRETTOKEN"),
@@ -191,10 +211,15 @@ mod tests {
         );
     }
 
-    /// RC-F-4: submit_bundle always returns Err(SubmitDisabled).
+    /// RC-F-4: submit_bundle returns Err(SubmitDisabled) when the
+    /// kill switch is inactive (continues to enforce the Flashbots
+    /// inactive-baseline regression on the existing path; v0.5 lean
+    /// matrix relies on this carry-forward so no separate Flashbots
+    /// D-T-D unit test is added).
     #[tokio::test]
     async fn rc_f_4_submit_bundle_always_disabled() {
-        let r = FlashbotsRelay::new(FlashbotsConfig::default()).expect("ctor ok");
+        let r = FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(false))
+            .expect("ctor ok");
         let dummy = SignedBundle {
             block_hash: [0u8; 32],
             state_block_number: 0,
