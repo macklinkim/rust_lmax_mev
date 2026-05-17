@@ -6,12 +6,21 @@
 //! `comparator_driver`) AND `BundleRelay` (whose `submit_bundle`
 //! returns `Err(SubmitDisabled)` unconditionally per DP-E1).
 //!
-//! Read-only `eth_callBundle` only. NO `eth_sendBundle`, NO production
-//! key material, NO signing infrastructure, NO production submission.
+//! Read-only `eth_callBundle` on the `RelaySimulator` path. NO
+//! production key material, NO signing infrastructure. The
+//! `BundleRelay::submit_bundle` body in `flashbots.rs` is extended
+//! at P6B-E1 to perform `eth_sendBundle` POST under a
+//! localhost-only gate (per `is_localhost_url(...)` + ALL of
+//! `live_send=true`, `Production` profile, `HsmKms` key backend,
+//! kill-switch inactive). The `bloxroute.rs` `submit_bundle` body
+//! remains `Err(SubmitDisabled)` per P6B-D close + the v0.1 plan
+//! lock (I) (single adapter at E1; Bloxroute parity is P6B-E2).
+//! No real external relay URL anywhere in this crate.
 
 pub mod bloxroute;
 pub(crate) mod call_bundle;
 pub mod flashbots;
+pub(crate) mod send_bundle;
 
 pub use bloxroute::{BloxrouteConfig, BloxrouteRelay};
 pub use flashbots::{FlashbotsConfig, FlashbotsRelay};

@@ -139,17 +139,46 @@ impl BundleRelay for FlashbotsRelay {
         &self.name
     }
 
-    /// HARD INVARIANT (DP-E1): returns `Err(SubmitDisabled)` when the
-    /// kill switch is inactive. P6-D §3 PRECEDENCE: when the kill
-    /// switch is active, returns `Err(KillSwitchActive)` FIRST (G10).
+    /// P6B-E1 D-E1-3 Ok-path flip (single-adapter scope per v0.1 lock (I)).
+    ///
+    /// PRECEDENCE (G10 + boundary doc Section 4 G12):
+    /// 1. Kill switch active -> `Err(KillSwitchActive)` (P5-D + P6-D §3).
+    /// 2. Endpoint host NOT in `{"127.0.0.1", "localhost", "::1"}` ->
+    ///    `Err(SubmitDisabledNonLocalhost)` (defense-in-depth with the
+    ///    config-validate-time `ConfigError::LiveSendRequiresLocalhostEndpoint`).
+    /// 3. HTTP POST `eth_sendBundle` to the localhost endpoint -> on
+    ///    success returns `Ok(SubmissionReceipt)`; on transport /
+    ///    parse failure returns `Err(SubmitHttpFailed)`.
+    ///
+    /// The G12 7-step pre-check chain (kill-switch + signer Ok +
+    /// local-sim Ok + relay-sim Ok + comparator Match + bundle-byte
+    /// equality + G13 inheritance) is the CALLER's responsibility
+    /// (`submission_driver` in `crates/app`); this adapter performs
+    /// only the localhost + kill-switch gate before the HTTP I/O.
     async fn submit_bundle(
         &self,
-        _bundle: &SignedBundle,
+        bundle: &SignedBundle,
     ) -> Result<SubmissionReceipt, BundleRelayError> {
+        // Step (1): kill switch precedence per G10.
         if self.kill_switch.is_active() {
             return Err(BundleRelayError::KillSwitchActive);
         }
-        Err(BundleRelayError::SubmitDisabled)
+        // Step (2): localhost-only defense-in-depth (R-D7 style
+        // mechanical check). If the endpoint somehow bypasses the
+        // config validate gate, fail-closed here before any HTTP I/O.
+        if !crate::send_bundle::is_localhost_url(&self.endpoint) {
+            return Err(BundleRelayError::SubmitDisabledNonLocalhost);
+        }
+        // Step (3): localhost HTTP POST `eth_sendBundle`. Body shape
+        // matches the Flashbots-flavored JSON-RPC envelope; the local
+        // wiremock relay responds with a `bundleHash` field.
+        crate::send_bundle::submit_eth_send_bundle(
+            &self.http,
+            &self.endpoint,
+            self.name.as_ref(),
+            bundle,
+        )
+        .await
     }
 }
 
@@ -211,13 +240,19 @@ mod tests {
         );
     }
 
-    /// RC-F-4: submit_bundle returns Err(SubmitDisabled) when the
-    /// kill switch is inactive (continues to enforce the Flashbots
-    /// inactive-baseline regression on the existing path; v0.5 lean
-    /// matrix relies on this carry-forward so no separate Flashbots
-    /// D-T-D unit test is added).
+    /// RC-F-4 P6B-E1 D-T-E1-4: submit_bundle with the default
+    /// (non-localhost) endpoint + kill switch INACTIVE returns
+    /// `Err(SubmitDisabledNonLocalhost)`. The pre-P6B-E1 invariant
+    /// was `Err(SubmitDisabled)`; P6B-E1's Ok-path flip narrows the
+    /// adapter to `Ok(_)` for localhost only and routes every other
+    /// endpoint to the defense-in-depth `SubmitDisabledNonLocalhost`.
+    /// Config-validate-time `LiveSendRequiresLocalhostEndpoint`
+    /// covers the boot path; this test covers the adapter-runtime
+    /// path (R-D7 style mechanical check) so a non-localhost
+    /// endpoint that somehow bypasses config validation still
+    /// fails-closed BEFORE any HTTP I/O.
     #[tokio::test]
-    async fn rc_f_4_submit_bundle_always_disabled() {
+    async fn rc_f_4_submit_bundle_non_localhost_rejects_at_runtime() {
         let r = FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(false))
             .expect("ctor ok");
         let dummy = SignedBundle {
@@ -230,8 +265,10 @@ mod tests {
             validity_block_max: 0,
         };
         match r.submit_bundle(&dummy).await {
-            Err(BundleRelayError::SubmitDisabled) => {}
-            other => panic!("submit_bundle must return SubmitDisabled; got {other:?}"),
+            Err(BundleRelayError::SubmitDisabledNonLocalhost) => {}
+            other => panic!(
+                "submit_bundle must return SubmitDisabledNonLocalhost for non-localhost endpoint; got {other:?}"
+            ),
         }
     }
 }

@@ -565,6 +565,13 @@ use tokio::sync::broadcast;
 // `submit_disabled` tests in `crates/relay-clients/tests/`, but the
 // app wiring stays simulator-side only.
 pub use rust_lmax_mev_bundle_relay::KillSwitch;
+// P6B-E1 D-E1-5 + D-E1-6: bundle-relay types reach app for the new
+// `submission_driver` task. `BundleRelay` trait object is held inside
+// the task closure only (G4 grows 0 -> 1 in `crates/app/src/`,
+// documented in boundary doc Section 5).
+pub use rust_lmax_mev_bundle_relay::{
+    BundleRelay, BundleRelayError, SignedBundle, SubmissionAttempt, SubmissionReceipt,
+};
 use rust_lmax_mev_relay_clients::{
     BloxrouteConfig, BloxrouteRelay, FlashbotsConfig, FlashbotsRelay,
 };
@@ -578,10 +585,28 @@ use rust_lmax_mev_relay_sim::{
 /// `LocalStateFingerprint` (for the new comparator_driver per R-E1 +
 /// DP-D9'). Wiring-only type; not journaled, not bus-archived; only
 /// `Clone + Debug` needed.
+///
+/// P6B-E1 D-E1-5 + plan lock (G): extended with
+/// `signed_bundle: Option<SignedBundle>`. In production runtime this
+/// field is ALWAYS `None` because the signer's production runtime call
+/// path remains test-only (G11 = 1 carried forward from P6B-CD). The
+/// field is populated ONLY by the test harness in
+/// `crates/app/tests/wire_phase4_e1.rs`, which injects synthetic
+/// SignedBundle bytes to exercise `submission_driver`'s full pipeline
+/// against a `127.0.0.1` wiremock relay. When `comparator_driver`
+/// observes Match AND `signed_bundle.is_some()`, it constructs a
+/// `SubmissionAttempt` and broadcasts on `submission_tx`. Otherwise
+/// (production runtime or None) no `SubmissionAttempt` is emitted and
+/// `submission_driver` stays idle.
 #[derive(Debug, Clone)]
 pub struct SimulationOutcomeWithFingerprint {
     pub outcome: SimulationOutcome,
     pub fingerprint: LocalStateFingerprint,
+    /// P6B-E1 D-E1-5: optional signed-bundle bytes carry-forward for
+    /// the `submission_driver` Ok-path. Always `None` in production
+    /// runtime (G11 = 1; no production sign_tx call site). Populated
+    /// only by the P6B-E1 test harness.
+    pub signed_bundle: Option<SignedBundle>,
 }
 
 /// Phase 4 P4-E: terminal "comparator passed" envelope payload. Emitted
@@ -636,6 +661,10 @@ pub struct AppHandle4 {
     // No subscribers in P4-E (terminal observability events).
     comparator_tx: broadcast::Sender<MismatchCheckPassed>,
     mismatch_tx: broadcast::Sender<MismatchAbortRecord>,
+    // P6B-E1 D-E1-6: submission attempt broadcast. comparator_driver
+    // broadcasts on Match when the upstream sim envelope carries
+    // `signed_bundle.is_some()`. submission_driver subscribes.
+    submission_tx: broadcast::Sender<SubmissionAttempt>,
     producer_task: tokio::task::JoinHandle<()>,
     ingress_journal_task: tokio::task::JoinHandle<()>,
     state_driver_task: tokio::task::JoinHandle<()>,
@@ -648,6 +677,10 @@ pub struct AppHandle4 {
     // `FileJournal<MismatchAbort>` directly (no separate drain task
     // per DP-E8 v0.4 R-E16 fix).
     comparator_driver_task: tokio::task::JoinHandle<()>,
+    // P6B-E1 D-E1-6: submission_driver task. Owns the
+    // `FileJournal<SubmissionReceipt>` directly. Spawned even when
+    // no relay is configured (structurally inert in that case).
+    submission_driver_task: tokio::task::JoinHandle<()>,
     // Phase 5 P5-D (DP-D5): process-wide kill switch. Cloned into
     // `comparator_driver` and any future submission boundary; toggled
     // via `set_execution_disabled`.
@@ -732,6 +765,7 @@ impl AppHandle4 {
             exec_tx,
             comparator_tx,
             mismatch_tx,
+            submission_tx,
             producer_task,
             ingress_journal_task,
             state_driver_task,
@@ -741,11 +775,19 @@ impl AppHandle4 {
             simulator_driver_task,
             execution_driver_task,
             comparator_driver_task,
+            submission_driver_task,
             kill_switch: _kill_switch,
         } = self;
 
         producer_task.abort();
         let _ = producer_task.await;
+
+        // P6B-E1 D-E1-6: drop submission_tx first so submission_driver
+        // observes Closed on its receiver and exits the loop. Owns the
+        // FileJournal<SubmissionReceipt> directly; flush at task exit.
+        drop(submission_tx);
+        submission_driver_task.abort();
+        let _ = submission_driver_task.await;
 
         // Drop comparator broadcasts so any subscribers get Closed,
         // then abort comparator driver. The driver owns the journal
@@ -879,10 +921,18 @@ pub async fn wire_phase4(
     // Phase 4 P4-E (D-E3 + DP-E12): comparator broadcasts.
     let (comparator_tx, _) = broadcast::channel::<MismatchCheckPassed>(cap);
     let (mismatch_tx, _) = broadcast::channel::<MismatchAbortRecord>(cap);
+    // P6B-E1 D-E1-6: submission_tx carries SubmissionAttempt envelopes
+    // from comparator_driver (on Match + signed_bundle.is_some()) to
+    // the new submission_driver. Inert in production runtime because
+    // signed_bundle is always None there (G11 = 1 carried forward).
+    let (submission_tx, _) = broadcast::channel::<SubmissionAttempt>(cap);
 
     // Phase 4 P4-E: open the comparator's mismatch journal.
     let mismatch_journal: FileJournal<MismatchAbort> =
         FileJournal::open(&config.journal.mismatch_journal_path)?;
+    // P6B-E1 D-E1-7: open the submission_driver's receipt journal.
+    let submission_journal: FileJournal<SubmissionReceipt> =
+        FileJournal::open(&config.journal.submission_journal_path)?;
     // Phase 5 P5-D (DP-D6): construct process-wide kill switch from
     // config initial value once; clones share the same AtomicBool.
     // P6-D §D-D2a: moved BEFORE `build_relay_sim_from_config` so the
@@ -890,8 +940,19 @@ pub async fn wire_phase4(
     // flips via the same `Arc<AtomicBool>` as `AppHandle4::kill_switch()`.
     let kill_switch = KillSwitch::new(config.relay.execution_disabled);
     // Build the relay-sim adapter from config (None when
-    // `enabled_relays` is empty per DP-E3 → comparator inert).
+    // `enabled_relays` is empty per DP-E3 -> comparator inert).
     let relay_sim = build_relay_sim_from_config(&config.relay, kill_switch.clone())?;
+    // P6B-E1 D-E1-6: parallel BundleRelay upcast for the new
+    // submission_driver. Same concrete adapter as `relay_sim` (via the
+    // same config), expressed as `Option<Arc<dyn BundleRelay>>` so the
+    // driver can call `submit_bundle` without an unsafe upcast.
+    let bundle_relay = build_bundle_relay_from_config(&config.relay, kill_switch.clone())?;
+    // P6B-E1 D-E1-6: submission gate snapshot read ONCE from the
+    // validated config. This is the only app-side read of
+    // `config.relay.live_send` (boundary doc Section 5 per-callsite
+    // documentation requirement); the driver consumes this snapshot
+    // for the G12 step 7 G13-inheritance assertion on every iteration.
+    let submission_gate = SubmissionGate::from_config(config);
 
     let ingress_journal_task = tokio::spawn(journal_drain_loop(
         "ingress-journal",
@@ -943,11 +1004,25 @@ pub async fn wire_phase4(
         sim_tx.subscribe(),
         comparator_tx.clone(),
         mismatch_tx.clone(),
+        submission_tx.clone(),
         relay_sim,
         Arc::clone(&bundle_constructor),
         mismatch_journal,
         "comparator-driver",
         kill_switch.clone(),
+    ));
+    // P6B-E1 D-E1-6: spawn submission_driver task. Subscribes to
+    // submission_tx (populated by comparator_driver on Match when
+    // signed_bundle.is_some()) and on each attempt runs the G12 7-step
+    // chain INHERITING G13 + invokes submit_bundle on the BundleRelay
+    // upcast. Inert (no-op loop) when `bundle_relay.is_none()`.
+    let submission_driver_task = tokio::spawn(submission_driver(
+        submission_tx.subscribe(),
+        bundle_relay,
+        kill_switch.clone(),
+        submission_gate,
+        submission_journal,
+        "submission-driver",
     ));
 
     // P4-F: dispatch on `config.ingress.mempool_source` selector.
@@ -973,6 +1048,7 @@ pub async fn wire_phase4(
         exec_tx,
         comparator_tx,
         mismatch_tx,
+        submission_tx,
         producer_task,
         ingress_journal_task,
         state_driver_task,
@@ -982,6 +1058,7 @@ pub async fn wire_phase4(
         simulator_driver_task,
         execution_driver_task,
         comparator_driver_task,
+        submission_driver_task,
         kill_switch,
     })
 }
@@ -1281,7 +1358,13 @@ pub async fn simulator_driver(
                 }
                 match simulator.simulate_with_fingerprint(envelope.payload()) {
                     Ok((outcome, fingerprint)) => {
+                        // P6B-E1 D-E1-5: signed_bundle is always None
+                        // in production runtime (G11 = 1 carried
+                        // forward from P6B-CD; no production signer
+                        // call site upstream). Test harnesses publish
+                        // synthetic envelopes with Some(...) directly.
                         let payload = SimulationOutcomeWithFingerprint {
+                            signed_bundle: None,
                             outcome,
                             fingerprint,
                         };
@@ -1398,6 +1481,16 @@ pub async fn comparator_driver<J: MismatchJournalSink>(
     mut rx: broadcast::Receiver<EventEnvelope<SimulationOutcomeWithFingerprint>>,
     comparator_tx: broadcast::Sender<MismatchCheckPassed>,
     mismatch_tx: broadcast::Sender<MismatchAbortRecord>,
+    // P6B-E1 D-E1-5 + D-E1-6: submission_tx sender. comparator_driver
+    // broadcasts a SubmissionAttempt on Match WHEN the upstream
+    // envelope carries `signed_bundle.is_some()`. In production
+    // runtime signed_bundle is always None (G11 = 1; no production
+    // signer call site upstream); this parameter exists so the
+    // test harness in `crates/app/tests/` can publish synthetic
+    // SimulationOutcomeWithFingerprint envelopes with
+    // `signed_bundle: Some(...)` and observe submission_driver
+    // pick them up end-to-end.
+    submission_tx: broadcast::Sender<SubmissionAttempt>,
     relay_sim: Option<Arc<dyn RelaySimulator>>,
     constructor: Arc<BundleConstructor>,
     mut journal: J,
@@ -1468,7 +1561,18 @@ pub async fn comparator_driver<J: MismatchJournalSink>(
                 match cmp {
                     Ok(()) => {
                         // No subscriber reads comparator_tx in P4-E.
-                        let _ = comparator_tx.send(MismatchCheckPassed { candidate });
+                        let _ = comparator_tx.send(MismatchCheckPassed {
+                            candidate: candidate.clone(),
+                        });
+                        // P6B-E1 D-E1-5 + D-E1-6: broadcast
+                        // SubmissionAttempt ONLY when the upstream sim
+                        // envelope carries signed bytes (test-only path
+                        // at E1). Production runtime never reaches the
+                        // `if let Some` branch because the field is
+                        // always None there.
+                        if let Some(signed_bundle) = envelope.payload().signed_bundle.clone() {
+                            let _ = submission_tx.send(SubmissionAttempt { signed_bundle });
+                        }
                     }
                     Err(abort_box) => {
                         let abort = *abort_box;
@@ -1591,6 +1695,226 @@ fn build_relay_sim_from_config(
         }
     };
     Ok(Some(arc))
+}
+
+/// P6B-E1 D-E1-6 helper: builds the `Arc<dyn BundleRelay>` handle the
+/// new `submission_driver` task uses to invoke
+/// `submit_bundle(&signed_bundle)`. Mirrors `build_relay_sim_from_config`
+/// but exposes the `BundleRelay` upcast instead of `RelaySimulator`.
+///
+/// At E1 only the Flashbots adapter is flipped to the Ok-path (v0.1
+/// plan lock (I); Bloxroute returns `Err(SubmitDisabled)` per P6B-D
+/// close + the single-adapter scope decision). Bloxroute is still
+/// upcast here so `submission_driver` can observe the (deliberate)
+/// `Err(SubmitDisabled)` from Bloxroute and journal-and-continue.
+fn build_bundle_relay_from_config(
+    cfg: &rust_lmax_mev_config::RelayConfig,
+    kill_switch: KillSwitch,
+) -> Result<Option<Arc<dyn BundleRelay>>, AppError> {
+    use rust_lmax_mev_config::RelayKind;
+    let Some(first) = cfg.enabled_relays.first() else {
+        return Ok(None);
+    };
+    let timeout = cfg.simulate_timeout_ms;
+    let arc: Arc<dyn BundleRelay> = match first.kind {
+        RelayKind::Flashbots => {
+            let r = FlashbotsRelay::new(
+                FlashbotsConfig {
+                    endpoint: first.endpoint.clone(),
+                    timeout_ms: timeout,
+                },
+                kill_switch,
+            )
+            .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
+            Arc::new(r)
+        }
+        RelayKind::Bloxroute => {
+            let r = BloxrouteRelay::new(
+                BloxrouteConfig {
+                    endpoint: first.endpoint.clone(),
+                    timeout_ms: timeout,
+                    api_key: first.api_key.clone(),
+                },
+                kill_switch,
+            )
+            .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
+            Arc::new(r)
+        }
+    };
+    Ok(Some(arc))
+}
+
+/// P6B-E1 D-E1-6 submission gate snapshot.
+///
+/// Captures the subset of `Config` values needed for the
+/// `submission_driver`'s G12 step-7 G13-inheritance assertion. All
+/// fields are read once at boot from the validated `Config` and
+/// passed into the task closure; the driver does NOT re-read
+/// `config.relay.live_send` at runtime (the boundary doc Section 5
+/// per-callsite documentation requirement only allows the one read
+/// site, which is at the spawn point here).
+#[derive(Debug, Clone, Copy)]
+pub struct SubmissionGate {
+    pub live_send: bool,
+    pub production_profile: bool,
+    pub hsmkms: bool,
+}
+
+impl SubmissionGate {
+    /// Returns `true` iff ALL 3 P6B-D / G13-inheritance conditions hold.
+    /// `submission_driver` short-circuits on `false` per G12 step 7.
+    pub fn permits_submission(&self) -> bool {
+        self.live_send && self.production_profile && self.hsmkms
+    }
+
+    fn from_config(cfg: &rust_lmax_mev_config::Config) -> Self {
+        use rust_lmax_mev_config::{KeyBackend, Profile};
+        Self {
+            live_send: cfg.relay.live_send,
+            production_profile: cfg.active_profile == Profile::Production,
+            hsmkms: cfg.relay.key_backend == KeyBackend::HsmKms,
+        }
+    }
+}
+
+/// P6B-E1 D-E1-6 submission_driver task body.
+///
+/// Subscribes to `submission_rx` (the new `submission_tx` broadcast
+/// receiver) and on each `SubmissionAttempt` runs the G12 7-step
+/// pre-check chain INHERITING G13 (boundary doc Section 4):
+///
+/// 1. **Kill-switch check** -- first-statement guard. Skip iteration
+///    if active.
+/// 2. **Signer Ok** -- structural: presence of `attempt.signed_bundle`
+///    proves signer returned Ok upstream. (P6B-E1 v0.1 lock B: only
+///    `Some(_)` SubmissionAttempts are broadcast.)
+/// 3. **Local-sim Ok** / 4. **Relay-sim Ok** / 5. **Comparator Match**
+///    -- structurally satisfied by the comparator_driver only
+///    broadcasting on Match.
+/// 6. **Bundle-byte equality** -- v0.1 lock D SIMPLIFICATION: assert
+///    `signed_bundle.signed_txs` non-empty AND first tx >= 64 bytes.
+///    True keccak-against-relay-echo is P6B-E2 scope.
+/// 7. **G13 inheritance** -- assert
+///    `(live_send && Production && HsmKms)` from the precomputed
+///    `SubmissionGate` snapshot.
+///
+/// On success: appends `SubmissionReceipt` to journal BEFORE the next
+/// iteration (DP-E8 v0.4 pattern). On failure: emits structured
+/// WARN log and continues. The `relay` argument is `Option<...>` so
+/// when no adapter is configured (e.g., empty `enabled_relays`),
+/// `submission_driver` is structurally inert.
+pub async fn submission_driver(
+    mut submission_rx: broadcast::Receiver<SubmissionAttempt>,
+    relay: Option<Arc<dyn BundleRelay>>,
+    kill_switch: KillSwitch,
+    gate: SubmissionGate,
+    mut journal: FileJournal<SubmissionReceipt>,
+    name: &'static str,
+) {
+    let Some(relay) = relay else {
+        // No relay configured -> structurally inert. Drain the
+        // receiver to avoid lag warnings but submit nothing.
+        loop {
+            if submission_rx.recv().await.is_err() {
+                return;
+            }
+        }
+    };
+    let mut seq: u64 = 0;
+    loop {
+        let attempt = match submission_rx.recv().await {
+            Ok(a) => a,
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        // G12 step 1: kill switch first-statement guard.
+        if kill_switch.is_active() {
+            tracing::warn!(
+                target: "submission_driver",
+                driver = %name,
+                "kill switch active; skipping submission attempt"
+            );
+            continue;
+        }
+        // G12 step 7: G13 inheritance (live_send + Production + HsmKms).
+        // Boundary doc Section 4 G12 step 7. Fail-closed if any false.
+        if !gate.permits_submission() {
+            tracing::warn!(
+                target: "submission_driver",
+                driver = %name,
+                "G13 inheritance check failed; skipping submission attempt"
+            );
+            continue;
+        }
+        // G12 step 6 (SIMPLIFIED at E1): bundle-byte non-empty + min length.
+        if attempt.signed_bundle.signed_txs.is_empty()
+            || attempt
+                .signed_bundle
+                .signed_txs
+                .iter()
+                .any(|t| t.len() < 64)
+        {
+            tracing::warn!(
+                target: "submission_driver",
+                driver = %name,
+                "bundle-byte equality (E1 simplified) failed; skipping submission attempt"
+            );
+            continue;
+        }
+        // Invoke submit_bundle. Adapter performs its own kill-switch +
+        // localhost-host re-check before any HTTP I/O (defense-in-depth).
+        match relay.submit_bundle(&attempt.signed_bundle).await {
+            Ok(receipt) => {
+                // DP-E8 v0.4 pattern: append-and-flush BEFORE
+                // acknowledging success in the loop. The receipt is
+                // wrapped in an EventEnvelope (Relay-source) for
+                // journal compatibility; correlation_id = 0 because
+                // SubmissionAttempt does not carry an upstream id
+                // through the broadcast (E1 simplification).
+                let Some(env) = seal_envelope(EventSource::Relay, receipt.clone(), &mut seq) else {
+                    tracing::error!(
+                        target: "submission_driver",
+                        driver = %name,
+                        "envelope seal failed; receipt NOT durably recorded"
+                    );
+                    continue;
+                };
+                if let Err(e) = journal.append(&env) {
+                    tracing::error!(
+                        target: "submission_driver",
+                        driver = %name,
+                        error = %e,
+                        "submission journal append failed; receipt NOT durably recorded"
+                    );
+                    continue;
+                }
+                if let Err(e) = journal.flush() {
+                    tracing::error!(
+                        target: "submission_driver",
+                        driver = %name,
+                        error = %e,
+                        "submission journal flush failed; receipt NOT durably recorded"
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    target: "submission_driver",
+                    driver = %name,
+                    relay_name = %receipt.relay_name,
+                    bundle_hash = %receipt.bundle_hash,
+                    "submission Ok"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "submission_driver",
+                    driver = %name,
+                    error = ?e,
+                    "submit_bundle returned Err"
+                );
+            }
+        }
+    }
 }
 
 fn seal_envelope<T>(source: EventSource, payload: T, seq: &mut u64) -> Option<EventEnvelope<T>> {

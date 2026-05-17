@@ -71,6 +71,26 @@ The two new branches evaluate BEFORE the P6B-B reject chain (live-send-first ord
 
 **P6B-E (`submit_bundle Ok` + `eth_sendBundle` runtime + actual relay submission) and P6B-F (Phase 6b DoD audit + `phase-6b-complete` annotated tag) REMAIN LOCKED.** The runtime safety chain at P6B-D close: `submit_bundle` adapters still return `Err(KillSwitchActive)` or `Err(SubmitDisabled)`; G3 + G4 stay at 0; G11 production runtime sign_tx call site count stays at 1 (test-only `invoke_signer_for_test` hook); G14 stays at 5 doc-comment hits; NO new app-side read of `config.relay.live_send` anywhere in `crates/app/src/`. The validation flip is necessary-but-not-sufficient for live submission; P6B-E owns the runtime G12 step 7 / G13 inheritance assertion site.
 
+### Section 3 amendment (added at P6B-E1 close, per APPROVED plan v0.1 at `4ca6abd`)
+
+P6B-E1 ships the **local-wiremock-only dress rehearsal** of `submit_bundle -> Ok(SubmissionReceipt)`. After E1 close the workspace can submit a real `eth_sendBundle` JSON-RPC POST to an in-process mock relay bound to `127.0.0.1` and observe the full G12 7-step chain INHERITING G13 fire under the kill-switch + comparator-pass + matched-bundle preconditions. **No non-localhost endpoint can be submitted to by ANY code path** -- enforced by two redundant fail-closed gates (`ConfigError::LiveSendRequiresLocalhostEndpoint` at validate-time + `BundleRelayError::SubmitDisabledNonLocalhost` at adapter runtime).
+
+Deliverables landed (D-E1-1..D-E1-9 per the v0.1 plan):
+
+- D-E1-1: `ConfigError::LiveSendRequiresLocalhostEndpoint` + validate-body check after the P6B-D live-send-first branches.
+- D-E1-2: NEW `BundleRelayError::SubmitDisabledNonLocalhost` + `SubmitHttpFailed` variants.
+- D-E1-3: `FlashbotsRelay::submit_bundle` Ok-path rewrite under localhost gate. **Bloxroute UNCHANGED at E1** (single-adapter scope per v0.1 plan lock (I); Bloxroute remains `Err(SubmitDisabled)`).
+- D-E1-4: NEW `crates/relay-clients/src/send_bundle.rs` JSON-RPC body builder + localhost-URL helper. Sibling to the P4-E `call_bundle.rs` `eth_callBundle` helper.
+- D-E1-5: `SimulationOutcomeWithFingerprint.signed_bundle: Option<SignedBundle>` extension + NEW `SubmissionAttempt` struct in `crates/bundle-relay`.
+- D-E1-6: NEW `submission_driver` task in `wire_phase4`, parallel to `comparator_driver`. Subscribes to `submission_tx` and on each `SubmissionAttempt` runs the G12 7-step pre-check chain INHERITING G13. One `Arc<dyn BundleRelay>` parameter (G4 grows 0 -> 1); one `.submit_bundle(` method call site (G3 grows 0 -> 1).
+- D-E1-7: NEW `FileJournal<SubmissionReceipt>` opened from `config.journal.submission_journal_path`. Append-and-flush BEFORE acknowledging success in the loop (DP-E8 v0.4 pattern).
+- D-E1-8: THIS Section 3 amendment + Section 5 per-callsite entries below.
+- D-E1-9: 7 targeted tests (D-T-E1-1..D-T-E1-7) -- 2 config validate (localhost reject + accept), 1 relay-clients adapter runtime non-localhost reject (`rc_f_4` rewritten), 1 relay-clients localhost wiremock happy path (`d_t_e1_5_submit_bundle_ok_on_local_wiremock`), 2 `submission_driver` integration tests in `crates/app/tests/submission_driver_e1.rs` (happy path + G13 inheritance fail skip). Plus 2 existing `submit_disabled_1` / `submit_disabled_5` updated to reflect the new `SubmitDisabledNonLocalhost` shape.
+
+**v0.1 plan lock (D) SIMPLIFICATION**: G12 step 6 ("bundle-byte equality") is approximated at E1 as `signed_bundle.signed_txs.iter().all(|t| t.len() >= 64) && !signed_txs.is_empty()`. True keccak-against-relay-echo bundle-byte equality is **deferred to P6B-E2** when production-relay echo responses are observable.
+
+**P6B-E2 (non-localhost endpoint adapter flip + multi-adapter parity + true bundle-byte equality) and P6B-F (Phase 6b DoD audit + `phase-6b-complete` annotated tag) REMAIN LOCKED.** Runtime safety chain at P6B-E1 close: relay adapters return `Ok(SubmissionReceipt)` ONLY when the endpoint host is in `{"127.0.0.1", "localhost", "::1"}` AND the kill-switch is inactive AND the HTTP POST succeeds; every other combination returns `Err(...)` per the documented PRECEDENCE (`KillSwitchActive` > `SubmitDisabledNonLocalhost` > `SubmitHttpFailed`). The `comparator_driver` -> `submission_tx` -> `submission_driver` path is structurally compiled but only fires in tests because `SimulationOutcomeWithFingerprint.signed_bundle` is ALWAYS `None` in production runtime (G11 = 1 carried forward from P6B-CD; no production signer call site upstream).
+
 ## Section 4 -- New Phase 6b G-gates
 
 ### G12 -- submit_bundle caller pre-check chain (G12 INHERITS G13)
@@ -208,6 +228,17 @@ rg -n -e 'test_key|TEST_KEY|TEST_PRIV|TEST_PRIVATE|SecretKey|SigningKey|from_byt
 Tests that need a known-good ECDSA recovery vector consume ONLY non-secret material (preimage, digest, signed-tx bytes, `r`, `s`, `y_parity`, precomputed-off-tree SEC1 public-key bytes, DER signature bytes); private-key derivation -- even from a published source -- happens OFF-TREE and only the non-secret outputs are pasted into the repo. Relaxing G2g requires its own ADR-001 amendment.
 
 ## Section 5 -- Per-callsite documentation requirement
+
+### P6B-E1 close: 1 new `submit_bundle(` caller + 1 new `eth_sendBundle` runtime reference
+
+Per the v0.1 plan lock (J), exactly ONE new caller per gate is documented here at P6B-E1 close:
+
+| Gate | File:line | Callsite |
+|---|---|---|
+| G3 / G4 (new `Arc<dyn BundleRelay>` + `.submit_bundle(` call) | `crates/app/src/lib.rs` -- inside the body of `pub async fn submission_driver(...)` -- the line `match relay.submit_bundle(&attempt.signed_bundle).await { ... }`. The `Arc<dyn BundleRelay>` is the function parameter `relay: Option<Arc<dyn BundleRelay>>` (None branch yields a structurally inert task). | G12 7-step chain INHERITING G13 verified in the same loop body BEFORE the `.submit_bundle(` invocation: (1) `kill_switch.is_active()` short-circuit; (2) structural (presence of `attempt.signed_bundle` proves the upstream signer Ok); (3)-(5) structural (comparator_driver only broadcasts SubmissionAttempt on Match); (6) `signed_bundle.signed_txs` non-empty + each tx >= 64 bytes (v0.1 D simplification); (7) `gate.permits_submission()` synchronous assertion `live_send && Production && HsmKms` against the boot-time `SubmissionGate` snapshot. |
+| G14 (new `eth_sendBundle` runtime reference) | `crates/relay-clients/src/send_bundle.rs` -- inside the body of `pub(crate) async fn submit_eth_send_bundle(...)` -- the JSON-RPC body literal `method: "eth_sendBundle"`. | This runtime reference is reachable ONLY through the chain `submission_driver -> FlashbotsRelay::submit_bundle -> send_bundle::submit_eth_send_bundle`. The 2 gates above (G3 + G4 documented chain) cover the upstream preconditions. The adapter itself also re-checks kill-switch + localhost-only before invoking this function (adapter-runtime defense-in-depth per `BundleRelayError::SubmitDisabledNonLocalhost`). |
+
+
 
 This section is **empty at P6B-A close**. P6B-A introduces no new caller / no new runtime reference / no new production sign_tx site.
 

@@ -24,11 +24,19 @@ fn dummy_bundle() -> SignedBundle {
 
 #[tokio::test]
 async fn submit_disabled_1_flashbots() {
+    // P6B-E1 update: Flashbots adapter Ok-path is now narrowed to
+    // localhost-only. The default endpoint is non-localhost so the
+    // adapter rejects with `SubmitDisabledNonLocalhost` (defense-in-depth
+    // against any non-localhost endpoint that bypasses the
+    // `ConfigError::LiveSendRequiresLocalhostEndpoint` validate gate).
     let r =
         FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(false)).expect("ctor ok");
     match r.submit_bundle(&dummy_bundle()).await {
-        Err(BundleRelayError::SubmitDisabled) => {}
-        other => panic!("Flashbots submit_bundle must return SubmitDisabled; got {other:?}"),
+        Err(BundleRelayError::SubmitDisabledNonLocalhost) => {}
+        other => panic!(
+            "Flashbots submit_bundle with default (non-localhost) endpoint must return \
+             SubmitDisabledNonLocalhost; got {other:?}"
+        ),
     }
 }
 
@@ -91,9 +99,11 @@ async fn submit_disabled_5_flashbots_shared_kill_switch_flip_visible() {
     let r = FlashbotsRelay::new(FlashbotsConfig::default(), ks_clone).expect("ctor ok");
 
     // Phase 1: inactive baseline.
+    // P6B-E1: default (non-localhost) endpoint -> SubmitDisabledNonLocalhost
+    // (was SubmitDisabled before the P6B-E1 adapter Ok-path flip).
     match r.submit_bundle(&dummy_bundle()).await {
-        Err(BundleRelayError::SubmitDisabled) => {}
-        other => panic!("pre-flip: expected SubmitDisabled, got {other:?}"),
+        Err(BundleRelayError::SubmitDisabledNonLocalhost) => {}
+        other => panic!("pre-flip: expected SubmitDisabledNonLocalhost, got {other:?}"),
     }
 
     // Phase 2: operator flips the switch from the held instance.

@@ -12,6 +12,9 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 alloy-primitives = { workspace = true, features = ["serde"] }
 rkyv = { workspace = true }
+# P6B-E1 D-E1-1: localhost-endpoint parsing for the
+# `LiveSendRequiresLocalhostEndpoint` validate-time check.
+url = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

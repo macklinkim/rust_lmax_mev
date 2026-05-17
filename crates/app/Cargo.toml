@@ -43,3 +43,8 @@ tokio = { workspace = true }
 alloy-primitives = { workspace = true }
 # P5-A: PA-4 mock StateFetcher impls the async_trait-sugared trait.
 async-trait = { workspace = true }
+# P6B-E1 D-T-E1-6 + D-T-E1-7: wiremock for the 127.0.0.1-bound local
+# relay test harness. Pre-existing workspace dev-dep in
+# relay-clients; pulled in here for the submission_driver integration tests.
+wiremock = { workspace = true }
+serde_json = { workspace = true }

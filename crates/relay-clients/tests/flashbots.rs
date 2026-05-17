@@ -1,8 +1,8 @@
 //! P4-E RC-F-1..5 integration tests for `FlashbotsRelay` against
 //! `wiremock::MockServer`. No live network calls.
 
-use alloy_primitives::{B256, U256};
-use rust_lmax_mev_bundle_relay::KillSwitch;
+use alloy_primitives::{Address, B256, U256};
+use rust_lmax_mev_bundle_relay::{BundleRelay, KillSwitch, SignedBundle};
 use rust_lmax_mev_relay_clients::{FlashbotsConfig, FlashbotsRelay};
 use rust_lmax_mev_relay_sim::{RelaySimError, RelaySimRequest, RelaySimStatus, RelaySimulator};
 use serde_json::json;
@@ -189,4 +189,61 @@ async fn rc_f_6_call_bundle_body_shape_matches_with_placeholder_bytes() {
         parsed, expected,
         "request body must match expected JSON-RPC envelope exactly"
     );
+}
+
+/// D-T-E1-5: P6B-E1 localhost-only happy-path. Wiremock listens at
+/// `127.0.0.1:<random>`; the adapter's localhost runtime check passes;
+/// `submit_bundle` POSTs an `eth_sendBundle` JSON-RPC envelope and
+/// returns `Ok(SubmissionReceipt)`. The request body shape is verified
+/// by exact `serde_json::Value` equality (mirrors the P6B-C RC-F-6
+/// `eth_callBundle` pattern).
+#[tokio::test]
+async fn d_t_e1_5_submit_bundle_ok_on_local_wiremock() {
+    let server = MockServer::start().await;
+    // The mock returns a canned bundleHash. P6B-E1 SIMPLIFICATION:
+    // the workspace's bundle-byte equality check (G12 step 6) is
+    // "non-empty + len >= 64"; the mock can return any string.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "result": {
+                "bundleHash": "0xabcdef0123456789",
+            }
+        })))
+        .mount(&server)
+        .await;
+    let relay = relay_pointing_at(&server.uri());
+    let bundle = SignedBundle {
+        block_hash: [0u8; 32],
+        state_block_number: 22_000_000,
+        signed_txs: vec![vec![0xAAu8; 80]],
+        coinbase_recipient: Address::ZERO,
+        coinbase_transfer_wei: U256::ZERO,
+        validity_block_min: 22_000_001,
+        validity_block_max: 22_000_005,
+    };
+    let receipt = relay
+        .submit_bundle(&bundle)
+        .await
+        .expect("D-T-E1-5: localhost submit_bundle must return Ok");
+    assert_eq!(receipt.relay_name, "flashbots");
+    assert_eq!(receipt.bundle_hash, "0xabcdef0123456789");
+    assert!(receipt.submitted_at_unix_ns > 0);
+
+    let received = server.received_requests().await.expect("wiremock recorded");
+    assert_eq!(received.len(), 1, "exactly one POST expected");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&received[0].body).expect("body is valid JSON");
+    let expected = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_sendBundle",
+        "params": [{
+            "txs": [format!("0x{}", "aa".repeat(80))],
+            "blockNumber": "0x14fb181"
+        }]
+    });
+    assert_eq!(parsed, expected, "eth_sendBundle envelope must match");
 }

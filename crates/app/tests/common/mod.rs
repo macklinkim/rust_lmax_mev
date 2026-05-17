@@ -48,6 +48,7 @@ pub fn make_config(tempdir: &std::path::Path) -> Config {
             ingress_journal_path: tempdir.join("ingress.log"),
             state_journal_path: tempdir.join("state.log"),
             mismatch_journal_path: tempdir.join("mismatch.bin"),
+            submission_journal_path: tempdir.join("submission.bin"),
         },
         bus: BusConfig { capacity: 8 },
         ingress: IngressConfig {

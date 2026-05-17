@@ -88,14 +88,53 @@ pub enum BundleRelayError {
     #[error("submit_bundle disabled in this build (Phase 5 Safety Gate required)")]
     SubmitDisabled,
 
-    /// P5-D DP-D3: Kill switch active — process-wide execution disabled.
+    /// P5-D DP-D3: Kill switch active -- process-wide execution disabled.
     /// The `Display` text contains literal `"kill switch active"` AND
     /// literal `"Phase 5 P5-D"` for the KS-3 BR-3-style spec-drift guard.
     /// PRECEDENCE: when a `submit_bundle` impl is wired to a kill switch
     /// (Phase 6), it MUST return this variant BEFORE returning
     /// `SubmitDisabled` if the kill switch is active.
-    #[error("kill switch active — Phase 5 P5-D execution disabled")]
+    #[error("kill switch active -- Phase 5 P5-D execution disabled")]
     KillSwitchActive,
+
+    /// P6B-E1 D-E1-2: adapter `submit_bundle` was called with a
+    /// configured endpoint whose URL host is NOT in
+    /// `{"127.0.0.1", "localhost", "::1"}`. Defense-in-depth with
+    /// `ConfigError::LiveSendRequiresLocalhostEndpoint`: even if a
+    /// non-localhost endpoint somehow bypasses the config validate
+    /// gate, the adapter fails-closed at runtime before any HTTP I/O.
+    /// PRECEDENCE: fires AFTER the kill-switch guard so an active
+    /// kill switch still reports `KillSwitchActive`. P6B-E2 is the
+    /// only path to unlocking non-localhost endpoints.
+    #[error(
+        "submit_bundle rejected: non-localhost relay endpoint not permitted until Phase 6b-E2"
+    )]
+    SubmitDisabledNonLocalhost,
+
+    /// P6B-E1 D-E1-2: the localhost HTTP POST to `eth_sendBundle`
+    /// failed at the transport or response-parse layer. Wraps
+    /// non-success status codes, body-read errors, and JSON-RPC
+    /// error envelopes. Payload-free per the workspace error
+    /// convention; details land in the journaled audit event (not
+    /// landed in P6B-E1; P6B-E2 may add).
+    #[error("submit_bundle HTTP transport failed")]
+    SubmitHttpFailed,
+}
+
+/// P6B-E1 D-E1-5: in-process broadcast envelope carrying everything
+/// `submission_driver` needs to run the G12 7-step chain INHERITING
+/// G13. `comparator_driver` builds this and broadcasts on
+/// `submission_tx` ONLY when its comparator match passes AND the
+/// upstream `signed_bytes` is `Some(_)`. The struct is in-process
+/// only (no rkyv / serde derives -- never journaled or sent over
+/// the wire).
+#[derive(Debug, Clone)]
+pub struct SubmissionAttempt {
+    /// Signed-bundle bytes ready for `eth_sendBundle`. The presence of
+    /// this field is the G12 Step 2 ("Signer Ok") structural witness.
+    /// `submission_driver` rejects iterations where the carrying
+    /// envelope omits this (defense-in-depth at the consumer side).
+    pub signed_bundle: SignedBundle,
 }
 
 /// Object-safe async trait for relay endpoints that expose both the

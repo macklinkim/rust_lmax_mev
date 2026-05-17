@@ -173,7 +173,7 @@ pub struct JournalConfig {
     pub ingress_journal_path: PathBuf,
     /// Phase 3 P3-B: target file for `FileJournal<StateUpdateEvent>`.
     pub state_journal_path: PathBuf,
-    /// Phase 4 P4-E: target file for `FileJournal<MismatchAbort>` —
+    /// Phase 4 P4-E: target file for `FileJournal<MismatchAbort>` --
     /// the comparator_driver appends a journaled abort record on every
     /// relay-sim mismatch BEFORE emitting any downstream broadcast
     /// (DP-E8 v0.4 synchronous-ordering guarantee). `#[serde(default)]`
@@ -181,10 +181,46 @@ pub struct JournalConfig {
     /// P4-E parse cleanly.
     #[serde(default = "default_mismatch_journal_path")]
     pub mismatch_journal_path: PathBuf,
+    /// P6B-E1 D-E1-7: target file for `FileJournal<SubmissionReceipt>`
+    /// -- the new `submission_driver` appends one receipt per
+    /// successful localhost-only `submit_bundle -> Ok(_)` BEFORE
+    /// acknowledging the loop iteration (mirrors the P4-E
+    /// mismatch-journal-before-broadcast pattern). `#[serde(default)]`
+    /// supplies `data/submission.bin` so existing TOML configs
+    /// predating P6B-E1 parse cleanly.
+    #[serde(default = "default_submission_journal_path")]
+    pub submission_journal_path: PathBuf,
 }
 
 fn default_mismatch_journal_path() -> PathBuf {
     PathBuf::from("data/mismatch.bin")
+}
+
+fn default_submission_journal_path() -> PathBuf {
+    PathBuf::from("data/submission.bin")
+}
+
+/// P6B-E1 D-E1-1 helper: returns `true` iff the endpoint URL's host
+/// is one of the localhost forms permitted in P6B-E1
+/// (`127.0.0.1`, `localhost`, `::1`). Parses the URL via the
+/// `url` crate (already a transitive dep through alloy); empty
+/// strings and unparseable URLs return `false` so the
+/// fail-closed disposition applies.
+pub(crate) fn is_localhost_endpoint(endpoint: &str) -> bool {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Parse via the `url` crate. The crate is a transitive dep of
+    // `alloy` and `reqwest`; pulling it directly here keeps the
+    // dependency edge explicit.
+    let Ok(parsed) = url::Url::parse(trimmed) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
 /// Event bus section per ADR-005. Capacity is a required tuning parameter
@@ -538,6 +574,21 @@ pub enum ConfigError {
     #[error("relay.live_send=true requires key_backend=HsmKms")]
     LiveSendRequiresHsmKms,
 
+    /// P6B-E1 D-E1-1: `relay.live_send = true` was set with a relay
+    /// endpoint whose URL host is NOT in
+    /// `{"127.0.0.1", "localhost", "::1"}`. The P6B-E1 dress
+    /// rehearsal binds to a localhost-only relay; non-localhost
+    /// endpoints are deferred to P6B-E2 (production-mainnet
+    /// submission), which requires its own separate user
+    /// re-authorization. Defense-in-depth: this validation
+    /// rejects at boot; `BundleRelayError::SubmitDisabledNonLocalhost`
+    /// rejects at adapter runtime even if config bypass is somehow
+    /// reached.
+    #[error(
+        "relay.live_send=true requires a localhost relay endpoint (127.0.0.1, localhost, or ::1)"
+    )]
+    LiveSendRequiresLocalhostEndpoint,
+
     /// Phase 4 P4-E: a relay endpoint string is empty.
     #[error("relay.enabled_relays[{index}].endpoint must be a non-empty URL")]
     EmptyRelayEndpoint { index: usize },
@@ -674,6 +725,22 @@ impl Config {
             && self.relay.key_backend != KeyBackend::HsmKms
         {
             return Err(ConfigError::LiveSendRequiresHsmKms);
+        }
+        // P6B-E1 D-E1-1: when live_send=true, ALL configured relay
+        // endpoints MUST resolve to a localhost host (127.0.0.1,
+        // localhost, ::1). The P6B-E2 unlock for non-localhost
+        // endpoints requires its own user re-authorization. Empty
+        // `enabled_relays` is permitted at this stage (no submission
+        // happens with 0 relays; comparator_driver runs inert per
+        // DP-E3). Defense-in-depth with the adapter-runtime check in
+        // `BundleRelayError::SubmitDisabledNonLocalhost`.
+        if self.relay.live_send {
+            for (idx, ep) in self.relay.enabled_relays.iter().enumerate() {
+                if !is_localhost_endpoint(&ep.endpoint) {
+                    let _ = idx;
+                    return Err(ConfigError::LiveSendRequiresLocalhostEndpoint);
+                }
+            }
         }
         // P6B-B D-B4 reject rule 1: Production profile requires HSM/KMS signer.
         if self.active_profile == Profile::Production
@@ -1479,5 +1546,51 @@ endpoint = ""
             matches!(err, ConfigError::ProductionProfileRequiresHsmKms),
             "expected ProductionProfileRequiresHsmKms; got {err:?}",
         );
+    }
+
+    /// D-T-E1-1: Production + HsmKms + live_send=true + NON-localhost
+    /// endpoint -> `Err(LiveSendRequiresLocalhostEndpoint)`. The new
+    /// P6B-E1 D-E1-1 validate-time gate fires AFTER the P6B-D
+    /// live-send-first reject pair; this combo passes those gates
+    /// (Production + HsmKms + non-empty audit_key_id), so the
+    /// localhost gate is the next reject the operator must clear.
+    #[test]
+    fn d_t_e1_1_non_localhost_endpoint_rejects() {
+        // Generic non-localhost URL placeholder. The test only proves
+        // the validator REJECTS non-localhost hosts when live_send=true,
+        // so the specific URL is irrelevant to the assertion +
+        // intentionally does not name any real production relay.
+        let toml = format!(
+            "active_profile = \"production\"\n{}\n[relay]\nkey_backend = \"hsmkms\"\naudit_key_id = \"k1\"\nlive_send = true\n[[relay.enabled_relays]]\nkind = \"flashbots\"\nendpoint = \"https://relay.example.invalid\"\n",
+            valid_minimum_toml()
+        );
+        let err = Config::from_toml_str(&toml)
+            .expect_err("D-T-E1-1: non-localhost endpoint + live_send=true must reject");
+        assert!(
+            matches!(err, ConfigError::LiveSendRequiresLocalhostEndpoint),
+            "D-T-E1-1: expected LiveSendRequiresLocalhostEndpoint; got {err:?}",
+        );
+    }
+
+    /// D-T-E1-2: Production + HsmKms + live_send=true + localhost
+    /// endpoint -> `Ok(_)`. Covers all 3 permitted host forms:
+    /// `127.0.0.1`, `localhost`, `[::1]`.
+    #[test]
+    fn d_t_e1_2_localhost_endpoints_accepted() {
+        for endpoint in &[
+            "http://127.0.0.1:9999",
+            "http://localhost:9999",
+            "http://[::1]:9999",
+        ] {
+            let toml = format!(
+                "active_profile = \"production\"\n{}\n[relay]\nkey_backend = \"hsmkms\"\naudit_key_id = \"k1\"\nlive_send = true\n[[relay.enabled_relays]]\nkind = \"flashbots\"\nendpoint = \"{}\"\n",
+                valid_minimum_toml(),
+                endpoint,
+            );
+            let cfg = Config::from_toml_str(&toml).unwrap_or_else(|e| {
+                panic!("D-T-E1-2: localhost endpoint `{endpoint}` must parse; got {e:?}")
+            });
+            assert!(cfg.relay.live_send);
+        }
     }
 }

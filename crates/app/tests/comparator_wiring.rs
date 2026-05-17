@@ -57,6 +57,7 @@ fn sample_outcome_envelope() -> EventEnvelope<SimulationOutcomeWithFingerprint> 
     let payload = SimulationOutcomeWithFingerprint {
         outcome,
         fingerprint,
+        signed_bundle: None,
     };
     let meta = PublishMeta {
         source: EventSource::Simulator,
@@ -106,25 +107,37 @@ fn cw_5_comparator_driver_takes_dyn_relay_simulator() {
     _cw_5_compile_check_comparator_driver_takes_dyn_relay_simulator(mock);
 }
 
-/// CW-3 source-byte grep: assert no `Arc<dyn BundleRelay>` /
-/// `dyn BundleRelay` / `submit_bundle(` calls in `crates/app/src/lib.rs`.
-/// Catches future PRs that reintroduce a forbidden trait-object form
-/// or a forbidden caller. Belt + suspenders alongside the manual
-/// `rg` gate at batch close.
+/// CW-3 source-byte grep at P6B-E1 close: the P4-E "0 hits" invariant
+/// is RELAXED to "exactly 1 documented call site" per the v0.1 plan
+/// lock (J): G3 grows 0 -> 1 (the new `submission_driver` task body's
+/// `submit_bundle(&attempt.signed_bundle)` call) and G4 grows 0 -> 1
+/// (the `Arc<dyn BundleRelay>` parameter of `submission_driver`).
+///
+/// The `dyn BundleRelay` substring appears in `lib.rs` only at the
+/// `submission_driver` signature, `build_bundle_relay_from_config`,
+/// and the `Option<Arc<dyn BundleRelay>>` plumbing into `wire_phase4`.
+/// This test counts occurrences and asserts an upper bound to catch
+/// future PRs that grow the surface beyond the documented set.
 #[test]
-fn cw_3_no_bundle_relay_object_or_submit_caller_in_app_src() {
+fn cw_3_bundle_relay_callsite_count_at_p6b_e1_close() {
     let src = include_str!("../src/lib.rs");
-    assert!(
-        !src.contains("Arc<dyn BundleRelay>"),
-        "CW-3: crates/app must not construct Arc<dyn BundleRelay>"
+    // P6B-E1: count `.submit_bundle(` METHOD invocations (not the
+    // bare `submit_bundle(` token which also appears in doc-comments
+    // referencing the symbol by name). Exactly 1 method call
+    // expected inside `submission_driver`.
+    let submit_method_call_count = src.matches(".submit_bundle(").count();
+    assert_eq!(
+        submit_method_call_count, 1,
+        "CW-3 P6B-E1: exactly 1 .submit_bundle( method call in crates/app/src/lib.rs (submission_driver); got {submit_method_call_count}",
     );
+    // The `submission_driver` parameter + the `build_bundle_relay_from_config`
+    // return type + the local binding + comments bring this to a small
+    // bounded number. The exact count can drift with cosmetic changes;
+    // assert an upper bound that catches an order-of-magnitude growth.
+    let dyn_bundle_relay_count = src.matches("dyn BundleRelay").count();
     assert!(
-        !src.contains("dyn BundleRelay"),
-        "CW-3: crates/app must not name dyn BundleRelay"
-    );
-    assert!(
-        !src.contains("submit_bundle("),
-        "CW-3: crates/app must not call submit_bundle"
+        dyn_bundle_relay_count <= 12,
+        "CW-3 P6B-E1: `dyn BundleRelay` mentions in crates/app/src/lib.rs grew unexpectedly; got {dyn_bundle_relay_count}",
     );
 }
 
@@ -144,10 +157,16 @@ async fn cw_1_happy_path_emits_mismatch_check_passed() {
 
     let bundle = Arc::new(BundleConstructor::new(BundleConfig::defaults()).expect("ctor"));
 
+    // P6B-E1 D-E1-6: comparator_driver now also takes a
+    // submission_tx Sender. Existing CW tests don't exercise the
+    // submission path; create a no-subscriber broadcast and drop the
+    // receiver immediately.
+    let (sub_tx, _) = tokio::sync::broadcast::channel(8);
     let driver = tokio::spawn(comparator_driver(
         sim_rx,
         cmp_tx.clone(),
         mismatch_tx,
+        sub_tx,
         Some(relay_sim),
         bundle,
         journal,
@@ -196,10 +215,12 @@ async fn cw_2_mismatch_path_journals_before_broadcast() {
 
     let bundle = Arc::new(BundleConstructor::new(BundleConfig::defaults()).expect("ctor"));
 
+    let (sub_tx_cw2, _) = tokio::sync::broadcast::channel(8);
     let driver = tokio::spawn(comparator_driver(
         sim_rx,
         cmp_tx,
         mismatch_tx.clone(),
+        sub_tx_cw2,
         Some(relay_sim),
         bundle,
         journal,
@@ -322,10 +343,12 @@ async fn cw_2_fail_journal_failure_suppresses_broadcast() {
         appends_attempted: Arc::clone(&appends_attempted),
     };
 
+    let (sub_tx_fail, _) = tokio::sync::broadcast::channel(8);
     let driver = tokio::spawn(comparator_driver(
         sim_rx,
         cmp_tx,
         mismatch_tx.clone(),
+        sub_tx_fail,
         Some(relay_sim),
         bundle,
         failing,
@@ -376,10 +399,12 @@ async fn ks_5_comparator_driver_kill_switch_suppresses_iteration() {
     // Kill switch ACTIVE from the start.
     let ks = KillSwitch::new(true);
 
+    let (sub_tx_ks, _) = tokio::sync::broadcast::channel(8);
     let driver = tokio::spawn(comparator_driver(
         sim_rx,
         cmp_tx.clone(),
         mismatch_tx.clone(),
+        sub_tx_ks,
         Some(relay_sim),
         bundle,
         journal,
