@@ -316,11 +316,18 @@ pub struct RelayConfig {
     /// Per-relay simulate timeout (ms). Default 2000ms per
     /// `relay_clients::DEFAULT_*_TIMEOUT_MS`.
     pub simulate_timeout_ms: u64,
-    /// **MUST be `false` in P4-E.** Validation rejects `true` with
-    /// `ConfigError::LiveSendForbidden`. The flag is NOT plumbed to
-    /// any code path in P4-E; the validation reject IS the only
-    /// safety mechanism per DP-E9 (defense in depth on top of the
-    /// `SubmitDisabled` impl + the no-caller invariant).
+    /// **`true` is permissible ONLY for the single legal combo**
+    /// `(Profile::Production, KeyBackend::HsmKms, non-empty audit_key_id)`
+    /// after P6B-D. Dev/Test/Shadow profiles continue to reject
+    /// `live_send=true` unconditionally with
+    /// `ConfigError::LiveSendRequiresProductionProfile`;
+    /// `Production` + non-`HsmKms` rejects with
+    /// `ConfigError::LiveSendRequiresHsmKms`. The flag is NOT plumbed
+    /// to any code path outside the config validation gate; the
+    /// runtime G12 step 7 / G13 inheritance assertion site is P6B-E
+    /// scope. The `SubmitDisabled` adapter impl + the 0-caller
+    /// invariant in `crates/app/src/` provide the runtime safety
+    /// chain at this batch close.
     pub live_send: bool,
     /// Kill-switch flag per execution-safety.md §"Kill Switch" +
     /// DP-E10. Default `false`. Read by the relay-clients code
@@ -508,11 +515,28 @@ pub enum ConfigError {
     #[error("journal paths must be distinct: {a} and {b} both point at the same file")]
     DuplicateJournalPath { a: &'static str, b: &'static str },
 
-    /// Phase 4 P4-E (DP-E9): `relay.live_send = true` is forbidden in
-    /// P4-E. Live submission lands at Phase 6b Production Gate per
-    /// docs/specs/execution-safety.md.
-    #[error("relay.live_send=true is forbidden until Phase 6b Production Gate")]
-    LiveSendForbidden,
+    /// P6B-D D-D1: `relay.live_send = true` was set with an
+    /// `active_profile` other than `Production`. Live submission is
+    /// scoped to the operator-controlled production profile by the
+    /// boundary doc Section 4 G13 contract; dev/test/shadow profiles
+    /// continue to reject `live_send=true` unconditionally. Fires
+    /// FIRST when the live-send-first evaluation order applies
+    /// (before the P6B-B `HsmKmsRequiresProductionProfile` reject).
+    /// Display contains no profile-specific or audit-id detail.
+    #[error("relay.live_send=true requires active_profile=Production")]
+    LiveSendRequiresProductionProfile,
+
+    /// P6B-D D-D1: `relay.live_send = true` was set with
+    /// `active_profile = Production` but `key_backend` is not
+    /// `HsmKms`. The single legal `live_send=true` combo is
+    /// `(Production, HsmKms, non-empty audit_key_id)`; any other
+    /// combination rejects. Fires before the P6B-B
+    /// `ProductionProfileRequiresHsmKms` reject under the
+    /// live-send-first evaluation order so the operator sees the
+    /// live-send-specific error message rather than the generic
+    /// Production-profile guard.
+    #[error("relay.live_send=true requires key_backend=HsmKms")]
+    LiveSendRequiresHsmKms,
 
     /// Phase 4 P4-E: a relay endpoint string is empty.
     #[error("relay.enabled_relays[{index}].endpoint must be a non-empty URL")]
@@ -634,14 +658,22 @@ impl Config {
             }
         }
 
-        // Phase 4 P4-E hard invariant per DP-E9 (defense-in-depth on
-        // top of SubmitDisabled + 0-callers grep gate): live_send=true
-        // is forbidden in P4-E. The flag is NOT plumbed to any code
-        // path in P4-E; this validation reject IS the only safety
-        // mechanism + the SubmitDisabled impl in every relay-clients
-        // adapter is the second.
-        if self.relay.live_send {
-            return Err(ConfigError::LiveSendForbidden);
+        // P6B-D D-D2 (replaces the P4-E absolute live_send-rejected branch).
+        // Live-send-first evaluation order: the two NEW live_send branches
+        // fire BEFORE the P6B-B reject chain below so the operator sees
+        // the live-send-specific error message rather than the generic
+        // (Profile, KeyBackend) guard. The boundary doc Section 4 G13
+        // ENFORCED subsection documents this contract. The flag is still
+        // NOT plumbed to any code path outside this validation gate;
+        // P6B-E owns the runtime G12 step 7 / G13 assertion site.
+        if self.relay.live_send && self.active_profile != Profile::Production {
+            return Err(ConfigError::LiveSendRequiresProductionProfile);
+        }
+        if self.relay.live_send
+            && self.active_profile == Profile::Production
+            && self.relay.key_backend != KeyBackend::HsmKms
+        {
+            return Err(ConfigError::LiveSendRequiresHsmKms);
         }
         // P6B-B D-B4 reject rule 1: Production profile requires HSM/KMS signer.
         if self.active_profile == Profile::Production
@@ -1036,13 +1068,14 @@ address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
         );
     }
 
-    /// CFG-LIVE-SEND-1 (DP-E9): `relay.live_send = true` is rejected
-    /// at config load with `ConfigError::LiveSendForbidden`. The
-    /// HARD INVARIANT live_send=false default is verified by the
-    /// existing minimum-valid TOML test (which omits `[relay]`
-    /// entirely → defaults apply → live_send = false).
+    /// D-T-D1 (P6B-D rewrite of CFG-LIVE-SEND-1): `relay.live_send = true`
+    /// with default Dev profile is rejected with the NEW
+    /// `LiveSendRequiresProductionProfile` variant per the live-send-first
+    /// evaluation order. The HARD INVARIANT `live_send=false` default is
+    /// verified by the minimum-valid TOML test (omitting `[relay]`
+    /// entirely yields `live_send=false`).
     #[test]
-    fn cfg_live_send_1_rejects_true() {
+    fn d_t_d1_dev_live_send_true_rejects_requires_production_profile() {
         let mut toml = valid_minimum_toml().to_string();
         toml.push_str(
             r#"
@@ -1055,11 +1088,111 @@ execution_disabled = false
 "#,
         );
         let err = Config::from_toml_str(&toml)
-            .expect_err("CFG-LIVE-SEND-1: live_send=true must be rejected");
+            .expect_err("D-T-D1: dev profile + live_send=true must reject");
         assert!(
-            matches!(err, ConfigError::LiveSendForbidden),
-            "CFG-LIVE-SEND-1: expected LiveSendForbidden; got {err:?}"
+            matches!(err, ConfigError::LiveSendRequiresProductionProfile),
+            "D-T-D1: expected LiveSendRequiresProductionProfile; got {err:?}"
         );
+    }
+
+    /// D-T-D2: Test profile + live_send=true rejects with
+    /// `LiveSendRequiresProductionProfile`.
+    #[test]
+    fn d_t_d2_test_live_send_true_rejects_requires_production_profile() {
+        let toml = format!(
+            "active_profile = \"test\"\n{}\n[relay]\nlive_send = true\n",
+            valid_minimum_toml()
+        );
+        let err = Config::from_toml_str(&toml)
+            .expect_err("D-T-D2: test profile + live_send=true must reject");
+        assert!(
+            matches!(err, ConfigError::LiveSendRequiresProductionProfile),
+            "D-T-D2: expected LiveSendRequiresProductionProfile; got {err:?}"
+        );
+    }
+
+    /// D-T-D3: Shadow profile + live_send=true rejects with
+    /// `LiveSendRequiresProductionProfile`.
+    #[test]
+    fn d_t_d3_shadow_live_send_true_rejects_requires_production_profile() {
+        let toml = format!(
+            "active_profile = \"shadow\"\n{}\n[relay]\nlive_send = true\n",
+            valid_minimum_toml()
+        );
+        let err = Config::from_toml_str(&toml)
+            .expect_err("D-T-D3: shadow profile + live_send=true must reject");
+        assert!(
+            matches!(err, ConfigError::LiveSendRequiresProductionProfile),
+            "D-T-D3: expected LiveSendRequiresProductionProfile; got {err:?}"
+        );
+    }
+
+    /// D-T-D4: Production + Disabled + live_send=true rejects with
+    /// `LiveSendRequiresHsmKms` (NOT the P6B-B
+    /// `ProductionProfileRequiresHsmKms`, because the live-send-first
+    /// branch fires first).
+    #[test]
+    fn d_t_d4_production_disabled_live_send_true_rejects_requires_hsmkms() {
+        let toml = format!(
+            "active_profile = \"production\"\n{}\n[relay]\nkey_backend = \"disabled\"\naudit_key_id = \"\"\nlive_send = true\n",
+            valid_minimum_toml()
+        );
+        let err = Config::from_toml_str(&toml).expect_err(
+            "D-T-D4: Production + Disabled + live_send=true must reject as LiveSendRequiresHsmKms",
+        );
+        assert!(
+            matches!(err, ConfigError::LiveSendRequiresHsmKms),
+            "D-T-D4: expected LiveSendRequiresHsmKms; got {err:?}"
+        );
+    }
+
+    /// D-T-D5: Production + HsmKms + non-empty audit_key_id + live_send=true
+    /// is the SINGLE legal `live_send=true` combo and MUST pass validation.
+    #[test]
+    fn d_t_d5_production_hsmkms_live_send_true_legal_combo_parses() {
+        let toml = format!(
+            "active_profile = \"production\"\n{}\n[relay]\nkey_backend = \"hsmkms\"\naudit_key_id = \"k1\"\nlive_send = true\n",
+            valid_minimum_toml()
+        );
+        let cfg = Config::from_toml_str(&toml)
+            .expect("D-T-D5: single legal live_send=true combo must parse");
+        assert_eq!(cfg.active_profile, Profile::Production);
+        assert_eq!(cfg.relay.key_backend, KeyBackend::HsmKms);
+        assert_eq!(cfg.relay.audit_key_id, "k1");
+        assert!(cfg.relay.live_send, "D-T-D5: live_send must be true");
+    }
+
+    /// D-T-D6: Production + HsmKms + live_send=false continues to pass
+    /// (P6B-CD baseline preserved). Sanity check that the v0.4
+    /// validate-body rewrite does not regress the no-flag path.
+    #[test]
+    fn d_t_d6_production_hsmkms_live_send_false_p6bcd_baseline_preserved() {
+        let toml = format!(
+            "active_profile = \"production\"\n{}\n[relay]\nkey_backend = \"hsmkms\"\naudit_key_id = \"k1\"\n",
+            valid_minimum_toml()
+        );
+        let cfg = Config::from_toml_str(&toml)
+            .expect("D-T-D6: Production + HsmKms + live_send=false must parse");
+        assert!(
+            !cfg.relay.live_send,
+            "D-T-D6: live_send default must remain false when omitted"
+        );
+    }
+
+    /// D-T-D7: All-defaults TOML preserves `live_send=false` and parses
+    /// successfully. Guards against any regression where the v0.4 rewrite
+    /// of the live_send reject branch accidentally changes default
+    /// resolution.
+    #[test]
+    fn d_t_d7_all_defaults_live_send_false_preserved() {
+        let cfg = Config::from_toml_str(valid_minimum_toml())
+            .expect("D-T-D7: minimum TOML must parse with defaults");
+        assert!(
+            !cfg.relay.live_send,
+            "D-T-D7: live_send default must be false"
+        );
+        assert_eq!(cfg.active_profile, Profile::Dev);
+        assert_eq!(cfg.relay.key_backend, KeyBackend::Disabled);
     }
 
     /// CFG-RELAY-1 (R-E23 v0.7): single relay endpoint parses; multi-

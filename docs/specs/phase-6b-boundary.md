@@ -25,7 +25,7 @@ Parent context:
 | HSI-5 | G2e | 2 `signer = { path = "../signer" }` dep edges | NEVER (v0.3 plan RECOMMENDS housing the new impl inside `crates/signer/`, keeping dep-edge count at 2) | -- | UNCHANGED (2 edges) |
 | HSI-6 | G3 | 0 `submit_bundle(` callers in `crates/app/src/` | P6B-E | Each new caller documented per file:line in Section 5; guarded by the **full 7-step G12 chain INHERITING G13** (kill-switch + signer Ok + local-sim Ok + relay-sim Ok + comparator Match + bundle-byte equality + runtime `live_send/profile/signer_kind` assertion) | UNCHANGED (0 callers) |
 | HSI-7 | G4 | 0 `dyn BundleRelay` / `Arc<dyn BundleRelay>` in `crates/app/src/` | P6B-E | Per-callsite decision recorded at P6B-E plan time; documented in Section 5 | UNCHANGED (0 hits) |
-| HSI-8 | G5 | `live_send=true` config-validation rejected for ALL profiles | P6B-D | Reject relaxed ONLY for the operator-controlled production profile AND ONLY when paired with `signer_kind == HsmKms`; dev/test/shadow continue to reject unconditionally | UNCHANGED (rejected for all profiles) |
+| HSI-8 | G5 | `live_send=true` config-validation rejected for ALL profiles | P6B-D | Reject relaxed ONLY for the operator-controlled production profile AND ONLY when paired with `key_backend == HsmKms` and non-empty `audit_key_id`; dev/test/shadow continue to reject unconditionally | RELAXED at P6B-D: `live_send=true` permissible only for `(Profile::Production, KeyBackend::HsmKms, non-empty audit_key_id)`; dev/test/shadow continue to reject unconditionally |
 | HSI-9 | G6 / G7 | `api_key` never in `tracing::*!`; `#[ignore]` count = 1 (P2-C carry-forward) | NEVER (G6); per-batch with explicit user approval (G7) | -- (G6); any live-network test added must be `#[ignore]`-gated + env-overlay opt-in | UNCHANGED |
 | HSI-10 | G8 / G9 | No workspace dep cycles; `KillSwitch` allow-list = `bundle-relay` + `app` + `relay-clients` | Per-batch as needed | All `KillSwitch` additions stay in the existing allow-list unless Section 5 extends it | UNCHANGED |
 | HSI-11 | G10 / G11 | G10: per-adapter `submit_bundle` first-statement kill-switch guard; G11: single `sign_tx` production call site at `crates/execution/src/lib.rs:238` | G10 REINFORCED (never relaxed) in P6B-E; G11 grows by additional callsites in P6B-E | G10: `Ok(_)` return path in P6B-E runs only after the guard passes + remains inactive throughout submission; G11: each new callsite documented in Section 5; routing through `&dyn Signer` preserved | UNCHANGED |
@@ -59,6 +59,17 @@ The table row for P6B-B in this section was authored before Codex review surface
 P6B-CD lands the sign-activation infrastructure: `BundleTx` EIP-1559 fee fields, an `alloy-rlp = "0.3"` unsigned + signed encoder, and a narrow `k256 = "0.13"` recovery-only carve-out per ADR-001 Amendment 2. `ProductionSigner::sign_tx` may now return `Ok(SignedTxBytes)` when ALL of: signer constructed via `from_aws_kms*`, `tx.from == derived_address`, `max_fee_per_gas >= max_priority_fee_per_gas`, KMS `sign_digest` succeeds, DER parses, low-s normalization completes, trial-recovery against the boot-time public key finds a matching `yParity in {0, 1}`. Every failure path emits an audited + counted outcome label exactly once (G15 contract preserved).
 
 **P6B-D `live_send=true` and P6B-E `submit_bundle Ok` + `eth_sendBundle` runtime remain locked behind P6B-CD impl close + separate user re-authorization per non-goal.** The `submit_bundle` adapters continue to return `Err(KillSwitchActive)` or `Err(SubmitDisabled)`. G3 + G4 stay at 0. G11 production runtime sign_tx call site count stays at 1 (the existing `#[cfg(test)] pub(crate) async fn invoke_signer_for_test` hook in `crates/execution/src/lib.rs`); the runtime caller path is P6B-E scope.
+
+### Section 3 amendment (added at P6B-D close, per APPROVED plan v0.4 at `dc5ca55`)
+
+P6B-D effectuates the boundary doc Section 4 G13 contract sketched at P6B-A. `Config::validate()` now permits `live_send=true` for the SINGLE legal combo `(Profile::Production, KeyBackend::HsmKms, non-empty audit_key_id)`; every other combination rejects. Two NEW `ConfigError` variants land:
+
+- `LiveSendRequiresProductionProfile` -- fires when `live_send=true` is set with any non-Production profile (Dev/Test/Shadow).
+- `LiveSendRequiresHsmKms` -- fires when `live_send=true` is set with `Profile::Production` but `key_backend != HsmKms`.
+
+The two new branches evaluate BEFORE the P6B-B reject chain (live-send-first ordering) so the operator sees the live-send-specific error message rather than the generic P6B-B Profile/KeyBackend guard. The P6B-B reject chain (`ProductionProfileRequiresHsmKms`, `HsmKmsRequiresProductionProfile`, `HsmKmsRequiresNonEmptyAuditKeyId`) continues to fire for the orthogonal `live_send=false` axis bit-for-bit unchanged.
+
+**P6B-E (`submit_bundle Ok` + `eth_sendBundle` runtime + actual relay submission) and P6B-F (Phase 6b DoD audit + `phase-6b-complete` annotated tag) REMAIN LOCKED.** The runtime safety chain at P6B-D close: `submit_bundle` adapters still return `Err(KillSwitchActive)` or `Err(SubmitDisabled)`; G3 + G4 stay at 0; G11 production runtime sign_tx call site count stays at 1 (test-only `invoke_signer_for_test` hook); G14 stays at 5 doc-comment hits; NO new app-side read of `config.relay.live_send` anywhere in `crates/app/src/`. The validation flip is necessary-but-not-sufficient for live submission; P6B-E owns the runtime G12 step 7 / G13 inheritance assertion site.
 
 ## Section 4 -- New Phase 6b G-gates
 
@@ -96,10 +107,11 @@ rg -n --type rust 'live_send' crates/config/src/
 
 At P6B-A close: same as `phase-6a-complete` baseline -- `crates/config/src/lib.rs:282` field declaration, `:295` default `false`, `:426` error variant, `:535` reject guard, surrounding doc comments. **No change at P6B-A close.**
 
-At P6B-D close (PROPOSED logic; LOCKED at P6B-D plan time):
+PROPOSED at P6B-A authoring time (operative field name in `crates/config/src/lib.rs::RelayConfig` is `key_backend`, NOT `signer_kind`; the pseudo-field below is the boundary doc's earlier draft wording, preserved for historical reference):
 
 ```text
-// PROPOSED P6B-D logic (NOT THIS BATCH; documented here for boundary contract only):
+// PROPOSED P6B-A boundary-contract sketch (operative names corrected in
+// the ENFORCED subsection below):
 // if self.relay.live_send && self.active_profile != Profile::Production {
 //     return Err(...);
 // }
@@ -109,7 +121,29 @@ At P6B-D close (PROPOSED logic; LOCKED at P6B-D plan time):
 // }
 ```
 
-The exact gating logic is finalized at P6B-D plan time. G13 locks the contract that ANY relaxation of the `live_send` reject MUST gate on (a) `active_profile == Production` AND (b) `signer_kind == HsmKms`. Dev / test / shadow continue to reject `live_send=true` unconditionally.
+The exact gating logic was finalized at P6B-D plan time + landed at P6B-D close (see the ENFORCED subsection below). G13 locks the contract that ANY relaxation of the `live_send` reject MUST gate on (a) `active_profile == Production` AND (b) HSM/KMS-backed signer.
+
+**At P6B-D close (ENFORCED at commit `dc5ca55`-derived impl):**
+
+`Config::validate()` in `crates/config/src/lib.rs` evaluates the live-send-first reject pair BEFORE the P6B-B reject chain:
+
+```rust
+// P6B-D D-D2 (replaces the P4-E absolute LiveSendForbidden reject):
+if self.relay.live_send && self.active_profile != Profile::Production {
+    return Err(ConfigError::LiveSendRequiresProductionProfile);
+}
+if self.relay.live_send
+    && self.active_profile == Profile::Production
+    && self.relay.key_backend != KeyBackend::HsmKms
+{
+    return Err(ConfigError::LiveSendRequiresHsmKms);
+}
+// ... P6B-B reject chain unchanged below ...
+```
+
+Note the operative field name is `key_backend` (NOT the boundary doc's pre-P6B-D pseudo-field `signer_kind`). The single legal `live_send=true` combo is `(Profile::Production, KeyBackend::HsmKms, non-empty audit_key_id)`; the `audit_key_id` non-empty constraint is enforced by the P6B-B `HsmKmsRequiresNonEmptyAuditKeyId` reject that fires AFTER the two new live-send-first branches (the Production+HsmKms+empty+live_send=true row falls through both new branches because both predicates are false, and hits the P6B-B reject). Dev / test / shadow continue to reject `live_send=true` unconditionally regardless of `key_backend`.
+
+`ConfigError::LiveSendForbidden` was REMOVED at P6B-D close as a deliberate workspace-local source-level break; the post-rename `rg -n 'LiveSendForbidden' crates/` returns 0 hits.
 
 ### G14 -- eth_sendBundle runtime call documentation
 
