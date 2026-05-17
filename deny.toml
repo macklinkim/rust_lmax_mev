@@ -20,6 +20,33 @@ ignore = [
     # by alloy 0.8's macro stack; out of our control until alloy
     # migrates.
     "RUSTSEC-2024-0436",
+    # RUSTSEC-2026-0098 / 0099 / 0104: three rustls-webpki 0.101.7
+    # advisories pulled transitively via aws-smithy-http-client 1.1.12
+    # -> rustls 0.21.12 -> rustls-webpki 0.101.7 (only the AWS SDK
+    # chain is still on the old rustls stack; the workspace ALSO
+    # pulls rustls-webpki 0.103.13 via reqwest + hyper-rustls 0.27.9,
+    # which is non-vulnerable). Reachability analysis:
+    # - 2026-0098 (URI name constraints accepted): rustls-webpki does
+    #   NOT expose any URI assertion API per the advisory text; no
+    #   caller in this workspace can reach the bug.
+    # - 2026-0099 (wildcard cert under DNS name constraint): would
+    #   require the AWS KMS endpoint to be served by a cert with a
+    #   wildcard SAN under a permitted-subtree name constraint; AWS
+    #   PCA misissuance is outside the operator threat model.
+    # - 2026-0104 (CRL parsing panic): aws-sdk-kms's HTTPS path does
+    #   not parse user-controlled CRLs (uses OCSP-or-none); the
+    #   panic is unreachable in this code path.
+    # Default-runtime fail-closed posture additionally shields the
+    # codepath: wire_phase4 injects DisabledSigner, so the
+    # ProductionSigner -> aws-sdk-kms HTTPS pipeline is never
+    # executed unless an operator explicitly wires the production
+    # signer.
+    # Revisit trigger: when aws-sdk-kms / aws-smithy-http-client
+    # publishes a release that uses rustls-webpki >= 0.103.12, bump
+    # the dep and REMOVE these three ignores in the same commit.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
 ]
 
 [licenses]
