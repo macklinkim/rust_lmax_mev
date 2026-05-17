@@ -977,6 +977,128 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // D-T-CD5: sign_tx HAPPY PATH returns Ok(SignedTxBytes) using the
+    // off-tree precomputed positive recovery vector from
+    // `crate::recovery::pos_vector`. The mock's `get_public_key_der`
+    // returns the SubjectPublicKeyInfo derived from POS_PUBKEY_SEC1_65;
+    // the mock's `sign_digest` returns POS_DER_SIGNATURE; the
+    // BundleTx is the `minimal_tx`-shaped fixture whose canonical RLP
+    // preimage hashes to POS_DIGEST. sign_tx assembles the full
+    // EIP-1559 type-2 signed-tx bytes. Asserts:
+    //   - Ok(SignedTxBytes(_)) returned (NOT Err);
+    //   - bytes start with 0x02 (type-2 envelope);
+    //   - bytes are deterministic across two runs;
+    //   - outcome="ok" audit + counter emitted.
+    // ------------------------------------------------------------------
+    #[test]
+    fn d_t_cd5_sign_tx_happy_path_returns_deterministic_ok() {
+        use crate::recovery::pos_vector::{
+            POS_DERIVED_ADDRESS, POS_DER_SIGNATURE, POS_PUBKEY_SEC1_65,
+        };
+        // SubjectPublicKeyInfo DER for the off-tree precomputed key:
+        // reuse the workspace's expected 24-byte prefix and append
+        // POS_PUBKEY_SEC1_65[1..65] (= X || Y).
+        let mut spki_der = Vec::with_capacity(88);
+        spki_der.extend_from_slice(
+            b"\x30\x56\x30\x10\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x05\x2b\x81\x04\x00\x0a\x03\x42\x00\x04",
+        );
+        spki_der.extend_from_slice(&POS_PUBKEY_SEC1_65[1..]);
+        assert_eq!(spki_der.len(), 88);
+
+        let mut mock_state = MockKmsSigningClient::ok(spki_der);
+        mock_state.sign_response = Ok(POS_DER_SIGNATURE.to_vec());
+        let mock = Arc::new(mock_state);
+
+        // BundleTx shape MUST match `rlp::tests::minimal_tx()` so the
+        // preimage hashes to POS_DIGEST. from = POS_DERIVED_ADDRESS so
+        // the address-consistency check passes.
+        let build_tx = || {
+            BundleTx::new(
+                Address::from(POS_DERIVED_ADDRESS),
+                Address::from([0x11u8; 20]),
+                U256::ZERO,
+                Vec::new(),
+                21_000,
+                0,
+                1,
+                0,
+                U256::from(1u64),
+                U256::from(2u64),
+            )
+        };
+
+        let (events_run1, bytes_run1) = {
+            let mut bytes = None;
+            let events = capture_events(|| {
+                let rt = current_thread_rt();
+                rt.block_on(async {
+                    let signer = ProductionSigner::from_aws_kms_with_client(
+                        "happy-path-id".to_string(),
+                        SigningAuditThresholds::default(),
+                        mock.clone(),
+                    )
+                    .await
+                    .expect("ctor success");
+                    assert_eq!(
+                        signer.derived_address(),
+                        Some(Address::from(POS_DERIVED_ADDRESS)),
+                        "derived_address must equal the off-tree precomputed value",
+                    );
+                    let tx = build_tx();
+                    let result = signer.sign_tx(&tx).await;
+                    let signed = result.expect("sign_tx must return Ok");
+                    bytes = Some(signed.0);
+                });
+            });
+            (events, bytes.unwrap())
+        };
+
+        // Type-2 envelope.
+        assert_eq!(bytes_run1[0], 0x02, "type-2 envelope byte");
+        // Length sanity: 1 envelope + RLP list header + body. The list
+        // body is 31 unsigned-payload bytes + y_parity(1) + r(33) +
+        // s(33) = 98 bytes. Outer header for payload=98 is 2 bytes
+        // (0xf8 0x62). Total = 1 + 2 + 98 = 101 bytes.
+        assert_eq!(bytes_run1.len(), 101, "signed tx total length");
+
+        // outcome="ok" audit + counter emitted.
+        let ok_audit = events_run1
+            .iter()
+            .find(|e| {
+                e.target == "production_signer_audit"
+                    && fields_to_map(e).get("outcome").copied() == Some("ok")
+            })
+            .expect("one ok audit event expected");
+        assert_eq!(fields_to_map(ok_audit).get("outcome").copied(), Some("ok"));
+
+        // Determinism: a fresh signer + signer call MUST produce the
+        // same signed bytes (no nonce, no clock, no randomness in the
+        // workspace path; KMS mock is deterministic).
+        let (_events_run2, bytes_run2) = {
+            let mut bytes = None;
+            let events = capture_events(|| {
+                let rt = current_thread_rt();
+                rt.block_on(async {
+                    let signer = ProductionSigner::from_aws_kms_with_client(
+                        "happy-path-id".to_string(),
+                        SigningAuditThresholds::default(),
+                        mock.clone(),
+                    )
+                    .await
+                    .expect("ctor success");
+                    let tx = build_tx();
+                    bytes = Some(signer.sign_tx(&tx).await.unwrap().0);
+                });
+            });
+            (events, bytes.unwrap())
+        };
+        assert_eq!(
+            bytes_run1, bytes_run2,
+            "sign_tx output must be deterministic"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // D-T-CD-INVALID-BUNDLE: sign_tx with max_fee_per_gas <
     // max_priority_fee_per_gas -> Err(InvalidBundleTx); outcome=
     // invalid_bundle_tx audit + counter emitted. (Covers the
