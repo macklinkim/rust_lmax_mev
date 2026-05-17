@@ -112,12 +112,41 @@ async fn d_t_e2_3_submission_driver_journals_bundle_hash_mismatch() {
     drop(sub_tx);
     let _ = tokio::time::timeout(Duration::from_millis(500), driver).await;
 
-    // Journal must contain at least one record (the mismatch envelope).
-    let journal_bytes = std::fs::read(&journal_path).expect("journal readable");
+    // P6B-F NOTE-3 strengthening: open a fresh FileJournal handle over
+    // the on-disk path and iterate the records. Asserts the actual
+    // mismatch semantics: exactly one journaled receipt; the relay-
+    // returned `bundle_hash` differs from the locally-computed keccak
+    // (`local_bundle_hash`). Removing the keccak compare logic in
+    // `submission_driver` would make these assertions fail.
+    let journal_ro: FileJournal<SubmissionReceipt> =
+        FileJournal::open(&journal_path).expect("journal re-open for read");
+    let records: Vec<SubmissionReceipt> = journal_ro
+        .iter_all()
+        .map(|r| r.expect("journal record decodes").payload().clone())
+        .collect();
+    assert_eq!(
+        records.len(),
+        1,
+        "D-T-E2-3: exactly one journaled mismatch record expected; got {}",
+        records.len()
+    );
+    let rec = &records[0];
+    assert_eq!(
+        rec.bundle_hash, "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "D-T-E2-3: relay-returned bundle_hash must round-trip into the journaled receipt"
+    );
     assert!(
-        journal_bytes.len() > 64,
-        "D-T-E2-3: mismatch must be journaled; got {} bytes",
-        journal_bytes.len()
+        !rec.local_bundle_hash.is_empty(),
+        "D-T-E2-3: local_bundle_hash must be populated on mismatch record"
+    );
+    assert_ne!(
+        rec.local_bundle_hash, rec.bundle_hash,
+        "D-T-E2-3: mismatch record MUST have local_bundle_hash != bundle_hash"
+    );
+    assert!(
+        rec.local_bundle_hash.starts_with("0x") && rec.local_bundle_hash.len() == 66,
+        "D-T-E2-3: local_bundle_hash must be lowercase 0x-prefixed 32-byte hex; got {:?}",
+        rec.local_bundle_hash
     );
 }
 

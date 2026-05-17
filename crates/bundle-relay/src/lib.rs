@@ -133,6 +133,15 @@ pub enum BundleRelayError {
     /// parsed; the mismatch record is appended to the submission journal
     /// with `local_bundle_hash` populated before the next iteration.
     /// Payload-free per the workspace error convention.
+    ///
+    /// **P6B-F NOTE-2 (audit-note follow-up)**: this variant is
+    /// intentionally reserved -- it is referenced only by the
+    /// `submission_driver` WARN log path and is NOT returned by any
+    /// production code at P6B-F close (the keccak compare is a soft
+    /// audit gate; the journaled mismatch record is the durable signal).
+    /// A downstream consumer that wants a hard-fail policy on
+    /// bundle-hash divergence can promote this variant to a return
+    /// value in a future batch without ABI churn (Q-E2-3 lock).
     #[error("bundle hash mismatch: relay-returned hash != local keccak")]
     BundleHashMismatch,
 }

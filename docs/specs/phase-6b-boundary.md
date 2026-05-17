@@ -115,6 +115,14 @@ At P6B-E2 close (default config, no operator overrides):
 - `key_backend = Disabled` -> `wire_phase4` injects `DisabledSigner` -> `sign_for_outcome` returns `Err(SignerDisabled)` -> `simulator_driver` skips -> no envelope flows downstream -> no submission attempt.
 - `submit_bundle` runtime path is the only Ok-source for `SubmissionReceipt`; the keccak check at the driver guarantees the journaled record is either a verified match or an audited mismatch.
 
+**P6B-F note-1 (Bloxroute operator wiring contract)**: `BloxrouteRelay::submit_bundle` Ok-path requires the adapter to have been constructed with a non-empty `api_key`. When the operator omits `api_key` from `RelayEndpointConfig`, the adapter ctor still succeeds (the inner `http: Option<Client>` stays `None`) but every `submit_bundle` call returns `Err(SubmitHttpFailed)` -- a third fail-closed layer beneath the kill-switch + localhost gates. Operators wiring a real HSM/KMS-backed `ProductionSigner` for Bloxroute MUST also configure `api_key` as an environment secret (per the Phase 6b operator-runbook conventions referenced by `production-signer.md` Section 2.4); without it, the chain stops at `SubmitHttpFailed` and no live submission is possible regardless of the other gates.
+
+**P6B-F note-4 (placeholder BundleTx as a 2-step safety chain)**: `BundleConstructor::sign_for_outcome` constructs a placeholder `BundleTx::new(Address::ZERO, Address::ZERO, ...)` and feeds it to `signer.sign_tx`. Together with the default `DisabledSigner` injection in `wire_phase4`, this gives a 2-step safety chain:
+- **Step 1** (default fail-closed): `DisabledSigner::sign_tx` returns `Err(SignerError::SignerDisabled)` unconditionally -> `simulator_driver` iteration-skip.
+- **Step 2** (defense-in-depth when operator wires a real signer): `ProductionSigner::sign_tx` rejects with `Err(SignerError::AddressMismatch)` because `tx.from == Address::ZERO != derived_address` -- the audited per-attempt counter records `address_mismatch`. No `Ok(SignedTxBytes)` can flow until the placeholder is replaced.
+
+A future batch that introduces a real `BundleTx::from` (real builder coinbase + populated calldata) removes Step 2; that batch MUST simultaneously add a different control point (e.g., transaction-shape validator, explicit operator confirmation, or a per-attempt rate-limit) so the post-replacement chain stays as defensive as the pre-replacement chain.
+
 ## Section 4 -- New Phase 6b G-gates
 
 ### G12 -- submit_bundle caller pre-check chain (G12 INHERITS G13)
