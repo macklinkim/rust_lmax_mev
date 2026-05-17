@@ -1,0 +1,53 @@
+# P6B-C v0.3 D-C5: Sample Prometheus Alertmanager rules for the
+# Section 2.5 candidate #4 Operator-Visible Signing Audit Log control.
+#
+# The workspace emits:
+#   - counter production_signer_audit_attempts_total{outcome}
+#     (outcomes at P6B-C close: not_configured, address_mismatch;
+#      a future sign-activation batch will add ok, hsm_error, etc.)
+#   - gauge   production_signer_audit_alert_threshold_max_attempts_per_minute
+#   - gauge   production_signer_audit_alert_threshold_max_failed_per_minute
+#
+# The threshold gauges carry the operator-configured values from the
+# workspace TOML `[relay.signing_audit_alert]` section. The rules below
+# reference the gauges (NOT hardcoded scalar thresholds) so the alert
+# ceiling is managed by the workspace config, not by editing this YAML.
+#
+# Codex APPROVED HIGH advisory at v0.3 review:
+#   `> on() <gauge>` requires both sides of the comparison to have an
+#   empty label set. The counter rate is therefore wrapped in `sum(...)`
+#   to drop the `outcome` label before the comparison. Gauge value `0`
+#   means the operator left the threshold disabled; alerts using these
+#   expressions will not fire while the gauge is `0` (rate cannot
+#   exceed 0 except when there is signing traffic, which is itself the
+#   condition operators care about).
+#
+# This file is illustrative. Operators copy + adapt to their own
+# Alertmanager / Prometheus deployment. The workspace ships only the
+# metric source and the configurable thresholds; the dashboard
+# rendering + alert routing are operator infrastructure.
+
+groups:
+  - name: production-signer-audit
+    rules:
+      - alert: SigningAttemptRateHigh
+        expr: |
+          sum(rate(production_signer_audit_attempts_total[1m])) * 60
+          > on() production_signer_audit_alert_threshold_max_attempts_per_minute
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Signing attempt rate exceeded configured threshold (Section 2.5 candidate #4)"
+          description: "production_signer_audit_attempts_total per-minute rate exceeded the operator-configured max_attempts_per_minute gauge."
+
+      - alert: SigningFailureRateHigh
+        expr: |
+          sum(rate(production_signer_audit_attempts_total{outcome!="not_configured"}[1m])) * 60
+          > on() production_signer_audit_alert_threshold_max_failed_per_minute
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Signing failure rate exceeded configured threshold (Section 2.5 candidate #4)"
+          description: "Non-not_configured-outcome signing-attempt rate exceeded the operator-configured max_failed_per_minute gauge. At P6B-C close, the only non-not_configured outcome is address_mismatch (host-compromise-requested signing on a bundle whose tx.from disagrees with the KMS-derived address)."

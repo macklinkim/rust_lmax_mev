@@ -31,7 +31,9 @@ use rust_lmax_mev_risk::RiskGate;
 // AND even then `sign_tx` returns `Err(SignerError::NotConfigured)` until
 // P6B-C wires the HSM/KMS SDK + signing-call.
 // See `docs/specs/phase-6a-boundary.md` §2.2 + `docs/specs/phase-6b-boundary.md` §2.
-use rust_lmax_mev_signer::{DisabledSigner, ProductionSigner, Signer};
+use rust_lmax_mev_signer::{
+    DisabledSigner, ProductionSigner, Signer, SignerError, SigningAuditThresholds,
+};
 use rust_lmax_mev_simulator::LocalSimulator;
 use rust_lmax_mev_state::{PoolId, StateEngine, StateError};
 use rust_lmax_mev_types::SmokeTestPayload;
@@ -78,6 +80,15 @@ pub enum AppError {
     /// `rust_lmax_mev_state::StateError`.
     #[error("state error: {0}")]
     State(#[from] StateError),
+
+    /// P6B-C v0.3 D-C5: `ProductionSigner::from_aws_kms(...)` factory
+    /// failure (AWS SDK init, `GetPublicKey` RPC, DER/SPKI prefix /
+    /// length / marker validation). The wrapped `SignerError` is
+    /// payload-free per `production-signer.md` Section 2.3(b); its
+    /// `Display` text contains no AWS-credential / public-key /
+    /// signature-bytes substring.
+    #[error("production signer init failed: {0}")]
+    ProductionSignerInit(SignerError),
 }
 
 /// Optional knobs for [`wire`]. The production [`run`] always passes
@@ -192,10 +203,27 @@ pub fn run(config_path: impl AsRef<Path>) -> Result<(), AppError> {
     // `ProductionSigner::sign_tx` returns `Err(SignerError::NotConfigured)`
     // (stub; P6B-C wires the HSM/KMS SDK + signing-call).
     // See `docs/specs/phase-6a-boundary.md` §2.2 + `docs/specs/phase-6b-boundary.md` §2.
+    // P6B-C v0.3 D-C5: HsmKms arm wires the AWS-KMS-backed boot path.
+    // `from_aws_kms(...)` performs the `GetPublicKey` call, derives the
+    // active Ethereum address, emits the boot-time audit-safe identifier
+    // tracing event, and emits the Prometheus threshold gauges carrying
+    // the configured `[relay.signing_audit_alert]` values. The returned
+    // `ProductionSigner` still fail-closes inside `sign_tx`: future
+    // approved sign-activation batch is the only path to `Ok(_)`.
     let signer: Arc<dyn Signer> = match config.relay.key_backend {
         rust_lmax_mev_config::KeyBackend::Disabled => Arc::new(DisabledSigner),
         rust_lmax_mev_config::KeyBackend::HsmKms => {
-            Arc::new(ProductionSigner::new(config.relay.audit_key_id.clone()))
+            let thresholds = SigningAuditThresholds {
+                max_attempts_per_minute: config.relay.signing_audit_alert.max_attempts_per_minute,
+                max_failed_per_minute: config.relay.signing_audit_alert.max_failed_per_minute,
+            };
+            let signer = runtime
+                .block_on(ProductionSigner::from_aws_kms(
+                    config.relay.audit_key_id.clone(),
+                    thresholds,
+                ))
+                .map_err(AppError::ProductionSignerInit)?;
+            Arc::new(signer)
         }
     };
     let handle = runtime.block_on(wire_phase4(&config, WireOptions::default(), signer))?;

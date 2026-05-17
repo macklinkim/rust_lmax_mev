@@ -1,30 +1,40 @@
-//! Phase 5 P5-C signer boundary + fail-closed stub.
+//! Phase 5 P5-C signer boundary + Phase 6b P6B-B/P6B-C
+//! pre-activation infrastructure.
 //!
 //! Per the user-approved P5-C execution note v0.3 §DP-C1..DP-C11 +
-//! SC-1..5 + Codex APPROVED HIGH 2026-05-10 KST.
+//! SC-1..5 + Codex APPROVED HIGH 2026-05-10 KST, extended by
+//! P6B-B v0.5 + P6B-C v0.3 APPROVED HIGH at commit `3e803c2` +
+//! explicit user re-authorization for P6B-C implementation.
 //!
-//! Boundary-only crate. Defines the signer surface that Phase 6b
-//! Production Gate will populate with a real HSM/KMS-backed
-//! implementation. Phase 5 ships exactly one impl, [`DisabledSigner`],
-//! whose every signing attempt returns
-//! [`SignerError::SignerDisabled`] unconditionally.
+//! `crates/signer` exposes the [`Signer`] trait, the `Phase 6a`
+//! fail-closed [`DisabledSigner`] impl, and the P6B-B / P6B-C
+//! pre-activation production signer [`ProductionSigner`] whose
+//! `sign_tx` is STILL fail-closed: it returns
+//! [`SignerError::AddressMismatch`] (KMS-built path with mismatched
+//! `from`) or [`SignerError::NotConfigured`] (every other case). It
+//! NEVER returns `Ok(_)` at P6B-C close. The HSM/KMS `sign_digest`
+//! call is wired on a `pub(crate)` trait but is NEVER invoked from
+//! `sign_tx`; the future approved sign-activation batch flips it.
 //!
-//! No production signer, no key derivation, no ECDSA-library or
-//! wallet-library symbols anywhere in the workspace, no key material
-//! in repo / tests / fixtures / configs / env examples, no app wiring.
-//! Phase 6b Production Gate is the only path to a real signer.
+//! No production signer that returns `Ok(_)`, no key derivation, no
+//! ECDSA-library or wallet-library symbols anywhere in the workspace,
+//! no key material in repo / tests / fixtures / configs / env
+//! examples, no app live-action surface. Phase 6b sign-activation
+//! batch is the only path to a real `Ok(SignedTxBytes)` return.
 //! (See plan DP-C7 G2a/G2b/G2d for the enforcement greps.)
 
 mod bundle_tx;
 mod disabled;
 mod error;
+mod kms_aws;
+mod kms_client;
 pub mod production;
 mod signer_trait;
 
 pub use bundle_tx::{BundleTx, SignedTxBytes};
 pub use disabled::DisabledSigner;
 pub use error::SignerError;
-pub use production::ProductionSigner;
+pub use production::{ProductionSigner, SigningAuditThresholds};
 pub use signer_trait::Signer;
 
 #[cfg(test)]
@@ -46,10 +56,7 @@ mod tests {
         )
     }
 
-    /// SC-1: fail-closed contract. Exercises both `Default::default()` ctor
-    /// path (DP-C5: `DisabledSigner` derives `Default`) and the unit-struct
-    /// literal path. Uses an `assert_eq!` directly because `SignerError`
-    /// derives `PartialEq + Eq` per DP-C4 / R-C8.
+    /// SC-1: fail-closed contract.
     #[tokio::test]
     async fn sc1_disabled_signer_always_errors() {
         let via_default: DisabledSigner = Default::default();
@@ -80,8 +87,7 @@ mod tests {
         assert_eq!(c, Err(SignerError::SignerDisabled));
     }
 
-    /// SC-3: spec-drift guard — `Display` MUST contain the literal
-    /// "Phase 6b Production Gate".
+    /// SC-3: spec-drift guard.
     #[test]
     fn sc3_signer_disabled_display_pins_phase_6b_phrase() {
         let rendered = format!("{}", SignerError::SignerDisabled);
@@ -93,8 +99,7 @@ mod tests {
         );
     }
 
-    /// SC-4: trait object-safety — `Box<dyn Signer>` constructible
-    /// and usable through the trait object.
+    /// SC-4: trait object-safety.
     #[tokio::test]
     async fn sc4_signer_is_object_safe() {
         let boxed: Box<dyn Signer> = Box::new(DisabledSigner);
@@ -102,9 +107,7 @@ mod tests {
         assert_eq!(boxed.sign_tx(&tx).await, Err(SignerError::SignerDisabled));
     }
 
-    /// SC-5: `BundleTx::new(...)` ctor accessibility despite
-    /// `#[non_exhaustive]`; `BundleTx` + `SignedTxBytes` round-trip
-    /// through `Clone + PartialEq + Eq`.
+    /// SC-5: boundary types round-trip.
     #[test]
     fn sc5_boundary_types_round_trip() {
         let tx = sample_tx();

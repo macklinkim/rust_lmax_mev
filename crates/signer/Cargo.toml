@@ -4,14 +4,21 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Phase 5 fail-closed signer boundary stub. Production signing requires Phase 6b Production Gate."
+description = "Phase 5 fail-closed signer boundary stub + P6B-B/P6B-C pre-activation HSM/KMS infrastructure. Production signing requires future approved sign-activation batch."
 
 [dependencies]
 alloy-primitives = { workspace = true }
 async-trait      = { workspace = true }
+metrics          = { workspace = true }
 thiserror        = { workspace = true }
 tracing          = { workspace = true }
 
+# P6B-C v0.3 D-C1 (locked versions; G2b verified post-add via
+# `cargo tree -e features -p rust-lmax-mev-signer | rg 'secp256k1|k256|alloy-signer|ethers-signers'`).
+aws-config  = { version = "1.6", features = ["behavior-version-latest"] }
+aws-sdk-kms = "1.65"
+
 [dev-dependencies]
+metrics-util       = "0.17"
 tokio              = { workspace = true }
 tracing-subscriber = { workspace = true }

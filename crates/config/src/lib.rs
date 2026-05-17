@@ -340,6 +340,18 @@ pub struct RelayConfig {
     /// `key_backend=HsmKms` requires a non-empty value per the
     /// `HsmKmsRequiresNonEmptyAuditKeyId` validation rule.
     pub audit_key_id: String,
+    /// P6B-C v0.3 D-C5: operator-visible signing-audit alert
+    /// thresholds. Defaults to zeros (disabled). The workspace emits
+    /// these values as Prometheus gauges
+    /// `production_signer_audit_alert_threshold_max_attempts_per_minute`
+    /// and `production_signer_audit_alert_threshold_max_failed_per_minute`
+    /// at `ProductionSigner` boot so operator Alertmanager rules can
+    /// reference them. The sample at
+    /// `config/examples/signing-audit-alert.yaml` shows the pattern;
+    /// `crates/app` maps this into the signer-local
+    /// `SigningAuditThresholds` at boot.
+    #[serde(default)]
+    pub signing_audit_alert: SigningAuditAlertConfig,
 }
 
 impl Default for RelayConfig {
@@ -351,8 +363,24 @@ impl Default for RelayConfig {
             execution_disabled: false,
             key_backend: KeyBackend::Disabled,
             audit_key_id: String::new(),
+            signing_audit_alert: SigningAuditAlertConfig::default(),
         }
     }
+}
+
+/// P6B-C v0.3 D-C5: operator-visible signing-audit alert thresholds.
+/// `max_attempts_per_minute = 0` (resp. `max_failed_per_minute = 0`)
+/// means the operator has not configured an alert ceiling. The values
+/// are surfaced as Prometheus gauges so Alertmanager rules can
+/// reference them; the workspace itself does NOT enforce the rate at
+/// runtime (operator policy lives in Alertmanager). `crates/signer`
+/// remains config-crate-independent; `crates/app` re-shapes this into
+/// `rust_lmax_mev_signer::SigningAuditThresholds` at boot.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct SigningAuditAlertConfig {
+    pub max_attempts_per_minute: u32,
+    pub max_failed_per_minute: u32,
 }
 
 /// One relay endpoint entry. The `kind` selects which adapter to
@@ -1266,5 +1294,57 @@ endpoint = ""
         // Compile-asserts Default impls return the expected variants.
         assert_eq!(Profile::default(), Profile::Dev);
         assert_eq!(KeyBackend::default(), KeyBackend::Disabled);
+    }
+
+    /// P6B-C v0.3 D-T-C6: `[relay.signing_audit_alert]` serde defaults
+    /// and non-zero parsing; preserves the P6B-B reject set unchanged.
+    #[test]
+    fn signing_audit_alert_serde_defaults_and_non_zero_parsing() {
+        // Defaults: omitting [relay.signing_audit_alert] yields 0/0.
+        let cfg = Config::from_toml_str(valid_minimum_toml()).expect("minimum TOML must parse");
+        assert_eq!(
+            cfg.relay.signing_audit_alert,
+            SigningAuditAlertConfig::default(),
+            "signing_audit_alert default must be (0, 0)",
+        );
+        assert_eq!(cfg.relay.signing_audit_alert.max_attempts_per_minute, 0);
+        assert_eq!(cfg.relay.signing_audit_alert.max_failed_per_minute, 0);
+
+        // Non-zero values parse.
+        let with_thresholds = format!(
+            "{}\n[relay.signing_audit_alert]\nmax_attempts_per_minute = 600\nmax_failed_per_minute = 60\n",
+            valid_minimum_toml()
+        );
+        let cfg = Config::from_toml_str(&with_thresholds).expect("non-zero thresholds must parse");
+        assert_eq!(cfg.relay.signing_audit_alert.max_attempts_per_minute, 600);
+        assert_eq!(cfg.relay.signing_audit_alert.max_failed_per_minute, 60);
+
+        // Unknown subfield is rejected (deny_unknown_fields).
+        let with_typo = format!(
+            "{}\n[relay.signing_audit_alert]\nmax_attemps_per_minute = 600\n",
+            valid_minimum_toml()
+        );
+        let err = Config::from_toml_str(&with_typo)
+            .expect_err("deny_unknown_fields must reject typo in signing_audit_alert");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("max_attemps_per_minute") || rendered.contains("unknown field"),
+            "expected deny_unknown_fields rejection for typo; got {rendered}",
+        );
+
+        // P6B-B reject rules unchanged: (Production, Disabled, *) -> ProductionProfileRequiresHsmKms.
+        // Smoke-check rather than re-running the full P6B-B matrix.
+        // active_profile must be at the top (before any [section]) per
+        // the P6B-B `make_toml` pattern.
+        let reject_toml = format!(
+            "active_profile = \"production\"\n{}\n[relay]\nkey_backend = \"disabled\"\naudit_key_id = \"\"\n[relay.signing_audit_alert]\nmax_attempts_per_minute = 600\nmax_failed_per_minute = 60\n",
+            valid_minimum_toml()
+        );
+        let err = Config::from_toml_str(&reject_toml)
+            .expect_err("Production + Disabled must reject even with signing_audit_alert set");
+        assert!(
+            matches!(err, ConfigError::ProductionProfileRequiresHsmKms),
+            "expected ProductionProfileRequiresHsmKms; got {err:?}",
+        );
     }
 }

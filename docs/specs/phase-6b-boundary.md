@@ -45,6 +45,15 @@ ALL ELEVEN HSI stay UNCHANGED at P6B-A close.
 
 **Reordering is forbidden.** Skipping a batch is forbidden. The user-authorization-per-non-goal model (Phase 6b overview v0.2 prerequisite table item #1) enforces the order at the human level; the per-batch Codex pre-impl review enforces the order at the artifact level.
 
+### Section 3 reconciliation (added at P6B-C v0.3 close, Codex APPROVED HIGH)
+
+The table row for P6B-B in this section was authored before Codex review surfaced two architectural blockers (`BundleTx` lacks EIP-1559 fee fields needed for unsigned-tx RLP construction; AWS KMS returns DER ECDSA signatures without an Ethereum recovery id, computing `v` requires either a G2b-approved recovery-only crypto-library carve-out or a different signer service). As a result:
+
+- **P6B-B (closed at `df96ac8`) and P6B-C (closed at the implementation commit for this v0.3 plan) are jointly classified as PRE-ACTIVATION signer infrastructure batches.** Neither batch alone, nor both together, gives `ProductionSigner::sign_tx` an `Ok(SignedTxBytes)` return path. At the close of each, `sign_tx` returns `Err(SignerError::NotConfigured)` (legacy `new(...)` path AND `from_aws_kms(...)` path with matching `from`) or `Err(SignerError::AddressMismatch)` (`from_aws_kms(...)` path with mismatched `from`).
+- **A future approved sign-activation batch (name + scope locked at that batch's plan time) MUST close before P6B-D or P6B-E may begin.** That batch must extend `BundleTx` with EIP-1559 fee fields, land an RLP encoder, resolve the DER -> `(r, s, v)` recovery question without violating G2b, and flip `sign_tx` to `Ok(_)` under matched-address + successful-sign conditions. The batch requires fresh explicit user re-authorization per the Phase 6b overview prerequisite #1 ("Fresh explicit user authorization per non-goal").
+- **P6B-D `live_send=true` capability flip and P6B-E `eth_sendBundle` runtime + actual relay submission BOTH remain locked behind the sign-activation batch.** The chain of locks is: P6B-C (HSM-wired ctor, no sign) -> future sign-activation batch (`sign_tx -> Ok`) -> P6B-D (`live_send=true` relaxation) -> P6B-E (`submit_bundle -> Ok` + `eth_sendBundle` runtime caller).
+- Reordering this revised chain is forbidden under the same Section 7 ban that governs the original P6B-A..F sequence.
+
 ## Section 4 -- New Phase 6b G-gates
 
 ### G12 -- submit_bundle caller pre-check chain (G12 INHERITS G13)
@@ -107,6 +116,28 @@ rg -n --type rust 'eth_sendBundle' crates/
 At P6B-A close: 5 `//!` doc-comment hits (HSI-1 baseline). **No change at P6B-A close.**
 
 At P6B-E close: every non-doc-comment runtime reference in `crates/` MUST be documented per file:line in Section 5 + guarded by the G12 chain. The 5 existing `//!` doc-comment hits stay; their text may be updated to reflect Phase 6b unlock semantics.
+
+### G15 -- production-signer audit-surface contract (added at P6B-C v0.3 close)
+
+Per `docs/specs/production-signer.md` Section 2.4 + Section 2.5 candidate #4 ("Operator-visible signing audit log"). At P6B-C close the workspace ships the audit-log SURFACE -- the operator's dashboard + Alertmanager stack scrape it. The four required surfaces below MUST stay in place across any later Phase 6b batch:
+
+1. **Boot-time audit-safe identifier.** `ProductionSigner::from_aws_kms(...)` emits exactly one `tracing::info!` event at construction with `target = "production_signer_boot"`, `event = "production_signer_initialized"`, and structured fields `audit_key_id` + `derived_address`. No field name contains a key-material-shaped substring (`private`, `secret`, `priv`, `seed`, `funded`). Section 2.4 satisfaction.
+2. **Per-attempt counter.** Every `ProductionSigner::sign_tx` call increments `production_signer_audit_attempts_total{outcome}` exactly once. Outcomes at P6B-C close: `not_configured`, `address_mismatch`. The future sign-activation batch will add `ok`, `hsm_error`, etc.; the metric name + label key stay stable.
+3. **Threshold gauges.** `ProductionSigner::from_aws_kms*` emits the two gauges `production_signer_audit_alert_threshold_max_attempts_per_minute` + `production_signer_audit_alert_threshold_max_failed_per_minute` carrying the operator-configured values from `[relay.signing_audit_alert]`. Gauge value `0` = operator left the threshold disabled.
+4. **Sample Alertmanager rule.** `config/examples/signing-audit-alert.yaml` references the threshold gauges in PromQL alert expressions (NOT hardcoded scalars). Operators copy + adapt to their stack. The sample is illustrative; the workspace does not ship dashboard rendering.
+
+Verbatim ripgrep + presence gates at P6B-C close:
+
+```text
+rg -n 'production_signer_boot' crates/signer/src/                         # >= 1 hit
+rg -n 'production_signer_audit_attempts_total' crates/signer/src/         # >= 1 hit
+rg -n 'production_signer_audit_alert_threshold_max_attempts_per_minute' crates/signer/src/   # >= 1 hit
+rg -n 'production_signer_audit_alert_threshold_max_failed_per_minute' crates/signer/src/     # >= 1 hit
+rg -n 'signing_audit_alert' crates/config/src/                            # >= 1 hit
+ls config/examples/signing-audit-alert.yaml                               # file exists
+```
+
+Any later Phase 6b batch that removes any of these four surfaces re-opens Section 2.5 candidate #4 and is a P6B-F audit blocker.
 
 ## Section 5 -- Per-callsite documentation requirement
 
