@@ -44,4 +44,25 @@ pub enum SignerError {
     /// in the upstream `bundle_correlation_id`-linked audit chain).
     #[error("signer address mismatch")]
     AddressMismatch,
+    /// P6B-CD D-CD5: AWS KMS `Sign` call failed (network error,
+    /// permission denied, KMS service error). Display is fixed text;
+    /// no AWS SDK error body / public-key bytes / signature bytes
+    /// rendered.
+    #[error("kms sign call failed")]
+    KmsSignFailed,
+    /// P6B-CD D-CD5: DER signature bytes returned by AWS KMS failed
+    /// to parse as a valid ECDSA signature. Display is fixed text.
+    #[error("kms signature is not a valid ECDSA signature")]
+    InvalidSignatureBytes,
+    /// P6B-CD D-CD5: ECDSA trial-recovery did not find a `yParity`
+    /// in `{0, 1}` that recovers to the boot-time-derived public key.
+    /// Indicates either a KMS misconfiguration (wrong key signed),
+    /// signature tampering, or a workspace bug. Display is fixed text.
+    #[error("kms signature did not recover to derived address")]
+    SignatureRecoveryFailed,
+    /// P6B-CD D-CD5: pre-sign `BundleTx` invariant violated
+    /// (currently: `max_fee_per_gas < max_priority_fee_per_gas`).
+    /// Display is fixed text; no fee values rendered.
+    #[error("bundle tx invariants violated")]
+    InvalidBundleTx,
 }

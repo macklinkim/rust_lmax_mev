@@ -388,6 +388,8 @@ mod construct_tests {
             0,
             1,
             0,
+            U256::ZERO, // max_priority_fee_per_gas (P6B-CD)
+            U256::ZERO, // max_fee_per_gas (P6B-CD)
         );
         let result = ctor.invoke_signer_for_test(&tx).await;
         assert_eq!(result, Err(SignerError::SignerDisabled));

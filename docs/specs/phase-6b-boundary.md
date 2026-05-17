@@ -54,6 +54,12 @@ The table row for P6B-B in this section was authored before Codex review surface
 - **P6B-D `live_send=true` capability flip and P6B-E `eth_sendBundle` runtime + actual relay submission BOTH remain locked behind the sign-activation batch.** The chain of locks is: P6B-C (HSM-wired ctor, no sign) -> future sign-activation batch (`sign_tx -> Ok`) -> P6B-D (`live_send=true` relaxation) -> P6B-E (`submit_bundle -> Ok` + `eth_sendBundle` runtime caller).
 - Reordering this revised chain is forbidden under the same Section 7 ban that governs the original P6B-A..F sequence.
 
+### Section 3 amendment (added at P6B-CD v0.4 close, per APPROVED plan at `c9451c2`)
+
+P6B-CD lands the sign-activation infrastructure: `BundleTx` EIP-1559 fee fields, an `alloy-rlp = "0.3"` unsigned + signed encoder, and a narrow `k256 = "0.13"` recovery-only carve-out per ADR-001 Amendment 2. `ProductionSigner::sign_tx` may now return `Ok(SignedTxBytes)` when ALL of: signer constructed via `from_aws_kms*`, `tx.from == derived_address`, `max_fee_per_gas >= max_priority_fee_per_gas`, KMS `sign_digest` succeeds, DER parses, low-s normalization completes, trial-recovery against the boot-time public key finds a matching `yParity in {0, 1}`. Every failure path emits an audited + counted outcome label exactly once (G15 contract preserved).
+
+**P6B-D `live_send=true` and P6B-E `submit_bundle Ok` + `eth_sendBundle` runtime remain locked behind P6B-CD impl close + separate user re-authorization per non-goal.** The `submit_bundle` adapters continue to return `Err(KillSwitchActive)` or `Err(SubmitDisabled)`. G3 + G4 stay at 0. G11 production runtime sign_tx call site count stays at 1 (the existing `#[cfg(test)] pub(crate) async fn invoke_signer_for_test` hook in `crates/execution/src/lib.rs`); the runtime caller path is P6B-E scope.
+
 ## Section 4 -- New Phase 6b G-gates
 
 ### G12 -- submit_bundle caller pre-check chain (G12 INHERITS G13)
@@ -138,6 +144,34 @@ ls config/examples/signing-audit-alert.yaml                               # file
 ```
 
 Any later Phase 6b batch that removes any of these four surfaces re-opens Section 2.5 candidate #4 and is a P6B-F audit blocker.
+
+**P6B-CD v0.4 outcome-label expansion**: the per-attempt counter's outcome-label set grows by 5 labels at P6B-CD close: `ok`, `kms_sign_failed`, `invalid_bundle_tx`, `invalid_signature_bytes`, `signature_recovery_failed`. The full 7-label set at P6B-CD close is `{not_configured, address_mismatch, invalid_bundle_tx, kms_sign_failed, invalid_signature_bytes, signature_recovery_failed, ok}`. The sample Alertmanager YAML's `SigningFailureRateHigh` matcher narrows to the 5-failure positive enumeration `{outcome=~"address_mismatch|invalid_bundle_tx|kms_sign_failed|invalid_signature_bytes|signature_recovery_failed"}` (excludes `ok` and `not_configured`); `SigningAttemptRateHigh` continues to scrape the full 7-label set as the operator-attack-surface signal.
+
+### G2f -- narrow k256 surface allow-list (added at P6B-CD v0.4 close)
+
+Permitted k256 symbols inside `crates/signer/src/recovery.rs`: `k256::ecdsa::{Signature, RecoveryId, VerifyingKey}` and `k256::PublicKey`. Forbidden absolute (in ANY `crates/*.rs` file): `k256::SecretKey`, `k256::ecdsa::SigningKey`, `k256::Scalar`, `k256::FieldElement`, `k256::ProjectivePoint`, `k256::AffinePoint`, `k256::elliptic_curve::*`.
+
+Verbatim ripgrep gate (must return 0 hits absolute):
+
+```text
+rg -n -e 'k256::(SecretKey|ecdsa::SigningKey|Scalar|FieldElement|ProjectivePoint|AffinePoint|elliptic_curve)' crates/ --glob '*.rs'
+```
+
+Positive grep (must return >= 1 hit):
+
+```text
+rg -n 'use k256::' crates/signer/src/recovery.rs
+```
+
+### G2g -- absolute ban on signing-key constructors / test-key bytes (added at P6B-CD v0.4 close, R-7)
+
+Verbatim ripgrep gate (must return 0 hits absolute, including `#[cfg(test)]` files):
+
+```text
+rg -n -e 'test_key|TEST_KEY|TEST_PRIV|TEST_PRIVATE|SecretKey|SigningKey|from_bytes_be|from_slice_be|::random\(|::generate\(' crates/ --glob '*.rs'
+```
+
+Tests that need a known-good ECDSA recovery vector consume ONLY non-secret material (preimage, digest, signed-tx bytes, `r`, `s`, `y_parity`, precomputed-off-tree SEC1 public-key bytes, DER signature bytes); private-key derivation -- even from a published source -- happens OFF-TREE and only the non-secret outputs are pasted into the repo. Relaxing G2g requires its own ADR-001 amendment.
 
 ## Section 5 -- Per-callsite documentation requirement
 

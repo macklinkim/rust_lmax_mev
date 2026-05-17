@@ -1,10 +1,17 @@
-# P6B-C v0.3 D-C5: Sample Prometheus Alertmanager rules for the
-# Section 2.5 candidate #4 Operator-Visible Signing Audit Log control.
+# P6B-C v0.3 D-C5 + P6B-CD v0.4 D-CD9 narrowing.
+# Sample Prometheus Alertmanager rules for the Section 2.5 candidate
+# #4 Operator-Visible Signing Audit Log control.
 #
 # The workspace emits:
 #   - counter production_signer_audit_attempts_total{outcome}
-#     (outcomes at P6B-C close: not_configured, address_mismatch;
-#      a future sign-activation batch will add ok, hsm_error, etc.)
+#     Outcomes at P6B-CD close (7-label set):
+#       not_configured              (no live KMS attached)
+#       address_mismatch            (failure: bundle from-address invariant)
+#       invalid_bundle_tx           (failure: fee-field invariant)
+#       kms_sign_failed             (failure: KMS Sign call error)
+#       invalid_signature_bytes     (failure: DER parse error)
+#       signature_recovery_failed   (failure: trial-recovery did not match pubkey)
+#       ok                          (success)
 #   - gauge   production_signer_audit_alert_threshold_max_attempts_per_minute
 #   - gauge   production_signer_audit_alert_threshold_max_failed_per_minute
 #
@@ -51,7 +58,7 @@ groups:
       - alert: SigningFailureRateHigh
         expr: |
           (
-            (sum(rate(production_signer_audit_attempts_total{outcome!="not_configured"}[1m])) * 60)
+            (sum(rate(production_signer_audit_attempts_total{outcome=~"address_mismatch|invalid_bundle_tx|kms_sign_failed|invalid_signature_bytes|signature_recovery_failed"}[1m])) * 60)
             > on() production_signer_audit_alert_threshold_max_failed_per_minute
           )
           and on() (production_signer_audit_alert_threshold_max_failed_per_minute > 0)
@@ -60,4 +67,4 @@ groups:
           severity: critical
         annotations:
           summary: "Signing failure rate exceeded configured threshold (Section 2.5 candidate #4)"
-          description: "Non-not_configured-outcome signing-attempt rate exceeded the operator-configured max_failed_per_minute gauge. Rule is gated on the gauge being > 0; a gauge value of 0 means the operator disabled this alert. At P6B-C close, the only non-not_configured outcome is address_mismatch (host-compromise-requested signing on a bundle whose tx.from disagrees with the KMS-derived address)."
+          description: "Sum-of-failure-outcome (address_mismatch, invalid_bundle_tx, kms_sign_failed, invalid_signature_bytes, signature_recovery_failed) signing-attempt rate exceeded the operator-configured max_failed_per_minute gauge. The ok outcome is EXCLUDED from this rule by construction; not_configured is excluded as a fail-closed no-op state. Rule is gated on the gauge being > 0; a gauge value of 0 means the operator disabled this alert."

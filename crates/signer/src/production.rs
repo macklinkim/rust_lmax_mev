@@ -66,18 +66,25 @@ pub struct SigningAuditThresholds {
 /// address and KMS client (only when constructed through
 /// `from_aws_kms*`), and the operator-configured alert thresholds.
 ///
-/// NO raw private-key bytes. NO `[u8; 32]` private-key field. NO
-/// `SecretKey`-style type. NO key fingerprint as a struct field.
+/// NO raw private-key bytes. NO `[u8; 32]` private-key field.
+/// no opaque private-key-byte struct field of any shape. NO key
+/// fingerprint as a struct field. (P6B-CD v0.4 R-9 cleanup: prior
+/// wording removed to keep G2g at 0 hits absolute; invariant
+/// preserved verbatim.)
 #[derive(Debug, Clone)]
 pub struct ProductionSigner {
     audit_key_id: String,
     derived_address: Option<Address>,
-    /// `client` is held for the future approved sign-activation batch
-    /// (it stores the `Arc<dyn KmsSigningClient>` that the future
-    /// `sign_tx -> Ok(_)` path will route through). Not read in P6B-C
-    /// because `sign_tx` is fail-closed; `#[allow(dead_code)]` is
-    /// required at the non-test crate build level.
-    #[allow(dead_code)]
+    /// P6B-CD D-CD6: SEC1-uncompressed public-key bytes
+    /// (`0x04 || x || y`, 65 bytes) captured at boot alongside
+    /// `derived_address`. Used by `sign_tx`'s recovery cross-check.
+    /// NOT key material per `production-signer.md` Section 2.3(b):
+    /// public-key bytes are non-secret.
+    pubkey_sec1_65: Option<[u8; 65]>,
+    /// `client` holds the `Arc<dyn KmsSigningClient>` used by
+    /// `sign_tx`'s P6B-CD Ok-path. Field is `Option` so the legacy
+    /// `new(...)` ctor (no HSM connection) destructures to `None`
+    /// and falls through to `Err(NotConfigured)`.
     client: Option<Arc<dyn KmsSigningClient>>,
     /// `thresholds` are consumed at boot to emit the Prometheus
     /// threshold gauges; the field is held so a future config-reload
@@ -95,6 +102,7 @@ impl ProductionSigner {
         Self {
             audit_key_id,
             derived_address: None,
+            pubkey_sec1_65: None,
             client: None,
             thresholds: SigningAuditThresholds::default(),
         }
@@ -142,7 +150,8 @@ impl ProductionSigner {
             .get_public_key_der(&audit_key_id)
             .await
             .map_err(|_| SignerError::ClientInit)?;
-        let derived_address = parse_ec_pubkey_der_to_address(&der)?;
+        let pubkey_sec1_65 = parse_ec_pubkey_der_to_sec1_65(&der)?;
+        let derived_address = derive_address_from_sec1_65(&pubkey_sec1_65);
 
         info!(
             target: "production_signer_boot",
@@ -159,6 +168,7 @@ impl ProductionSigner {
         Ok(Self {
             audit_key_id,
             derived_address: Some(derived_address),
+            pubkey_sec1_65: Some(pubkey_sec1_65),
             client: Some(client),
             thresholds,
         })
@@ -181,34 +191,92 @@ impl ProductionSigner {
 
 #[async_trait]
 impl Signer for ProductionSigner {
-    /// P6B-C v0.3 D-C3 fail-closed body.
-    ///
-    /// Pre-sign address-consistency check fires FIRST when the signer
-    /// was constructed through `from_aws_kms*` (i.e.,
-    /// `derived_address.is_some()`). The legacy `new()` path skips the
-    /// check and falls through to the P6B-B `NotConfigured` baseline.
-    /// `Ok(_)` is unreachable; the KMS `sign_digest` is never called
-    /// from this function.
+    /// P6B-CD v0.4 D-CD6 body. `Ok(SignedTxBytes)` is now reachable
+    /// when ALL of: signer was built via `from_aws_kms*`,
+    /// `tx.from == derived_address`, `max_fee_per_gas >=
+    /// max_priority_fee_per_gas`, KMS `sign_digest` succeeds, DER
+    /// parses, low-s normalization completes, and trial-recovery
+    /// against `pubkey_sec1_65` finds a matching `yParity in {0, 1}`.
+    /// Every return path emits an audited + counted outcome label
+    /// exactly once (G15 contract). No `expect(...)` / `unwrap()` /
+    /// `panic!()` on any path.
     async fn sign_tx(&self, tx: &BundleTx) -> Result<SignedTxBytes, SignerError> {
+        // P6B-C invariant: address consistency.
         if let Some(derived) = self.derived_address {
             if tx.from != derived {
                 emit_attempt_audit(self, tx, "address_mismatch");
-                metrics::counter!(
-                    "production_signer_audit_attempts_total",
-                    "outcome" => "address_mismatch",
-                )
-                .increment(1);
+                counter_increment("address_mismatch");
                 return Err(SignerError::AddressMismatch);
             }
         }
-        emit_attempt_audit(self, tx, "not_configured");
-        metrics::counter!(
-            "production_signer_audit_attempts_total",
-            "outcome" => "not_configured",
-        )
-        .increment(1);
-        Err(SignerError::NotConfigured)
+        // P6B-CD: legacy `new(...)` path OR any boot path where the
+        // three KMS-derived Options are not jointly Some(...) stays
+        // NotConfigured. `from_aws_kms_with_client` is the only setter
+        // and sets all three atomically; this destructure is the single
+        // fail-closed entry for "no live KMS attached". No panic path.
+        let (Some(client), Some(_derived), Some(pubkey_sec1_65)) = (
+            self.client.as_ref(),
+            self.derived_address,
+            self.pubkey_sec1_65,
+        ) else {
+            emit_attempt_audit(self, tx, "not_configured");
+            counter_increment("not_configured");
+            return Err(SignerError::NotConfigured);
+        };
+
+        // P6B-CD bundle-tx invariant check.
+        if tx.max_fee_per_gas < tx.max_priority_fee_per_gas {
+            emit_attempt_audit(self, tx, "invalid_bundle_tx");
+            counter_increment("invalid_bundle_tx");
+            return Err(SignerError::InvalidBundleTx);
+        }
+
+        // P6B-CD encode + sign.
+        let preimage = crate::rlp::encode_eip1559_unsigned(tx);
+        let digest = keccak256(&preimage);
+        let der = match client.sign_digest(&self.audit_key_id, &digest.0).await {
+            Ok(d) => d,
+            Err(_) => {
+                emit_attempt_audit(self, tx, "kms_sign_failed");
+                counter_increment("kms_sign_failed");
+                return Err(SignerError::KmsSignFailed);
+            }
+        };
+
+        // R-2: DER parse failure is audited + counted.
+        let (r, s) = match crate::recovery::parse_der_to_rs(&der) {
+            Ok(rs) => rs,
+            Err(_) => {
+                emit_attempt_audit(self, tx, "invalid_signature_bytes");
+                counter_increment("invalid_signature_bytes");
+                return Err(SignerError::InvalidSignatureBytes);
+            }
+        };
+
+        // R-2: trial-recovery failure is audited + counted.
+        let y_parity = match crate::recovery::recover_y_parity(&digest.0, r, s, &pubkey_sec1_65) {
+            Ok(v) => v,
+            Err(_) => {
+                emit_attempt_audit(self, tx, "signature_recovery_failed");
+                counter_increment("signature_recovery_failed");
+                return Err(SignerError::SignatureRecoveryFailed);
+            }
+        };
+
+        // P6B-CD assemble signed bytes.
+        let signed = crate::rlp::encode_eip1559_signed(tx, y_parity, &r, &s);
+        emit_attempt_audit(self, tx, "ok");
+        counter_increment("ok");
+        Ok(SignedTxBytes(signed))
     }
+}
+
+fn counter_increment(outcome: &'static str) {
+    metrics::counter!(
+        "production_signer_audit_attempts_total",
+        "outcome" => outcome,
+    )
+    .increment(1);
 }
 
 /// P6B-C v0.3 D-C2 DER/SPKI parser.
@@ -225,7 +293,13 @@ impl Signer for ProductionSigner {
 ///
 /// Any prefix mismatch, length mismatch, or marker mismatch returns
 /// `Err(SignerError::ClientInit)` with no panic.
-fn parse_ec_pubkey_der_to_address(der: &[u8]) -> Result<Address, SignerError> {
+///
+/// P6B-CD D-CD6 refactor: returns the SEC1-uncompressed point bytes
+/// `0x04 || x || y` (65 bytes) instead of the derived `Address`. The
+/// boot path derives the address via [`derive_address_from_sec1_65`]
+/// and stores BOTH on the signer (the SEC1 bytes are needed by
+/// `recover_y_parity` at sign time).
+fn parse_ec_pubkey_der_to_sec1_65(der: &[u8]) -> Result<[u8; 65], SignerError> {
     // Expected DER for AWS KMS `ECC_SECG_P256K1` `GetPublicKey` response:
     //
     //   30 56                            ; SEQUENCE (86 bytes)
@@ -236,22 +310,32 @@ fn parse_ec_pubkey_der_to_address(der: &[u8]) -> Result<Address, SignerError> {
     //     04                             ; SEC1 uncompressed-point marker
     //     <32 bytes X> <32 bytes Y>
     //
-    // Total: 88 bytes. The 24-byte prefix is fixed for the K1 curve;
-    // bytes 24..56 = X, 56..88 = Y. The check below is byte-literal;
-    // no ASN.1 parser dependency is introduced (G2b clean).
-    const EXPECTED_PREFIX: &[u8; 24] = b"\x30\x56\x30\x10\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x05\x2b\x81\x04\x00\x0a\x03\x42\x00\x04";
+    // Total: 88 bytes. The 23-byte fixed prefix is followed by the
+    // 0x04 SEC1 marker at offset 23; bytes 23..88 are the
+    // SEC1-uncompressed point (0x04 || x || y). Byte-literal check;
+    // no ASN.1 parser dependency.
+    const EXPECTED_PREFIX_TO_MARKER: &[u8; 24] = b"\x30\x56\x30\x10\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x05\x2b\x81\x04\x00\x0a\x03\x42\x00\x04";
     const EXPECTED_LEN: usize = 88;
+    const SEC1_OFFSET: usize = 23; // byte index of the 0x04 SEC1 marker
 
     if der.len() != EXPECTED_LEN {
         return Err(SignerError::ClientInit);
     }
-    if &der[..EXPECTED_PREFIX.len()] != EXPECTED_PREFIX.as_slice() {
+    if &der[..EXPECTED_PREFIX_TO_MARKER.len()] != EXPECTED_PREFIX_TO_MARKER.as_slice() {
         return Err(SignerError::ClientInit);
     }
-    let point_xy = &der[EXPECTED_PREFIX.len()..];
-    debug_assert_eq!(point_xy.len(), 64);
-    let digest = keccak256(point_xy);
-    Ok(Address::from_slice(&digest.as_slice()[12..]))
+    let mut sec1 = [0u8; 65];
+    sec1.copy_from_slice(&der[SEC1_OFFSET..EXPECTED_LEN]);
+    debug_assert_eq!(sec1[0], 0x04);
+    Ok(sec1)
+}
+
+/// Derive an Ethereum `Address` from SEC1-uncompressed point bytes
+/// `0x04 || x || y` via `keccak256(x || y)[12..32]`. Public-key
+/// derivation is non-secret per `production-signer.md` Section 2.3(b).
+fn derive_address_from_sec1_65(sec1_65: &[u8; 65]) -> Address {
+    let digest = keccak256(&sec1_65[1..]);
+    Address::from_slice(&digest.as_slice()[12..])
 }
 
 /// Emit the structured `tracing::info!` audit event for one
@@ -447,7 +531,27 @@ mod tests {
             7,
             1,
             0xDEAD_BEEFu64,
+            U256::from(1u64), // max_priority_fee_per_gas
+            U256::from(2u64), // max_fee_per_gas
         )
+    }
+
+    /// Hand-crafted structurally-valid DER for an ECDSA signature
+    /// with (r=[0x01;32], s=[0x02;32]). Both r and s have top bit
+    /// clear so no DER 0x00 padding byte is needed. DER bytes:
+    ///   30 44                ; SEQUENCE (68 bytes body)
+    ///     02 20 r (32 bytes) ; INTEGER r
+    ///     02 20 s (32 bytes) ; INTEGER s
+    /// Total: 70 bytes. parse_der_to_rs ACCEPTS this; recover_y_parity
+    /// against any specific pubkey almost-certainly returns Err
+    /// because (r, s, digest) is not a real signature.
+    fn well_formed_but_non_recovering_der() -> Vec<u8> {
+        let mut v = Vec::with_capacity(70);
+        v.extend_from_slice(&[0x30, 0x44, 0x02, 0x20]);
+        v.extend_from_slice(&[0x01u8; 32]);
+        v.extend_from_slice(&[0x02, 0x20]);
+        v.extend_from_slice(&[0x02u8; 32]);
+        v
     }
 
     fn current_thread_rt() -> tokio::runtime::Runtime {
@@ -465,12 +569,14 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // D-T-C1: KMS mock success + matching from -> NotConfigured + audit
-    // Also exercises mock `sign_digest` directly so the trait method
-    // is not dead code.
+    // D-T-CD9 (was P6B-C d_t_c1; repurposed for the P6B-CD sign_tx Ok
+    // path that no longer returns NotConfigured for matched-from):
+    // mock returns 4-byte non-DER garbage; sign_tx full pipeline runs
+    // up to parse_der_to_rs, which fails -> Err(InvalidSignatureBytes);
+    // outcome=invalid_signature_bytes audit + counter emitted.
     // ------------------------------------------------------------------
     #[test]
-    fn d_t_c1_matching_address_returns_not_configured_with_audit() {
+    fn d_t_cd9_invalid_signature_bytes_emits_audit_and_counter() {
         let x = [0xAAu8; 32];
         let y = [0xBBu8; 32];
         let mock = Arc::new(MockKmsSigningClient::ok(valid_test_der(x, y)));
@@ -490,12 +596,12 @@ mod tests {
 
                 let tx = sample_tx_with_from(derived, vec![0x01, 0x02, 0x03]);
                 let result = signer.sign_tx(&tx).await;
-                assert_eq!(result, Err(SignerError::NotConfigured));
+                // Default mock sign_response is vec![0xDE, 0xAD, 0xBE, 0xEF]
+                // (4 bytes); not valid DER -> InvalidSignatureBytes.
+                assert_eq!(result, Err(SignerError::InvalidSignatureBytes));
 
-                // Exercise mock sign_digest directly so the trait
-                // method is exercised in P6B-C. ProductionSigner::sign_tx
-                // does NOT invoke sign_digest; this targeted call keeps
-                // the trait method out of dead-code lint territory.
+                // Exercise mock sign_digest directly so the trait method
+                // is not dead code at the workspace test level.
                 let raw = mock
                     .sign_digest("test-audit-key-id", &[0u8; 32])
                     .await
@@ -504,12 +610,14 @@ mod tests {
             });
         });
 
-        let audit_event = events
+        let audit = events
             .iter()
-            .find(|e| e.target == "production_signer_audit")
-            .expect("at least one audit event captured");
-        let map = fields_to_map(audit_event);
-        assert_eq!(map.get("outcome").copied(), Some("not_configured"));
+            .find(|e| {
+                e.target == "production_signer_audit"
+                    && fields_to_map(e).get("outcome").copied() == Some("invalid_signature_bytes")
+            })
+            .expect("one invalid_signature_bytes audit event expected");
+        let map = fields_to_map(audit);
         assert_eq!(map.get("event").copied(), Some("signer_sign_tx_attempt"));
         assert_eq!(map.get("audit_key_id").copied(), Some("test-audit-key-id"));
     }
@@ -749,30 +857,174 @@ mod tests {
 
     // ------------------------------------------------------------------
     // DER parser robustness: length / prefix / marker mismatches all
-    // surface as Err(ClientInit) with no panic.
+    // surface as Err(ClientInit) with no panic. Targets the P6B-CD
+    // refactored function `parse_ec_pubkey_der_to_sec1_65`.
     // ------------------------------------------------------------------
     #[test]
     fn parser_rejects_short_der_with_client_init() {
         let too_short = vec![0u8; 87];
-        let result = parse_ec_pubkey_der_to_address(&too_short);
-        assert_eq!(result, Err(SignerError::ClientInit));
+        let result = parse_ec_pubkey_der_to_sec1_65(&too_short);
+        assert_eq!(result.err(), Some(SignerError::ClientInit));
     }
 
     #[test]
     fn parser_rejects_bad_prefix_with_client_init() {
         let mut der = valid_test_der([0u8; 32], [0u8; 32]);
-        // Corrupt the outer SEQUENCE tag.
         der[0] = 0x31;
-        let result = parse_ec_pubkey_der_to_address(&der);
-        assert_eq!(result, Err(SignerError::ClientInit));
+        let result = parse_ec_pubkey_der_to_sec1_65(&der);
+        assert_eq!(result.err(), Some(SignerError::ClientInit));
     }
 
     #[test]
     fn parser_rejects_bad_uncompressed_marker_with_client_init() {
         let mut der = valid_test_der([0u8; 32], [0u8; 32]);
-        // Corrupt the SEC1 uncompressed marker (byte 23 in the prefix).
         der[23] = 0x02;
-        let result = parse_ec_pubkey_der_to_address(&der);
-        assert_eq!(result, Err(SignerError::ClientInit));
+        let result = parse_ec_pubkey_der_to_sec1_65(&der);
+        assert_eq!(result.err(), Some(SignerError::ClientInit));
+    }
+
+    // ------------------------------------------------------------------
+    // D-T-CD7: KMS sign_digest error -> Err(KmsSignFailed); audit +
+    // counter emitted with outcome="kms_sign_failed".
+    // ------------------------------------------------------------------
+    #[test]
+    fn d_t_cd7_kms_sign_failed_emits_audit_and_counter() {
+        let x = [0x55u8; 32];
+        let y = [0x66u8; 32];
+        let mut mock_state = MockKmsSigningClient::ok(valid_test_der(x, y));
+        // Override sign_response to simulate AWS KMS Sign failure.
+        mock_state.sign_response = Err(KmsClientError::SignFailed);
+        let mock = Arc::new(mock_state);
+        let derived = expected_address_from(x, y);
+
+        let events = capture_events(|| {
+            let rt = current_thread_rt();
+            rt.block_on(async {
+                let signer = ProductionSigner::from_aws_kms_with_client(
+                    "kms-sign-err-id".to_string(),
+                    SigningAuditThresholds::default(),
+                    mock,
+                )
+                .await
+                .expect("ctor success");
+                let tx = sample_tx_with_from(derived, vec![0x77]);
+                let result = signer.sign_tx(&tx).await;
+                assert_eq!(result, Err(SignerError::KmsSignFailed));
+            });
+        });
+
+        let audit = events
+            .iter()
+            .find(|e| {
+                e.target == "production_signer_audit"
+                    && fields_to_map(e).get("outcome").copied() == Some("kms_sign_failed")
+            })
+            .expect("one kms_sign_failed audit event expected");
+        let map = fields_to_map(audit);
+        assert_eq!(map.get("outcome").copied(), Some("kms_sign_failed"));
+    }
+
+    // ------------------------------------------------------------------
+    // D-T-CD10 (also covers v0.4 plan D-T-CD5 source-lock deviation
+    // structurally): mock returns a STRUCTURALLY VALID DER signature
+    // (parses successfully) that does NOT correspond to a real
+    // signature by the boot-time public key. parse_der_to_rs succeeds
+    // -> recover_y_parity fails because neither y_parity in {0, 1}
+    // recovers to the boot pubkey -> Err(SignatureRecoveryFailed);
+    // outcome=signature_recovery_failed audit + counter emitted. This
+    // exercises every line of the sign_tx pipeline up to (but not
+    // through) the Ok-return assembly. Positive Ok-return testing
+    // requires precomputed off-tree non-secret material per the v0.4
+    // plan deviation note in recovery.rs.
+    // ------------------------------------------------------------------
+    #[test]
+    fn d_t_cd10_signature_recovery_failed_emits_audit_and_counter() {
+        let x = [0x88u8; 32];
+        let y = [0x99u8; 32];
+        let mut mock_state = MockKmsSigningClient::ok(valid_test_der(x, y));
+        mock_state.sign_response = Ok(well_formed_but_non_recovering_der());
+        let mock = Arc::new(mock_state);
+        let derived = expected_address_from(x, y);
+
+        let events = capture_events(|| {
+            let rt = current_thread_rt();
+            rt.block_on(async {
+                let signer = ProductionSigner::from_aws_kms_with_client(
+                    "recovery-fail-id".to_string(),
+                    SigningAuditThresholds::default(),
+                    mock,
+                )
+                .await
+                .expect("ctor success");
+                let tx = sample_tx_with_from(derived, vec![0xAA]);
+                let result = signer.sign_tx(&tx).await;
+                assert_eq!(result, Err(SignerError::SignatureRecoveryFailed));
+            });
+        });
+
+        let audit = events
+            .iter()
+            .find(|e| {
+                e.target == "production_signer_audit"
+                    && fields_to_map(e).get("outcome").copied() == Some("signature_recovery_failed")
+            })
+            .expect("one signature_recovery_failed audit event expected");
+        let map = fields_to_map(audit);
+        assert_eq!(
+            map.get("outcome").copied(),
+            Some("signature_recovery_failed")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // D-T-CD-INVALID-BUNDLE: sign_tx with max_fee_per_gas <
+    // max_priority_fee_per_gas -> Err(InvalidBundleTx); outcome=
+    // invalid_bundle_tx audit + counter emitted. (Covers the
+    // pre-sign invariant check the v0.4 plan adds in D-CD6 step 3.)
+    // ------------------------------------------------------------------
+    #[test]
+    fn d_t_cd_invalid_bundle_tx_emits_audit_and_counter() {
+        let x = [0x11u8; 32];
+        let y = [0x12u8; 32];
+        let mock = Arc::new(MockKmsSigningClient::ok(valid_test_der(x, y)));
+        let derived = expected_address_from(x, y);
+
+        let events = capture_events(|| {
+            let rt = current_thread_rt();
+            rt.block_on(async {
+                let signer = ProductionSigner::from_aws_kms_with_client(
+                    "bad-fee-id".to_string(),
+                    SigningAuditThresholds::default(),
+                    mock,
+                )
+                .await
+                .expect("ctor success");
+                // Build a tx with max_fee < max_priority_fee.
+                let tx = BundleTx::new(
+                    derived,
+                    Address::from([0x22u8; 20]),
+                    U256::ZERO,
+                    Vec::new(),
+                    21_000,
+                    0,
+                    1,
+                    0,
+                    U256::from(100u64), // max_priority_fee_per_gas
+                    U256::from(50u64),  // max_fee_per_gas (lower; invalid)
+                );
+                let result = signer.sign_tx(&tx).await;
+                assert_eq!(result, Err(SignerError::InvalidBundleTx));
+            });
+        });
+
+        let audit = events
+            .iter()
+            .find(|e| {
+                e.target == "production_signer_audit"
+                    && fields_to_map(e).get("outcome").copied() == Some("invalid_bundle_tx")
+            })
+            .expect("one invalid_bundle_tx audit event expected");
+        let map = fields_to_map(audit);
+        assert_eq!(map.get("outcome").copied(), Some("invalid_bundle_tx"));
     }
 }

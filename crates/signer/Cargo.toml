@@ -7,16 +7,38 @@ publish = false
 description = "Phase 5 fail-closed signer boundary stub + P6B-B/P6B-C pre-activation HSM/KMS infrastructure. Production signing requires future approved sign-activation batch."
 
 [dependencies]
-alloy-primitives = { workspace = true }
+# P6B-CD: `rlp` feature enables `alloy_rlp::Encodable` impls for
+# `Uint<256, 4>` (= U256) so the EIP-1559 RLP encoder in rlp.rs can
+# encode fee + value fields canonically without hand-rolled
+# leading-zero stripping.
+alloy-primitives = { workspace = true, features = ["rlp"] }
 async-trait      = { workspace = true }
 metrics          = { workspace = true }
 thiserror        = { workspace = true }
 tracing          = { workspace = true }
 
-# P6B-C v0.3 D-C1 (locked versions; G2b verified post-add via
-# `cargo tree -e features -p rust-lmax-mev-signer | rg 'secp256k1|k256|alloy-signer|ethers-signers'`).
+# P6B-C v0.3 D-C1 (locked versions). At P6B-CD the G2b regex no longer bans
+# `k256`; the narrow `k256` carve-out (P6B-CD D-CD3) is permitted only with
+# the locked feature set below + enforced via G2f narrow-surface allow-list
+# + single-file import gate (only `crates/signer/src/recovery.rs` may
+# `use k256::*`). G2b dep audit at impl time runs the workspace-level
+# cargo-tree grep against the carry-forward banned dep set; expected 0 hits.
+# (Literal banned-token names omitted from this comment to keep the
+# Cargo.toml itself G2b-clean.)
 aws-config  = { version = "1.6", features = ["behavior-version-latest"] }
 aws-sdk-kms = "1.65"
+
+# P6B-CD D-CD2 (EIP-1559 unsigned-tx RLP encoder; signed-tx RLP assembly).
+alloy-rlp = "0.3"
+
+# P6B-CD D-CD3 (narrow recovery-only carve-out). default-features = false
+# drops `pkcs8`, `pem`, `precomputed-tables`, `serde`, `std` defaults
+# (transitive-tree-hygiene win; NOT a safety property). The `ecdsa` feature
+# DOES expose `SigningKey` per docs.rs/k256/0.13/k256/ecdsa/; the workspace
+# ban on signing-key constructs is enforced by G2f + G2g grep gates and
+# the single-file import gate (only `crates/signer/src/recovery.rs` may
+# `use k256::*`), NOT by feature exclusion.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
 
 [dev-dependencies]
 metrics-util       = "0.17"

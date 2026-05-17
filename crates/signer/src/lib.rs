@@ -29,6 +29,8 @@ mod error;
 mod kms_aws;
 mod kms_client;
 pub mod production;
+mod recovery;
+mod rlp;
 mod signer_trait;
 
 pub use bundle_tx::{BundleTx, SignedTxBytes};
@@ -53,6 +55,8 @@ mod tests {
             0,
             1,
             42,
+            U256::ZERO, // max_priority_fee_per_gas
+            U256::ZERO, // max_fee_per_gas
         )
     }
 
