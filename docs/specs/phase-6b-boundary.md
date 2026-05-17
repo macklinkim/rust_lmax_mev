@@ -91,6 +91,30 @@ Deliverables landed (D-E1-1..D-E1-9 per the v0.1 plan):
 
 **P6B-E2 (non-localhost endpoint adapter flip + multi-adapter parity + true bundle-byte equality) and P6B-F (Phase 6b DoD audit + `phase-6b-complete` annotated tag) REMAIN LOCKED.** Runtime safety chain at P6B-E1 close: relay adapters return `Ok(SubmissionReceipt)` ONLY when the endpoint host is in `{"127.0.0.1", "localhost", "::1"}` AND the kill-switch is inactive AND the HTTP POST succeeds; every other combination returns `Err(...)` per the documented PRECEDENCE (`KillSwitchActive` > `SubmitDisabledNonLocalhost` > `SubmitHttpFailed`). The `comparator_driver` -> `submission_tx` -> `submission_driver` path is structurally compiled but only fires in tests because `SimulationOutcomeWithFingerprint.signed_bundle` is ALWAYS `None` in production runtime (G11 = 1 carried forward from P6B-CD; no production signer call site upstream).
 
+### Section 3 amendment (added at P6B-E2 close, per APPROVED plan v0.1)
+
+P6B-E2 ships the **live submission unlock**: non-localhost Ok-path under operator opt-in + Bloxroute parity + true keccak bundle-byte equality + production-runtime `sign_tx` call site. The runtime fail-closed posture is preserved at the default: `wire_phase4` continues to inject `DisabledSigner`, so the new production `sign_tx` call site returns `Err(SignerError::SignerDisabled)` on every iteration -> `simulator_driver` skips -> no `SubmissionAttempt` is broadcast -> no `submit_bundle` invocation. The unlock is reachable only by an operator who (a) wires a real `ProductionSigner` AND (b) flips `RelayConfig::allow_non_localhost_endpoint = true` (legal only paired with `live_send=true` + Production + HsmKms).
+
+Deliverables landed (D-E2-1..D-E2-9 per the v0.1 plan):
+
+- D-E2-1: `RelayConfig::allow_non_localhost_endpoint: bool` (default `false`; serde default). `Config::validate()` keeps the `LiveSendRequiresLocalhostEndpoint` reject UNLESS the flag is `true`. D-T-E2-1a + D-T-E2-1b cover both branches.
+- D-E2-2: NEW `BundleRelayError::BundleHashMismatch` (payload-free; Display literal `"bundle hash mismatch: relay-returned hash != local keccak"`). Synthesized by `submission_driver` (not the adapter) after a successful HTTP parse + keccak compare.
+- D-E2-3: `SubmissionReceipt::local_bundle_hash: String` (additive). Populated by `submission_driver` on both match (informational) and mismatch (audit). Sample fixtures + the `br_2` rkyv+serde round-trip test updated.
+- D-E2-4: `FlashbotsRelay::new(cfg, ks, allow_non_localhost)` + `BloxrouteRelay::new(cfg, ks, allow_non_localhost)` (BREAKING ctor signature change). Bloxroute `submit_bundle` flipped from unconditional `Err(SubmitDisabled)` to the same PRECEDENCE chain as Flashbots via the shared `crates/relay-clients/src/send_bundle.rs` helper. `RC-B-4` + `bloxroute_kill_switch_inactive_baseline_*` + `submit_disabled_2` updated to expect `SubmitDisabledNonLocalhost`.
+- D-E2-5: `submission_driver` G12 step 6 keccak compare. Computes `keccak256(concat(signed_bundle.signed_txs))` lowercase-hex; compares to the relay-returned `bundle_hash` (host-tolerant `0x` normalization). On mismatch: warn-log naming `BundleRelayError::BundleHashMismatch` + journal mismatch record. On match: existing Ok-path receipt journal append with `local_bundle_hash` populated for audit.
+- D-E2-6: NEW `BundleConstructor::sign_for_outcome(&self, outcome) -> Result<SignedTxBytes, SignerError>` in `crates/execution/src/lib.rs`. Production runtime `sign_tx` call site (G11 grows 1 -> 2). `simulator_driver` invokes this after `simulate_with_fingerprint` Ok; `Err(_)` -> iteration-skip + WARN (unsigned bundles never flow downstream past the simulator boundary).
+- D-E2-7: Audit-note-1 visibility narrowing -- `DEFAULT_FLASHBOTS_ENDPOINT` + `DEFAULT_BLOXROUTE_ENDPOINT` flipped to `pub(crate)` + `#[doc(hidden)]`. Crate-public surface no longer leaks the literal URLs.
+- D-E2-8: THIS Section 3 amendment + Section 4 G14 count update + Section 5 per-callsite expansion below.
+- D-E2-9: 5 targeted tests (D-T-E2-1a/1b in `crates/config/src/lib.rs`; D-T-E2-2 in `crates/relay-clients/tests/bloxroute.rs`; D-T-E2-3 + D-T-E2-4 + D-T-E2-5 in `crates/app/tests/submission_driver_e2.rs`). Plus carry-forward updates: `rc_f_4` + `rc_b_4_*` + `submit_disabled_*` ctor + variant updates.
+
+**P6B-F (Phase 6b DoD audit + `phase-6b-complete` annotated tag) REMAINS LOCKED** behind P6B-E2 close + a separate explicit user re-authorization per the Phase 6b overview's per-non-goal prerequisite chain.
+
+At P6B-E2 close (default config, no operator overrides):
+
+- `allow_non_localhost_endpoint = false` -> `LiveSendRequiresLocalhostEndpoint` reject preserved.
+- `key_backend = Disabled` -> `wire_phase4` injects `DisabledSigner` -> `sign_for_outcome` returns `Err(SignerDisabled)` -> `simulator_driver` skips -> no envelope flows downstream -> no submission attempt.
+- `submit_bundle` runtime path is the only Ok-source for `SubmissionReceipt`; the keccak check at the driver guarantees the journaled record is either a verified match or an audited mismatch.
+
 ## Section 4 -- New Phase 6b G-gates
 
 ### G12 -- submit_bundle caller pre-check chain (G12 INHERITS G13)

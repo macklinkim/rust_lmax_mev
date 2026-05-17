@@ -395,6 +395,16 @@ pub struct RelayConfig {
     /// `SigningAuditThresholds` at boot.
     #[serde(default)]
     pub signing_audit_alert: SigningAuditAlertConfig,
+    /// P6B-E2 D-E2-1: operator-controlled non-localhost endpoint flip.
+    /// Default `false` keeps the P6B-E1 fail-closed posture (config
+    /// validate rejects `live_send=true` with non-localhost endpoint;
+    /// adapter runtime rejects non-localhost POST). Setting to `true`
+    /// requires explicit operator opt-in AND the `live_send=true` legal
+    /// combo (Production + HsmKms + non-empty audit_key_id). Threaded
+    /// into Flashbots + Bloxroute adapter ctors as a third arg so the
+    /// adapter-runtime defense-in-depth check matches the boot gate.
+    #[serde(default)]
+    pub allow_non_localhost_endpoint: bool,
 }
 
 impl Default for RelayConfig {
@@ -407,6 +417,7 @@ impl Default for RelayConfig {
             key_backend: KeyBackend::Disabled,
             audit_key_id: String::new(),
             signing_audit_alert: SigningAuditAlertConfig::default(),
+            allow_non_localhost_endpoint: false,
         }
     }
 }
@@ -734,7 +745,7 @@ impl Config {
         // happens with 0 relays; comparator_driver runs inert per
         // DP-E3). Defense-in-depth with the adapter-runtime check in
         // `BundleRelayError::SubmitDisabledNonLocalhost`.
-        if self.relay.live_send {
+        if self.relay.live_send && !self.relay.allow_non_localhost_endpoint {
             for (idx, ep) in self.relay.enabled_relays.iter().enumerate() {
                 if !is_localhost_endpoint(&ep.endpoint) {
                     let _ = idx;
@@ -1260,6 +1271,45 @@ execution_disabled = false
         );
         assert_eq!(cfg.active_profile, Profile::Dev);
         assert_eq!(cfg.relay.key_backend, KeyBackend::Disabled);
+    }
+
+    /// D-T-E2-1a: Production + HsmKms + live_send=true + non-localhost
+    /// endpoint + `allow_non_localhost_endpoint = true` parses Ok. The
+    /// flag is the operator's explicit opt-out from the P6B-E1
+    /// localhost-only gate; without it the validate path returns
+    /// `Err(LiveSendRequiresLocalhostEndpoint)` (covered by D-T-E2-1b).
+    #[test]
+    fn d_t_e2_1a_allow_non_localhost_true_accepts_non_localhost_endpoint() {
+        let toml = format!(
+            "active_profile = \"production\"\n{}\n[relay]\nkey_backend = \"hsmkms\"\naudit_key_id = \"k1\"\nlive_send = true\nallow_non_localhost_endpoint = true\n[[relay.enabled_relays]]\nkind = \"flashbots\"\nendpoint = \"https://relay.example.invalid\"\n",
+            valid_minimum_toml()
+        );
+        let cfg = Config::from_toml_str(&toml).expect(
+            "D-T-E2-1a: allow_non_localhost_endpoint=true must permit non-localhost endpoint",
+        );
+        assert!(cfg.relay.live_send);
+        assert!(cfg.relay.allow_non_localhost_endpoint);
+        assert_eq!(cfg.relay.enabled_relays.len(), 1);
+    }
+
+    /// D-T-E2-1b: Production + HsmKms + live_send=true + non-localhost
+    /// endpoint + `allow_non_localhost_endpoint = false` (default)
+    /// continues to reject with `LiveSendRequiresLocalhostEndpoint`.
+    /// P6B-E1 regression guard: without the operator opt-in, the
+    /// localhost-only gate stays effective.
+    #[test]
+    fn d_t_e2_1b_allow_non_localhost_false_rejects_non_localhost_endpoint() {
+        let toml = format!(
+            "active_profile = \"production\"\n{}\n[relay]\nkey_backend = \"hsmkms\"\naudit_key_id = \"k1\"\nlive_send = true\n[[relay.enabled_relays]]\nkind = \"flashbots\"\nendpoint = \"https://relay.example.invalid\"\n",
+            valid_minimum_toml()
+        );
+        let err = Config::from_toml_str(&toml).expect_err(
+            "D-T-E2-1b: allow_non_localhost_endpoint omitted (default false) must reject non-localhost",
+        );
+        assert!(
+            matches!(err, ConfigError::LiveSendRequiresLocalhostEndpoint),
+            "D-T-E2-1b: expected LiveSendRequiresLocalhostEndpoint; got {err:?}"
+        );
     }
 
     /// CFG-RELAY-1 (R-E23 v0.7): single relay endpoint parses; multi-

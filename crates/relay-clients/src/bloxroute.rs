@@ -25,7 +25,12 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Default bloXroute relay endpoint.
-pub const DEFAULT_BLOXROUTE_ENDPOINT: &str = "https://api.blxrbdn.com";
+///
+/// P6B-E2 audit note-1: narrowed from `pub` to `pub(crate)` +
+/// `#[doc(hidden)]` so the literal URL no longer leaks into the public
+/// crate surface. Tests inside the crate may still reference the const.
+#[doc(hidden)]
+pub(crate) const DEFAULT_BLOXROUTE_ENDPOINT: &str = "https://api.blxrbdn.com";
 
 /// Default per-request timeout (ms). Same rationale as Flashbots.
 pub const DEFAULT_BLOXROUTE_TIMEOUT_MS: u64 = 2_000;
@@ -66,6 +71,9 @@ pub struct BloxrouteRelay {
     /// `AppHandle4::kill_switch()`. `submit_bundle` checks
     /// `is_active()` as its FIRST non-trivia statement (G10).
     kill_switch: KillSwitch,
+    /// P6B-E2 D-E2-4: operator-controlled non-localhost endpoint flip.
+    /// Same semantics as `FlashbotsRelay::allow_non_localhost`.
+    allow_non_localhost: bool,
 }
 
 impl std::fmt::Debug for BloxrouteRelay {
@@ -91,7 +99,11 @@ impl BloxrouteRelay {
     /// `Arc<KillSwitch>` / `Option<KillSwitch>`). Pass `kill_switch.clone()`
     /// from a shared instance to keep the adapter wired to the operator
     /// surface via `AppHandle4::kill_switch()`.
-    pub fn new(cfg: BloxrouteConfig, kill_switch: KillSwitch) -> Result<Self, RelaySimError> {
+    pub fn new(
+        cfg: BloxrouteConfig,
+        kill_switch: KillSwitch,
+        allow_non_localhost: bool,
+    ) -> Result<Self, RelaySimError> {
         if cfg.endpoint.trim().is_empty() {
             return Err(RelaySimError::NotConfigured);
         }
@@ -118,6 +130,7 @@ impl BloxrouteRelay {
             http,
             timeout,
             kill_switch,
+            allow_non_localhost,
         })
     }
 
@@ -151,17 +164,32 @@ impl BundleRelay for BloxrouteRelay {
         &self.name
     }
 
-    /// HARD INVARIANT (DP-E1): returns `Err(SubmitDisabled)` when the
-    /// kill switch is inactive. P6-D §3 PRECEDENCE: when the kill
-    /// switch is active, returns `Err(KillSwitchActive)` FIRST (G10).
+    /// P6B-E2 D-E2-4 Ok-path parity with Flashbots.
+    ///
+    /// PRECEDENCE (G10 + G12):
+    /// 1. Kill switch active -> `Err(KillSwitchActive)`.
+    /// 2. Endpoint host NOT in `{"127.0.0.1", "localhost", "::1"}` AND
+    ///    `allow_non_localhost == false` -> `Err(SubmitDisabledNonLocalhost)`.
+    /// 3. `self.http.is_none()` (api_key absent at ctor time) ->
+    ///    `Err(SubmitHttpFailed)`.
+    /// 4. HTTP POST `eth_sendBundle` via the shared
+    ///    `crate::send_bundle::submit_eth_send_bundle` helper.
     async fn submit_bundle(
         &self,
-        _bundle: &SignedBundle,
+        bundle: &SignedBundle,
     ) -> Result<SubmissionReceipt, BundleRelayError> {
         if self.kill_switch.is_active() {
             return Err(BundleRelayError::KillSwitchActive);
         }
-        Err(BundleRelayError::SubmitDisabled)
+        if !self.allow_non_localhost && !crate::send_bundle::is_localhost_url(&self.endpoint) {
+            return Err(BundleRelayError::SubmitDisabledNonLocalhost);
+        }
+        let http = self
+            .http
+            .as_ref()
+            .ok_or(BundleRelayError::SubmitHttpFailed)?;
+        crate::send_bundle::submit_eth_send_bundle(http, &self.endpoint, self.name.as_ref(), bundle)
+            .await
     }
 }
 
@@ -171,7 +199,7 @@ mod tests {
 
     #[test]
     fn bloxroute_new_default_succeeds() {
-        let r = BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(false))
+        let r = BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(false), false)
             .expect("default config ok");
         assert_eq!(r.name(), "bloxroute");
         assert_eq!(r.timeout().as_millis() as u64, DEFAULT_BLOXROUTE_TIMEOUT_MS);
@@ -184,7 +212,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            BloxrouteRelay::new(cfg, KillSwitch::new(false)),
+            BloxrouteRelay::new(cfg, KillSwitch::new(false), false),
             Err(RelaySimError::NotConfigured)
         ));
     }
@@ -196,7 +224,7 @@ mod tests {
             timeout_ms: 1_000,
             api_key: Some("SECRETKEY".to_string()),
         };
-        let r = BloxrouteRelay::new(cfg, KillSwitch::new(false)).expect("ctor ok");
+        let r = BloxrouteRelay::new(cfg, KillSwitch::new(false), false).expect("ctor ok");
         let dbg = format!("{r:?}");
         assert!(!dbg.contains("SECRETTOKEN"));
         assert!(!dbg.contains("SECRETKEY"));
@@ -211,7 +239,7 @@ mod tests {
             api_key: None,
             ..Default::default()
         };
-        let r = BloxrouteRelay::new(cfg, KillSwitch::new(false)).expect("ctor ok");
+        let r = BloxrouteRelay::new(cfg, KillSwitch::new(false), false).expect("ctor ok");
         let req = RelaySimRequest {
             block_hash: alloy_primitives::B256::from([0u8; 32]),
             state_block_number: 0,
@@ -223,11 +251,17 @@ mod tests {
         }
     }
 
-    /// RC-B-4: submit_bundle returns Err(SubmitDisabled) when the
-    /// kill switch is inactive.
+    /// RC-B-4 (P6B-E2): submit_bundle with the default
+    /// (non-localhost) endpoint + KillSwitch inactive +
+    /// `allow_non_localhost=false` returns
+    /// `Err(SubmitDisabledNonLocalhost)`. Pre-P6B-E2 the variant was
+    /// `SubmitDisabled` (unconditional fail-closed); P6B-E2 flips
+    /// Bloxroute to the same PRECEDENCE chain as Flashbots so a
+    /// non-localhost endpoint reports `SubmitDisabledNonLocalhost`
+    /// instead.
     #[tokio::test]
-    async fn rc_b_4_submit_bundle_always_disabled() {
-        let r = BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(false))
+    async fn rc_b_4_submit_bundle_non_localhost_rejects_at_runtime() {
+        let r = BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(false), false)
             .expect("ctor ok");
         let dummy = SignedBundle {
             block_hash: [0u8; 32],
@@ -239,8 +273,10 @@ mod tests {
             validity_block_max: 0,
         };
         match r.submit_bundle(&dummy).await {
-            Err(BundleRelayError::SubmitDisabled) => {}
-            other => panic!("submit_bundle must return SubmitDisabled; got {other:?}"),
+            Err(BundleRelayError::SubmitDisabledNonLocalhost) => {}
+            other => panic!(
+                "submit_bundle with non-localhost endpoint must return SubmitDisabledNonLocalhost; got {other:?}"
+            ),
         }
     }
 
@@ -251,8 +287,8 @@ mod tests {
     /// any future refactor that re-orders the guard / Err arms is
     /// caught at the test-name level (spec-drift readability).
     #[tokio::test]
-    async fn bloxroute_kill_switch_inactive_baseline_returns_submit_disabled() {
-        let r = BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(false))
+    async fn bloxroute_kill_switch_inactive_baseline_returns_submit_disabled_non_localhost() {
+        let r = BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(false), false)
             .expect("ctor ok");
         let dummy = SignedBundle {
             block_hash: [0u8; 32],
@@ -264,10 +300,10 @@ mod tests {
             validity_block_max: 0,
         };
         match r.submit_bundle(&dummy).await {
-            Err(BundleRelayError::SubmitDisabled) => {}
+            Err(BundleRelayError::SubmitDisabledNonLocalhost) => {}
             other => panic!(
-                "submit_bundle with inactive KillSwitch must return \
-                 SubmitDisabled; got {other:?}"
+                "submit_bundle with inactive KillSwitch + non-localhost endpoint must return \
+                 SubmitDisabledNonLocalhost; got {other:?}"
             ),
         }
     }

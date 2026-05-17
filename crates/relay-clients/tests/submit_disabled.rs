@@ -29,8 +29,8 @@ async fn submit_disabled_1_flashbots() {
     // adapter rejects with `SubmitDisabledNonLocalhost` (defense-in-depth
     // against any non-localhost endpoint that bypasses the
     // `ConfigError::LiveSendRequiresLocalhostEndpoint` validate gate).
-    let r =
-        FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(false)).expect("ctor ok");
+    let r = FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(false), false)
+        .expect("ctor ok");
     match r.submit_bundle(&dummy_bundle()).await {
         Err(BundleRelayError::SubmitDisabledNonLocalhost) => {}
         other => panic!(
@@ -42,11 +42,19 @@ async fn submit_disabled_1_flashbots() {
 
 #[tokio::test]
 async fn submit_disabled_2_bloxroute() {
-    let r =
-        BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(false)).expect("ctor ok");
+    let r = BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(false), false)
+        .expect("ctor ok");
+    // P6B-E2 D-E2-4 update: Bloxroute is now flipped to the same
+    // PRECEDENCE chain as Flashbots. Default (non-localhost) endpoint
+    // + KillSwitch inactive + `allow_non_localhost=false` reports
+    // `SubmitDisabledNonLocalhost`; the pre-P6B-E2 `SubmitDisabled`
+    // shape no longer fires.
     match r.submit_bundle(&dummy_bundle()).await {
-        Err(BundleRelayError::SubmitDisabled) => {}
-        other => panic!("bloXroute submit_bundle must return SubmitDisabled; got {other:?}"),
+        Err(BundleRelayError::SubmitDisabledNonLocalhost) => {}
+        other => panic!(
+            "bloXroute submit_bundle with default (non-localhost) endpoint must return \
+             SubmitDisabledNonLocalhost; got {other:?}"
+        ),
     }
 }
 
@@ -54,8 +62,8 @@ async fn submit_disabled_2_bloxroute() {
 /// KillSwitchActive BEFORE SubmitDisabled (boundary-spec §3 PRECEDENCE).
 #[tokio::test]
 async fn submit_disabled_3_flashbots_kill_switch_active_takes_precedence() {
-    let r =
-        FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(true)).expect("ctor ok");
+    let r = FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(true), false)
+        .expect("ctor ok");
     match r.submit_bundle(&dummy_bundle()).await {
         Err(BundleRelayError::KillSwitchActive) => {}
         other => panic!(
@@ -68,8 +76,8 @@ async fn submit_disabled_3_flashbots_kill_switch_active_takes_precedence() {
 /// P6-D D-T-D2: mirror of D-T-D1 for BloxrouteRelay.
 #[tokio::test]
 async fn submit_disabled_4_bloxroute_kill_switch_active_takes_precedence() {
-    let r =
-        BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(true)).expect("ctor ok");
+    let r = BloxrouteRelay::new(BloxrouteConfig::default(), KillSwitch::new(true), false)
+        .expect("ctor ok");
     match r.submit_bundle(&dummy_bundle()).await {
         Err(BundleRelayError::KillSwitchActive) => {}
         other => panic!(
@@ -96,7 +104,7 @@ async fn submit_disabled_4_bloxroute_kill_switch_active_takes_precedence() {
 async fn submit_disabled_5_flashbots_shared_kill_switch_flip_visible() {
     let ks = KillSwitch::new(false);
     let ks_clone = ks.clone();
-    let r = FlashbotsRelay::new(FlashbotsConfig::default(), ks_clone).expect("ctor ok");
+    let r = FlashbotsRelay::new(FlashbotsConfig::default(), ks_clone, false).expect("ctor ok");
 
     // Phase 1: inactive baseline.
     // P6B-E1: default (non-localhost) endpoint -> SubmitDisabledNonLocalhost

@@ -23,9 +23,7 @@ pub use bid_strategy::{
 use std::sync::Arc;
 
 use alloy_primitives::{Address, U256};
-#[cfg(test)]
-use rust_lmax_mev_signer::{BundleTx, SignedTxBytes, SignerError};
-use rust_lmax_mev_signer::{DisabledSigner, Signer};
+use rust_lmax_mev_signer::{BundleTx, DisabledSigner, SignedTxBytes, Signer, SignerError};
 use rust_lmax_mev_simulator::{ProfitSource, SimStatus, SimulationOutcome};
 use serde::{Deserialize, Serialize};
 
@@ -130,15 +128,14 @@ pub struct BundleCandidate {
 pub struct BundleConstructor {
     cfg: BundleConfig,
     strategy: BidStrategyRef,
-    /// Phase 6 P6-B (D-B2): signer injection. Stored but NOT invoked
-    /// from `construct(...)` / `construct_with_context(...)` in Phase 6a;
-    /// the production runtime path stays byte-identical to P3-F. Reachable
-    /// only via the `#[cfg(test)] pub(crate) async fn invoke_signer_for_test`
-    /// accessor. Phase 6b lands the runtime invocation alongside the relay
-    /// submission path. See `docs/specs/phase-6a-boundary.md` §2.2 + §3.
-    /// `dead_code` allowed because in non-test builds the field is intentionally
-    /// stored-but-not-read until Phase 6b.
-    #[allow(dead_code)]
+    /// Phase 6 P6-B (D-B2): signer injection. P6B-E2 D-E2-6 adds the
+    /// production runtime call site `sign_for_outcome(...)`; the
+    /// `#[cfg(test)] pub(crate) async fn invoke_signer_for_test` hook
+    /// stays in place for the test-only path. G11 ripgrep `sign_tx` in
+    /// `crates/execution/src/lib.rs` flips 1 -> 2. The default impl
+    /// passed in by `wire_phase4` remains `DisabledSigner`, which
+    /// returns `Err(SignerError::SignerDisabled)` -> simulator_driver
+    /// iteration-skip -> no submission attempt.
     signer: Arc<dyn Signer>,
 }
 
@@ -236,6 +233,49 @@ impl BundleConstructor {
         tx: &BundleTx,
     ) -> Result<SignedTxBytes, SignerError> {
         self.signer.sign_tx(tx).await
+    }
+
+    /// P6B-E2 D-E2-6: production runtime signing entry point.
+    ///
+    /// Builds a placeholder `BundleTx` from the simulation outcome and
+    /// invokes the signer's signing-request method. This is the SINGLE new
+    /// production runtime `sign_tx` call site (G11 grows 1 -> 2 in
+    /// `crates/execution/src/lib.rs`).
+    ///
+    /// Returns the signed transaction bytes on success. On `Err(_)`,
+    /// the caller (`simulator_driver` in `crates/app`) iteration-skips
+    /// with a WARN log: unsigned bundles never flow downstream past
+    /// this boundary. At P6B-E2 close `wire_phase4` continues to inject
+    /// `DisabledSigner`, so every call returns `Err(SignerDisabled)`
+    /// and the default runtime stays fail-closed (no submission
+    /// attempt reaches `submit_bundle`).
+    ///
+    /// G15 audit-once-per-attempt: each call goes through the audited
+    /// `ProductionSigner::sign_tx` path exactly once. `submission_driver`
+    /// is forbidden from re-invoking `signer.sign_tx` (CW-3-style grep
+    /// gate prevents that surface).
+    pub async fn sign_for_outcome(
+        &self,
+        outcome: &SimulationOutcome,
+    ) -> Result<SignedTxBytes, SignerError> {
+        // Placeholder BundleTx: gas + block-number-as-nonce-source come
+        // from the outcome; remaining fields are zero/empty per the
+        // Phase 3 P3-F placeholder convention. A real production
+        // wiring of the builder coinbase + populated calldata is
+        // out of P6B-E2 scope (Q-E2-7 + plan §H).
+        let tx = BundleTx::new(
+            Address::ZERO, // from
+            Address::ZERO, // to
+            U256::ZERO,    // value
+            Vec::new(),    // data
+            outcome.gas_used,
+            0,                                // nonce
+            1,                                // chain_id
+            outcome.opportunity_block_number, // bundle_correlation_id
+            U256::ZERO,                       // max_priority_fee_per_gas
+            U256::ZERO,                       // max_fee_per_gas
+        );
+        self.signer.sign_tx(&tx).await
     }
 
     pub fn cfg(&self) -> &BundleConfig {

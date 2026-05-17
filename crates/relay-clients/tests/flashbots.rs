@@ -16,6 +16,7 @@ fn relay_pointing_at(uri: &str) -> FlashbotsRelay {
             timeout_ms: 2_000,
         },
         KillSwitch::new(false),
+        false,
     )
     .expect("ctor ok")
 }

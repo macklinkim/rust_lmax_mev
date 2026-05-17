@@ -71,6 +71,12 @@ pub struct SubmissionReceipt {
     pub relay_name: String,
     pub bundle_hash: String,
     pub submitted_at_unix_ns: u64,
+    /// P6B-E2 D-E2-3: locally-computed `keccak256(concat(signed_txs))`
+    /// rendered as lowercase `0x<64hex>`. Empty string on the Ok-path
+    /// when `bundle_hash == local_bundle_hash` (the verified-match
+    /// case can elide the duplicate). Populated on every mismatch
+    /// record so the audit reader can compare side-by-side.
+    pub local_bundle_hash: String,
 }
 
 /// `BundleRelay` operation errors. `#[non_exhaustive]` so future
@@ -119,6 +125,16 @@ pub enum BundleRelayError {
     /// landed in P6B-E1; P6B-E2 may add).
     #[error("submit_bundle HTTP transport failed")]
     SubmitHttpFailed,
+
+    /// P6B-E2 D-E2-2: `submission_driver`'s G12 step-6 keccak compare
+    /// detected that the relay-returned `bundleHash` does not equal
+    /// `keccak256(concat(signed_txs))`. Synthesized by the driver (not
+    /// returned by the adapter) after an Ok-shaped HTTP response is
+    /// parsed; the mismatch record is appended to the submission journal
+    /// with `local_bundle_hash` populated before the next iteration.
+    /// Payload-free per the workspace error convention.
+    #[error("bundle hash mismatch: relay-returned hash != local keccak")]
+    BundleHashMismatch,
 }
 
 /// P6B-E1 D-E1-5: in-process broadcast envelope carrying everything
@@ -187,6 +203,7 @@ mod tests {
             relay_name: "flashbots".into(),
             bundle_hash: "0xdeadbeef".into(),
             submitted_at_unix_ns: 1_700_000_000_000_000_000,
+            local_bundle_hash: String::new(),
         }
     }
 

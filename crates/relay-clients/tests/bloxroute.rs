@@ -17,6 +17,7 @@ fn relay_pointing_at(uri: &str) -> BloxrouteRelay {
             api_key: Some("dummy-test-key".to_string()),
         },
         KillSwitch::new(false),
+        false,
     )
     .expect("ctor ok")
 }
@@ -175,5 +176,66 @@ async fn rc_b_6_call_bundle_body_shape_matches_with_placeholder_bytes() {
     assert_eq!(
         parsed, expected,
         "request body must match expected JSON-RPC envelope exactly"
+    );
+}
+
+/// D-T-E2-2: BloxrouteRelay.submit_bundle Ok-path happy path against
+/// wiremock at `127.0.0.1:<random>`. Verifies the `eth_sendBundle`
+/// JSON-RPC envelope by exact `serde_json::Value` equality (mirror of
+/// the Flashbots D-T-E1-5 happy path). Bloxroute is now flipped to the
+/// same Ok-path PRECEDENCE chain as Flashbots per the P6B-E2 plan
+/// lock D (shared `crates/relay-clients/src/send_bundle.rs` helper).
+#[tokio::test]
+async fn d_t_e2_2_submit_bundle_ok_on_local_wiremock() {
+    use rust_lmax_mev_bundle_relay::{BundleRelay, SignedBundle};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "result": { "bundleHash": "0xdeadbeef" }
+        })))
+        .mount(&server)
+        .await;
+
+    let relay = relay_pointing_at(&server.uri());
+    let bundle = SignedBundle {
+        block_hash: [0u8; 32],
+        state_block_number: 22_000_000,
+        signed_txs: vec![FIXTURE_PLACEHOLDER_BYTES.to_vec()],
+        coinbase_recipient: alloy_primitives::Address::ZERO,
+        coinbase_transfer_wei: U256::ZERO,
+        validity_block_min: 22_000_000,
+        validity_block_max: 22_000_005,
+    };
+
+    let receipt = relay
+        .submit_bundle(&bundle)
+        .await
+        .expect("D-T-E2-2: Bloxroute localhost submit_bundle must Ok");
+    assert_eq!(receipt.relay_name, "bloxroute");
+    assert_eq!(receipt.bundle_hash, "0xdeadbeef");
+
+    let received = server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    assert_eq!(received.len(), 1, "exactly one POST expected");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&received[0].body).expect("body is valid JSON");
+    let expected = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_sendBundle",
+        "params": [{
+            "txs": [FIXTURE_PLACEHOLDER_HEX],
+            "blockNumber": "0x14fb180"
+        }]
+    });
+    assert_eq!(
+        parsed, expected,
+        "D-T-E2-2: eth_sendBundle JSON-RPC body must match expected envelope exactly"
     );
 }

@@ -32,7 +32,12 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Default Flashbots relay endpoint for `eth_callBundle`.
-pub const DEFAULT_FLASHBOTS_ENDPOINT: &str = "https://relay.flashbots.net";
+///
+/// P6B-E2 audit note-1: narrowed from `pub` to `pub(crate)` +
+/// `#[doc(hidden)]` so the literal URL no longer leaks into the public
+/// crate surface. Tests inside the crate may still reference the const.
+#[doc(hidden)]
+pub(crate) const DEFAULT_FLASHBOTS_ENDPOINT: &str = "https://relay.flashbots.net";
 
 /// Default per-request timeout (ms). Comparator latency budget per
 /// `BundleCandidate` is single-digit hundreds of ms; 2000ms is a
@@ -70,6 +75,14 @@ pub struct FlashbotsRelay {
     /// `AppHandle4::kill_switch()`. `submit_bundle` checks
     /// `is_active()` as its FIRST non-trivia statement (G10).
     kill_switch: KillSwitch,
+    /// P6B-E2 D-E2-4: operator-controlled non-localhost endpoint flip.
+    /// When `false` (default), `submit_bundle` rejects any non-localhost
+    /// endpoint at runtime with `SubmitDisabledNonLocalhost`. When
+    /// `true`, the runtime check is bypassed (still gated by kill
+    /// switch + HTTP outcome). Mirrors
+    /// `RelayConfig::allow_non_localhost_endpoint`; threaded through
+    /// the ctor.
+    allow_non_localhost: bool,
 }
 
 impl std::fmt::Debug for FlashbotsRelay {
@@ -91,7 +104,11 @@ impl FlashbotsRelay {
     /// `Arc<KillSwitch>` / `Option<KillSwitch>`). Pass `kill_switch.clone()`
     /// from a shared instance to keep the adapter wired to the operator
     /// surface via `AppHandle4::kill_switch()`.
-    pub fn new(cfg: FlashbotsConfig, kill_switch: KillSwitch) -> Result<Self, RelaySimError> {
+    pub fn new(
+        cfg: FlashbotsConfig,
+        kill_switch: KillSwitch,
+        allow_non_localhost: bool,
+    ) -> Result<Self, RelaySimError> {
         if cfg.endpoint.trim().is_empty() {
             return Err(RelaySimError::NotConfigured);
         }
@@ -107,6 +124,7 @@ impl FlashbotsRelay {
             http,
             timeout,
             kill_switch,
+            allow_non_localhost,
         })
     }
 
@@ -166,7 +184,11 @@ impl BundleRelay for FlashbotsRelay {
         // Step (2): localhost-only defense-in-depth (R-D7 style
         // mechanical check). If the endpoint somehow bypasses the
         // config validate gate, fail-closed here before any HTTP I/O.
-        if !crate::send_bundle::is_localhost_url(&self.endpoint) {
+        // P6B-E2 D-E2-4: bypass the localhost check ONLY when the
+        // operator explicitly opted in via
+        // `RelayConfig::allow_non_localhost_endpoint`. Kill-switch
+        // precedence above stays mandatory regardless of this flag.
+        if !self.allow_non_localhost && !crate::send_bundle::is_localhost_url(&self.endpoint) {
             return Err(BundleRelayError::SubmitDisabledNonLocalhost);
         }
         // Step (3): localhost HTTP POST `eth_sendBundle`. Body shape
@@ -189,7 +211,7 @@ mod tests {
     /// Construct succeeds with the default endpoint.
     #[test]
     fn flashbots_new_default_succeeds() {
-        let r = FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(false))
+        let r = FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(false), false)
             .expect("default config ok");
         assert_eq!(r.name(), "flashbots");
         assert_eq!(r.timeout().as_millis() as u64, DEFAULT_FLASHBOTS_TIMEOUT_MS);
@@ -203,7 +225,7 @@ mod tests {
             timeout_ms: 1_000,
         };
         assert!(matches!(
-            FlashbotsRelay::new(cfg, KillSwitch::new(false)),
+            FlashbotsRelay::new(cfg, KillSwitch::new(false), false),
             Err(RelaySimError::NotConfigured)
         ));
     }
@@ -216,7 +238,7 @@ mod tests {
             timeout_ms: 1_000,
         };
         assert!(matches!(
-            FlashbotsRelay::new(cfg, KillSwitch::new(false)),
+            FlashbotsRelay::new(cfg, KillSwitch::new(false), false),
             Err(RelaySimError::NotConfigured)
         ));
     }
@@ -228,7 +250,7 @@ mod tests {
             endpoint: "http://example.com/?token=SECRETTOKEN".to_string(),
             timeout_ms: 1_000,
         };
-        let r = FlashbotsRelay::new(cfg, KillSwitch::new(false)).expect("ctor ok");
+        let r = FlashbotsRelay::new(cfg, KillSwitch::new(false), false).expect("ctor ok");
         let dbg = format!("{r:?}");
         assert!(
             !dbg.contains("SECRETTOKEN"),
@@ -253,7 +275,7 @@ mod tests {
     /// fails-closed BEFORE any HTTP I/O.
     #[tokio::test]
     async fn rc_f_4_submit_bundle_non_localhost_rejects_at_runtime() {
-        let r = FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(false))
+        let r = FlashbotsRelay::new(FlashbotsConfig::default(), KillSwitch::new(false), false)
             .expect("ctor ok");
         let dummy = SignedBundle {
             block_hash: [0u8; 32],

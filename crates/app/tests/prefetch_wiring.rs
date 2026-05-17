@@ -95,6 +95,12 @@ async fn pa_1_disabled_by_default_no_event_emitted() {
         None, // P5-A: prefetch_enabled = false → no fetcher
         weth_addr(),
         usdc_addr(),
+        Arc::new(
+            rust_lmax_mev_execution::BundleConstructor::new(
+                rust_lmax_mev_execution::BundleConfig::defaults(),
+            )
+            .expect("bundle constructor"),
+        ),
     ));
 
     risk_tx
@@ -168,6 +174,12 @@ async fn pa_4_fail_closed_on_archive_error() {
         Some(fetcher),
         weth_addr(),
         usdc_addr(),
+        Arc::new(
+            rust_lmax_mev_execution::BundleConstructor::new(
+                rust_lmax_mev_execution::BundleConfig::defaults(),
+            )
+            .expect("bundle constructor"),
+        ),
     ));
 
     // Publish first event → driver attempts prefetch → fetcher fails →

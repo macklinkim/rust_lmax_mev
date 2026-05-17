@@ -989,6 +989,7 @@ pub async fn wire_phase4(
         prefetch_fetcher,
         config.ingress.tokens.weth,
         config.ingress.tokens.usdc,
+        Arc::clone(&bundle_constructor),
     ));
     let execution_driver_task = tokio::spawn(execution_driver(
         sim_tx.subscribe(),
@@ -1326,6 +1327,12 @@ pub async fn simulator_driver(
     prefetch_fetcher: Option<Arc<dyn rust_lmax_mev_state_fetcher::StateFetcher>>,
     weth_address: alloy_primitives::Address,
     usdc_proxy_address: alloy_primitives::Address,
+    // P6B-E2 D-E2-6: production runtime sign_tx call site. Reachable
+    // ONLY through `bundle_constructor.sign_for_outcome(&outcome)`
+    // which delegates to `self.signer.sign_tx(&tx).await`. On
+    // `Err(_)` the iteration skips with WARN; unsigned bundles never
+    // flow past this boundary.
+    bundle_constructor: Arc<BundleConstructor>,
 ) {
     let mut seq: u64 = 0;
     loop {
@@ -1358,13 +1365,35 @@ pub async fn simulator_driver(
                 }
                 match simulator.simulate_with_fingerprint(envelope.payload()) {
                     Ok((outcome, fingerprint)) => {
-                        // P6B-E1 D-E1-5: signed_bundle is always None
-                        // in production runtime (G11 = 1 carried
-                        // forward from P6B-CD; no production signer
-                        // call site upstream). Test harnesses publish
-                        // synthetic envelopes with Some(...) directly.
+                        // P6B-E2 D-E2-6: production runtime sign_tx
+                        // call site. Iteration-skip + WARN on any
+                        // Err(_); unsigned bundles never flow
+                        // downstream. With wire_phase4's default
+                        // `DisabledSigner` injection, every call here
+                        // returns `Err(SignerDisabled)` -> skip ->
+                        // genuinely fail-closed default runtime.
+                        let signed_tx_bytes =
+                            match bundle_constructor.sign_for_outcome(&outcome).await {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = ?e,
+                                        "P6B-E2: sign_for_outcome failed; skipping iteration"
+                                    );
+                                    continue;
+                                }
+                            };
+                        let signed_bundle = SignedBundle {
+                            block_hash: envelope.chain_context().block_hash,
+                            state_block_number: envelope.chain_context().block_number,
+                            signed_txs: vec![signed_tx_bytes.0],
+                            coinbase_recipient: alloy_primitives::Address::ZERO,
+                            coinbase_transfer_wei: alloy_primitives::U256::ZERO,
+                            validity_block_min: outcome.opportunity_block_number,
+                            validity_block_max: outcome.opportunity_block_number,
+                        };
                         let payload = SimulationOutcomeWithFingerprint {
-                            signed_bundle: None,
+                            signed_bundle: Some(signed_bundle),
                             outcome,
                             fingerprint,
                         };
@@ -1669,6 +1698,7 @@ fn build_relay_sim_from_config(
         return Ok(None);
     };
     let timeout = cfg.simulate_timeout_ms;
+    let allow = cfg.allow_non_localhost_endpoint;
     let arc: Arc<dyn RelaySimulator> = match first.kind {
         RelayKind::Flashbots => {
             let r = FlashbotsRelay::new(
@@ -1677,6 +1707,7 @@ fn build_relay_sim_from_config(
                     timeout_ms: timeout,
                 },
                 kill_switch,
+                allow,
             )
             .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
             Arc::new(r)
@@ -1689,6 +1720,7 @@ fn build_relay_sim_from_config(
                     api_key: first.api_key.clone(),
                 },
                 kill_switch,
+                allow,
             )
             .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
             Arc::new(r)
@@ -1716,6 +1748,7 @@ fn build_bundle_relay_from_config(
         return Ok(None);
     };
     let timeout = cfg.simulate_timeout_ms;
+    let allow = cfg.allow_non_localhost_endpoint;
     let arc: Arc<dyn BundleRelay> = match first.kind {
         RelayKind::Flashbots => {
             let r = FlashbotsRelay::new(
@@ -1724,6 +1757,7 @@ fn build_bundle_relay_from_config(
                     timeout_ms: timeout,
                 },
                 kill_switch,
+                allow,
             )
             .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
             Arc::new(r)
@@ -1736,6 +1770,7 @@ fn build_bundle_relay_from_config(
                     api_key: first.api_key.clone(),
                 },
                 kill_switch,
+                allow,
             )
             .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
             Arc::new(r)
@@ -1861,16 +1896,40 @@ pub async fn submission_driver(
             );
             continue;
         }
+        // P6B-E2 D-E2-5: G12 step 6 keccak compare. Compute the local
+        // bundle hash BEFORE the HTTP POST so a network error vs a
+        // hash-mismatch can be distinguished cleanly downstream.
+        let local_bundle_hash = compute_local_bundle_hash(&attempt.signed_bundle);
         // Invoke submit_bundle. Adapter performs its own kill-switch +
         // localhost-host re-check before any HTTP I/O (defense-in-depth).
         match relay.submit_bundle(&attempt.signed_bundle).await {
-            Ok(receipt) => {
+            Ok(mut receipt) => {
+                // P6B-E2 D-E2-5: compare the relay-returned bundleHash
+                // to the locally-computed keccak256(concat(signed_txs)).
+                // On mismatch, synthesize `BundleRelayError::BundleHashMismatch`
+                // (driver-side; the adapter only reports the parse / HTTP
+                // outcome) and append a mismatch record to the same
+                // submission journal with `local_bundle_hash` populated.
+                let relay_hash_normalized = normalize_hash_hex(&receipt.bundle_hash);
+                receipt.local_bundle_hash = local_bundle_hash.clone();
+                let mismatch = relay_hash_normalized != local_bundle_hash;
+                if mismatch {
+                    tracing::warn!(
+                        target: "submission_driver",
+                        driver = %name,
+                        relay_name = %receipt.relay_name,
+                        relay_bundle_hash = %receipt.bundle_hash,
+                        local_bundle_hash = %local_bundle_hash,
+                        error = ?BundleRelayError::BundleHashMismatch,
+                        "BundleHashMismatch: relay-returned hash != local keccak; journaling mismatch record"
+                    );
+                }
                 // DP-E8 v0.4 pattern: append-and-flush BEFORE
                 // acknowledging success in the loop. The receipt is
                 // wrapped in an EventEnvelope (Relay-source) for
                 // journal compatibility; correlation_id = 0 because
                 // SubmissionAttempt does not carry an upstream id
-                // through the broadcast (E1 simplification).
+                // through the broadcast.
                 let Some(env) = seal_envelope(EventSource::Relay, receipt.clone(), &mut seq) else {
                     tracing::error!(
                         target: "submission_driver",
@@ -1897,13 +1956,15 @@ pub async fn submission_driver(
                     );
                     continue;
                 }
-                tracing::info!(
-                    target: "submission_driver",
-                    driver = %name,
-                    relay_name = %receipt.relay_name,
-                    bundle_hash = %receipt.bundle_hash,
-                    "submission Ok"
-                );
+                if !mismatch {
+                    tracing::info!(
+                        target: "submission_driver",
+                        driver = %name,
+                        relay_name = %receipt.relay_name,
+                        bundle_hash = %receipt.bundle_hash,
+                        "submission Ok (bundle-byte equality verified)"
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -1914,6 +1975,39 @@ pub async fn submission_driver(
                 );
             }
         }
+    }
+}
+
+/// P6B-E2 D-E2-5: locally compute `keccak256(concat(signed_txs))`
+/// rendered as lowercase `0x<64hex>` for the G12 step-6 bundle-byte
+/// equality check inside `submission_driver`. Matches the standard
+/// Flashbots / Bloxroute `bundleHash` shape (relay-side keccak of
+/// concatenated raw signed-tx bytes); a non-matching relay echo
+/// surfaces as `BundleRelayError::BundleHashMismatch`.
+fn compute_local_bundle_hash(bundle: &SignedBundle) -> String {
+    let total_len: usize = bundle.signed_txs.iter().map(|t| t.len()).sum();
+    let mut concat = Vec::with_capacity(total_len);
+    for tx in &bundle.signed_txs {
+        concat.extend_from_slice(tx);
+    }
+    let digest = alloy_primitives::keccak256(&concat);
+    let mut s = String::with_capacity(2 + 64);
+    s.push_str("0x");
+    for b in digest.as_slice() {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Lowercase + ensure `0x` prefix for the relay-returned bundle hash
+/// string. Tolerates the relay returning the bundle hash either with or
+/// without the `0x` prefix (production relays return both shapes).
+fn normalize_hash_hex(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.starts_with("0x") {
+        lower
+    } else {
+        format!("0x{lower}")
     }
 }
 

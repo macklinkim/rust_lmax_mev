@@ -60,7 +60,7 @@ async fn rc_common_2_secret_redaction_across_five_surfaces() {
         timeout_ms: 1_000,
         api_key: Some(SECRET_KEY.to_string()),
     };
-    let relay = BloxrouteRelay::new(cfg, KillSwitch::new(false)).expect("ctor ok");
+    let relay = BloxrouteRelay::new(cfg, KillSwitch::new(false), false).expect("ctor ok");
 
     // Surface 1: Debug elision.
     let dbg = format!("{relay:?}");
@@ -201,6 +201,7 @@ async fn rc_common_2_extra_jsonrpc_body_secret_redacted() {
             api_key: Some(SECRET_KEY.to_string()),
         },
         KillSwitch::new(false),
+        false,
     )
     .expect("ctor ok");
     let req = RelaySimRequest {
@@ -272,6 +273,7 @@ async fn rc_common_2_extra_relay_revert_hex_secret_redacted() {
             api_key: Some("dummy-test-key".to_string()),
         },
         KillSwitch::new(false),
+        false,
     )
     .expect("ctor ok");
     let req = RelaySimRequest {

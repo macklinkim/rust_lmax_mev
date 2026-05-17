@@ -153,6 +153,9 @@ pub(crate) async fn submit_eth_send_bundle(
         relay_name: relay_name.to_string(),
         bundle_hash: result.bundle_hash,
         submitted_at_unix_ns,
+        // P6B-E2 D-E2-3: `submission_driver` populates this on the
+        // bundle-byte equality check site; adapter leaves it empty.
+        local_bundle_hash: String::new(),
     })
 }
 

@@ -56,6 +56,7 @@ async fn d_t_e1_6_submission_driver_happy_path_journals_receipt() {
             timeout_ms: 2_000,
         },
         KillSwitch::new(false),
+        false,
     )
     .expect("ctor ok");
     let relay: Arc<dyn BundleRelay> = Arc::new(flashbots);
@@ -128,6 +129,7 @@ async fn d_t_e1_7_submission_driver_skips_on_g13_inheritance_fail() {
             timeout_ms: 2_000,
         },
         KillSwitch::new(false),
+        false,
     )
     .expect("ctor ok");
     let relay: Arc<dyn BundleRelay> = Arc::new(flashbots);
