@@ -13,14 +13,18 @@
 # reference the gauges (NOT hardcoded scalar thresholds) so the alert
 # ceiling is managed by the workspace config, not by editing this YAML.
 #
-# Codex APPROVED HIGH advisory at v0.3 review:
-#   `> on() <gauge>` requires both sides of the comparison to have an
-#   empty label set. The counter rate is therefore wrapped in `sum(...)`
-#   to drop the `outcome` label before the comparison. Gauge value `0`
-#   means the operator left the threshold disabled; alerts using these
-#   expressions will not fire while the gauge is `0` (rate cannot
-#   exceed 0 except when there is signing traffic, which is itself the
-#   condition operators care about).
+# Codex review notes:
+#   - `> on() <gauge>` requires both sides of the comparison to have an
+#     empty label set. The counter rate is therefore wrapped in `sum(...)`
+#     to drop the `outcome` label before the comparison.
+#   - Gauge value `0` means the operator left the threshold DISABLED.
+#     Each rule below is gated on `<threshold_gauge> > 0` so the rule
+#     evaluates to no samples when the threshold is disabled, even if
+#     the observed signing rate is positive. (Without the gate, any
+#     positive rate would compare strictly greater than 0 and fire the
+#     alert -- contradicting the "0 = disabled" contract documented on
+#     `RelayConfig::signing_audit_alert` in `crates/config/src/lib.rs`
+#     and the `production-signer.md` Section 2.5 candidate #4 contract.)
 #
 # This file is illustrative. Operators copy + adapt to their own
 # Alertmanager / Prometheus deployment. The workspace ships only the
@@ -32,22 +36,28 @@ groups:
     rules:
       - alert: SigningAttemptRateHigh
         expr: |
-          sum(rate(production_signer_audit_attempts_total[1m])) * 60
-          > on() production_signer_audit_alert_threshold_max_attempts_per_minute
+          (
+            (sum(rate(production_signer_audit_attempts_total[1m])) * 60)
+            > on() production_signer_audit_alert_threshold_max_attempts_per_minute
+          )
+          and on() (production_signer_audit_alert_threshold_max_attempts_per_minute > 0)
         for: 1m
         labels:
           severity: warning
         annotations:
           summary: "Signing attempt rate exceeded configured threshold (Section 2.5 candidate #4)"
-          description: "production_signer_audit_attempts_total per-minute rate exceeded the operator-configured max_attempts_per_minute gauge."
+          description: "production_signer_audit_attempts_total per-minute rate exceeded the operator-configured max_attempts_per_minute gauge. Rule is gated on the gauge being > 0; a gauge value of 0 means the operator disabled this alert at the workspace TOML config level."
 
       - alert: SigningFailureRateHigh
         expr: |
-          sum(rate(production_signer_audit_attempts_total{outcome!="not_configured"}[1m])) * 60
-          > on() production_signer_audit_alert_threshold_max_failed_per_minute
+          (
+            (sum(rate(production_signer_audit_attempts_total{outcome!="not_configured"}[1m])) * 60)
+            > on() production_signer_audit_alert_threshold_max_failed_per_minute
+          )
+          and on() (production_signer_audit_alert_threshold_max_failed_per_minute > 0)
         for: 1m
         labels:
           severity: critical
         annotations:
           summary: "Signing failure rate exceeded configured threshold (Section 2.5 candidate #4)"
-          description: "Non-not_configured-outcome signing-attempt rate exceeded the operator-configured max_failed_per_minute gauge. At P6B-C close, the only non-not_configured outcome is address_mismatch (host-compromise-requested signing on a bundle whose tx.from disagrees with the KMS-derived address)."
+          description: "Non-not_configured-outcome signing-attempt rate exceeded the operator-configured max_failed_per_minute gauge. Rule is gated on the gauge being > 0; a gauge value of 0 means the operator disabled this alert. At P6B-C close, the only non-not_configured outcome is address_mismatch (host-compromise-requested signing on a bundle whose tx.from disagrees with the KMS-derived address)."
